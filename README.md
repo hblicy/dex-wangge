@@ -1,6 +1,6 @@
 # 三交易所整合网格交易机器人
 
-一个跑在你自己电脑上的加密货币**永续合约网格交易机器人**，同时支持三家去中心化交易所：**Decibel**（Aptos 链）、**Extended**（Starknet 链）、**RISEx**。三个交易所可以同时各跑一个网格策略，统一在一个浏览器仪表盘里监控和操控。
+一个跑在你自己电脑上的加密货币**永续合约网格交易机器人**，同时支持三家去中心化交易所：**Decibel**（Aptos 链）、**Extended**（Starknet 链）、**RISEx**。三个交易所可以同时各跑一个网格策略，统一在一个浏览器仪表盘里监控和操控；目前只有 Decibel 和 Extended 开放实盘，RISEx 仅开放模拟盘。
 
 > ⚠️ **免责声明**：本程序仅供学习和研究。合约交易带高杠杆风险，可能损失全部本金。实盘前请务必先用模拟模式充分熟悉。使用本程序造成的任何盈亏由使用者自行承担。
 
@@ -34,7 +34,7 @@
 | 功能 | 说明 |
 |---|---|
 | 三交易所并行 | Decibel / Extended / RISEx 各自独立运行一个网格机器人，互不影响 |
-| 双运行模式 | `paper` 模拟盘（虚拟资金，真实行情）和 `live` 实盘（真实下单） |
+| 双运行模式 | Decibel / Extended 支持 `paper` 和 `live`；RISEx 仅支持 `paper` |
 | 三种网格类型 | 中性（区间震荡双向吃单）、做多（低吸高抛）、做空（高抛低补） |
 | 等差网格 | 在设定区间内均匀布单，每次成交后在相邻一格自动补反向单，赚取格差 |
 | 智能填充参数 | 一键根据近期 K 线趋势分析，自动推荐网格类型、区间上下界、格数 |
@@ -65,6 +65,7 @@
 - 仪表盘和全部 API 使用 HTTP Basic Auth；登录用户名固定为 `admin`，密码来自 `.env` 的 `DASHBOARD_TOKEN`
 - 所有控制类 POST 请求都校验 JSON、自定义请求头和 Origin，页面不再运行时加载第三方 CDN 脚本
 - 服务默认只监听 `127.0.0.1`，远程访问使用 SSH 隧道或 Tailscale Serve
+- Linux/macOS 启动时强制检查 `.env` 为 `0600`，防止同机其他用户读取私钥
 
 ---
 
@@ -266,10 +267,20 @@ tailscale serve status
 
 ## 七、实盘模式：API 密钥获取与配置
 
+> 当前实盘支持范围：**Decibel、Extended**。RISEx 实盘入口已禁用，不能通过配置绕过。
+
+### 实盘启动检查清单
+
+- 已执行 `npm ci` 和 `npm test`，全部通过。
+- Linux/macOS 的 `.env` 已执行 `chmod 600 .env`，VPS 使用独立服务用户。
+- `HOST=127.0.0.1`，只通过 SSH 隧道或 Tailscale Serve 访问；未开放 8080 公网端口、未启用 Funnel。
+- 先在 paper 或交易所测试网验证相同参数，再从可承受损失的最小仓位开始。
+- 首次只启用一家实盘交易所，并在交易所网页核对挂单、持仓和撤单结果。
+
 ### 7.0 总体步骤
 
 1. 用记事本（或任何文本编辑器）打开项目文件夹里的 `.env` 文件（没有就先复制 `.env.example` 改名为 `.env`；注意文件名就是 `.env`，前面有个点，没有别的后缀）。
-2. 把你要实盘的交易所的模式改为 live：`DE_MODE=live`（Decibel）/ `EX_MODE=live`（Extended）/ `RS_MODE=live`（RISEx）。**三个所互相独立**，可以只实盘一个、其余保持 paper。
+2. 把要实盘的交易所模式改为 `DE_MODE=live`（Decibel）或 `EX_MODE=live`（Extended）。`RS_MODE` 必须保持 `paper`。
 3. 按下面各小节获取并填入对应凭据。
 4. 保存 `.env`，双击 `实盘启动.bat`，输入 `YES` 确认启动。
 5. 启动日志里看到 `[XX] ✓ 连接成功 [LIVE 模式]` 即成功。
@@ -316,25 +327,13 @@ EXTENDED_STARK_PUBLIC_KEY=     # ④ Stark 公钥
 
 ### 7.3 RISEx
 
-需要填 2 项：
+RISEx 当前**仅支持 `RS_MODE=paper`**。此前使用的社区 `risex-client` 无法可靠确认私有订单状态和实际成交数量，不满足真实资金所需的状态确认条件，因此服务会拒绝任何 RISEx live 配置。
 
-```ini
-RS_MODE=live
-ACCOUNT_ADDRESS=       # ① 账户地址
-SIGNER_PRIVATE_KEY=    # ② 签名私钥
-```
-
-获取步骤：
-
-1. 打开 RISEx 官网交易应用，连接钱包完成开户。
-2. 在账户 / API 设置中查看你的**账户地址**，并创建 / 导出用于签名下单的 **Signer 私钥**（具体入口以 RISEx 官方文档为准，通常在 API 或账户安全设置里）。
-3. 两个值填入 `.env`，确保账户有保证金。
-
-`RISEX_API_URL` / `RISEX_WS_URL` 留空即用官方默认地址，一般不用改。
+重新开放实盘至少需要官方稳定的私有订单/成交接口、可靠的撤单与部分成交确认，并完成测试网端到端和故障恢复验证。在这些条件满足前，不要把签名私钥填入本项目。
 
 ### 7.4 测试网练手（可选）
 
-三个所都支持先连测试网（用测试币实盘流程）：把对应的 `DE_NETWORK` / `EX_NETWORK` / `RS_NETWORK` 改为 `testnet`，再用测试网的账户凭据即可。
+Decibel 和 Extended 可先连测试网走完整下单流程：把对应的 `DE_NETWORK` / `EX_NETWORK` 改为 `testnet`，再使用测试网凭据。RISEx 仍只运行 paper。
 
 ---
 
@@ -445,7 +444,8 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 | `PAPER_BALANCE` | `10000` | 模拟模式初始虚拟余额（USDC） |
 | `GLOBAL_PROXY` | 空 | 全局代理，见第八节 |
 | `DECIBEL_PROXY` / `EXTENDED_PROXY` / `RISEX_PROXY` | 空 | 各所独立代理 |
-| `DE_MODE` / `EX_MODE` / `RS_MODE` | `paper` | 各所运行模式：`paper` 或 `live` |
+| `DE_MODE` / `EX_MODE` | `paper` | Decibel / Extended：`paper` 或 `live` |
+| `RS_MODE` | `paper` | RISEx：只能为 `paper`，`live` 会拒绝启动 |
 | `DE_NETWORK` / `EX_NETWORK` / `RS_NETWORK` | `mainnet` | 主网 / 测试网 |
 | `DECIBEL_API_KEY` | 空 | Decibel：geomi.dev 的 API Key |
 | `DECIBEL_PRIVATE_KEY` | 空 | Decibel：API 钱包 Ed25519 私钥 |
@@ -456,9 +456,7 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 | `EXTENDED_STARK_PRIVATE_KEY` / `EXTENDED_STARK_PUBLIC_KEY` | 空 | Extended：Stark 密钥对 |
 | `EXTENDED_MAX_FEE` | `0.0005` | Extended 最大手续费率 |
 | `EXTENDED_API_URL` | 官方默认 | 自定义 API 地址 |
-| `ACCOUNT_ADDRESS` | 空 | RISEx：账户地址 |
-| `SIGNER_PRIVATE_KEY` | 空 | RISEx：签名私钥 |
-| `RISEX_API_URL` / `RISEX_WS_URL` | 官方默认 | 自定义 API / WebSocket 地址 |
+| `RISEX_API_URL` | 官方默认 | RISEx paper 行情 API 地址 |
 | `AI_PROVIDER` | `openai` | AI 协议：`openai` / `anthropic` / `gemini` |
 | `AI_API_KEY` / `AI_BASE_URL` / `AI_MODEL` / `AI_MODEL_SMALL` | 空 | 见第九节 |
 | `AI_SENTINEL_MINUTES` | `5` | 哨兵巡检间隔（分钟，0=关） |
@@ -473,9 +471,9 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 
 程序每次状态变化都会把快照写入项目目录下的 `.state.json`（自动生成，含配置、挂单、累计统计）。重启后：
 
-1. **上次是运行状态** → 自动**续跑**：重新连接交易所，按市场名称重新解析交易对（交易所每次连接会重新编号市场 ID），接管还挂着的单，对账后继续运行。
-2. **续跑失败**（如交易所连不上）→ 撤销遗留挂单，绝不在"半知半解"状态下运行网格。
-3. **交易所暂时连不上** → 跳过续跑、保留挂单，等你在界面点 **🔌 重连交易所** 成功后自动接管。
+1. **上次是运行状态** → 按市场名称重新解析交易对，接管还挂着的单；首次对账成功后才恢复运行。
+2. **实盘交易所初始化失败** → 整个服务停止启动，不会把离线交易所伪装成可用状态；现有挂单保持不动，需先到交易所网页确认。
+3. **续跑或首次对账失败** → 尝试撤销遗留挂单；若交易所没有明确确认全部撤销，服务停止启动并打印原因。
 4. **发现遗留持仓** → 界面弹三选项：只减仓回收 / 按现价重开网格 / 市价平仓。
 
 累计盈亏、成交量等统计也随快照保留，跨重启连续显示。想清零就点"重置统计"。
@@ -564,7 +562,7 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 │   └── exchange/
 │       ├── de/           # Decibel 接入（live + paper）
 │       ├── ex/           # Extended 接入（live + paper + Stark 签名）
-│       └── rs/           # RISEx 接入（live + paper）
+│       └── rs/           # RISEx 接入（仅 paper）
 └── test/
     └── grid.test.js      # 网格逻辑单元测试
 ```
@@ -579,7 +577,9 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 4. **实盘前先模拟**：同样的参数先在 paper 模式跑几天，理解成交节奏和风险再上真钱。
 5. **小资金起步**：首次实盘用你亏得起的钱。
 6. **仪表盘默认只监听本机**（localhost）。VPS 通过 SSH 隧道或 Tailscale Serve 访问，不要在安全组或防火墙公开 8080，也不要使用 Tailscale Funnel。
-7. 本程序没有远程服务器、不上传任何数据，所有状态都在你本机。
+7. **VPS 使用独立服务用户**，并执行 `chmod 600 .env`；程序会拒绝读取权限过宽的密钥文件。
+8. **RISEx 只允许 paper**；不要尝试修改代码绕过实盘禁用。
+9. 本程序没有远程服务器、不上传任何数据，所有状态都在你本机。
 
 ---
 

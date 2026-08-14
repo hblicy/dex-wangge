@@ -46,7 +46,7 @@ const cfg = getConfig();
     console.error('\n解决办法（二选一）：');
     console.error('  1. 用记事本打开项目里的 .env，补齐上面列出的字段');
     console.error('     （详细获取教程见 README.md 第七节）');
-    console.error('  2. 暂时不实盘：把 .env 里对应的 DE_MODE / EX_MODE / RS_MODE 改回 paper\n');
+    console.error('  2. 暂时不实盘：把 .env 里对应的 DE_MODE / EX_MODE 改回 paper\n');
     process.exit(1);
   }
 }
@@ -547,7 +547,7 @@ server.listen(cfg.port, cfg.host, () => {
   console.log(`${'─'.repeat(52)}`);
   if (cfg.de.mode === 'paper' || cfg.ex.mode === 'paper' || cfg.rs.mode === 'paper') {
     console.log('  ⚠ 部分交易所为模拟模式，不涉及真实资金。');
-    console.log('    在 .env 中设置 DE_MODE/EX_MODE/RS_MODE=live 切换实盘。');
+    console.log('    Decibel/Extended 可在 .env 中切换 live；RISEx 当前仅支持 paper。');
   }
   console.log('');
 });

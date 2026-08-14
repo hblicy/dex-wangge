@@ -22,6 +22,14 @@ test('direct RISEx live adapter initialization is also blocked before SDK loadin
   assert.match(source, /async reconnect\(\) \{\s*throw new Error\('RISEx 实盘已禁用/);
 });
 
+test('disabled RISEx live client is not installed as a project dependency', () => {
+  const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  const packageLock = fs.readFileSync(new URL('../package-lock.json', import.meta.url), 'utf8');
+
+  assert.equal(packageJson.optionalDependencies?.['risex-client'], undefined);
+  assert.doesNotMatch(packageLock, /node_modules\/risex-client/);
+});
+
 test('live exchange initialization failure aborts startup', async () => {
   const cause = new Error('authentication failed');
   const exchange = { init: async () => { throw cause; } };
