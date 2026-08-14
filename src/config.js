@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { getSecurityConfig } from './security.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -24,6 +25,7 @@ export function loadEnv() {
 
 export function getConfig() {
   loadEnv();
+  const security = getSecurityConfig(process.env);
 
   // 全局代理：作为所有交易所的默认代理
   const globalProxy =
@@ -94,6 +96,7 @@ export function getConfig() {
     // LIVE trading and edit .env) is NOT exposed to the local network. Set
     // HOST=0.0.0.0 explicitly only if you understand the risk and add your own auth.
     host: process.env.HOST || '127.0.0.1',
+    ...security,
     globalProxy,
     de,
     ex,
