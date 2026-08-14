@@ -16,6 +16,8 @@ import { analyzeTrend } from './trend.js';
 import { setupProxies, checkProxy } from './proxy.js';
 import { loadSnapshot, saveSnapshot } from './persist.js';
 import { createAiService } from './ai/service.js';
+import { enforceRequestSecurity, HttpRequestError, readJsonBody } from './security.js';
+import { SseClientPool } from './sse.js';
 
 // ── 启动配置 ─────────────────────────────────────────────────────────────────
 const cfg = getConfig();
@@ -101,10 +103,11 @@ const aiService = createAiService({
 });
 aiService.start();
 
-// SSE 客户端集合（按交易所分组）
-const deClients = new Set();
-const exClients = new Set();
-const rsClients = new Set();
+// SSE 客户端池（按交易所和总览分组）
+const deClients = new SseClientPool('de', cfg.maxSseClients);
+const exClients = new SseClientPool('ex', cfg.maxSseClients);
+const rsClients = new SseClientPool('rs', cfg.maxSseClients);
+const overviewClients = new SseClientPool('overview', cfg.maxSseClients);
 
 // ── 工具函数 ──────────────────────────────────────────────────────────────────
 const MIME = {
@@ -117,6 +120,7 @@ const MIME = {
   '.json': 'application/json',
   '.woff2': 'font/woff2',
 };
+const CHART_JS_FILE = path.join(ROOT, 'node_modules', 'chart.js', 'dist', 'chart.umd.js');
 
 function send(res, code, obj) {
   const body = JSON.stringify(obj, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
@@ -125,17 +129,8 @@ function send(res, code, obj) {
   res.end(body);
 }
 
-function readBody(req, maxBytes = 1_000_000) {
-  return new Promise((resolve) => {
-    let b = '', n = 0, done = false;
-    req.on('data', (c) => {
-      if (done) return;
-      n += c.length;
-      if (n > maxBytes) { done = true; try { req.destroy(); } catch { /* ignore */ } resolve({}); return; }
-      b += c;
-    });
-    req.on('end', () => { if (done) return; done = true; try { resolve(b ? JSON.parse(b) : {}); } catch { resolve({}); } });
-  });
+function errorStatus(error, fallback) {
+  return error instanceof HttpRequestError ? error.statusCode : fallback;
 }
 
 // ── 交易所路由处理器工厂 ───────────────────────────────────────────────────────
@@ -171,18 +166,18 @@ function makeExchangeHandler(prefix, bot, exchange, exCfg, clients, name) {
     if (subPath === '/state') return send(res, 200, bot.getState());
 
     if (subPath === '/start' && req.method === 'POST') {
-      try { return send(res, 200, await bot.start(await readBody(req))); }
-      catch (e) { return send(res, 400, { error: e.message }); }
+      try { return send(res, 200, await bot.start(await readJsonBody(req))); }
+      catch (e) { return send(res, errorStatus(e, 400), { error: e?.message || String(e) }); }
     }
 
     if (subPath === '/stop' && req.method === 'POST') {
-      try { return send(res, 200, await bot.stop(await readBody(req))); }
-      catch (e) { return send(res, 400, { error: e.message }); }
+      try { return send(res, 200, await bot.stop(await readJsonBody(req))); }
+      catch (e) { return send(res, errorStatus(e, 400), { error: e?.message || String(e) }); }
     }
 
     if (subPath === '/adjust' && req.method === 'POST') {
-      try { return send(res, 200, await bot.adjustRange(await readBody(req))); }
-      catch (e) { return send(res, 400, { error: e.message }); }
+      try { return send(res, 200, await bot.adjustRange(await readJsonBody(req))); }
+      catch (e) { return send(res, errorStatus(e, 400), { error: e?.message || String(e) }); }
     }
 
     if (subPath === '/reset' && req.method === 'POST') {
@@ -196,8 +191,8 @@ function makeExchangeHandler(prefix, bot, exchange, exCfg, clients, name) {
     }
 
     if (subPath === '/start-recovery' && req.method === 'POST') {
-      try { return send(res, 200, await bot.startRecovery(await readBody(req))); }
-      catch (e) { return send(res, 400, { error: e.message }); }
+      try { return send(res, 200, await bot.startRecovery(await readJsonBody(req))); }
+      catch (e) { return send(res, errorStatus(e, 400), { error: e?.message || String(e) }); }
     }
 
     // 重新与交易所建立连接：重建客户端/解卡轮询/重启轮询循环。
@@ -235,19 +230,20 @@ function makeExchangeHandler(prefix, bot, exchange, exCfg, clients, name) {
     }
 
     if (subPath === '/close-position' && req.method === 'POST') {
-      try { const b = await readBody(req); return send(res, 200, await bot.closePositionNow(b && b.marketId)); }
-      catch (e) { return send(res, 400, { error: e.message }); }
+      try { const b = await readJsonBody(req); return send(res, 200, await bot.closePositionNow(b && b.marketId)); }
+      catch (e) { return send(res, errorStatus(e, 400), { error: e?.message || String(e) }); }
     }
 
     if (subPath === '/stream') {
+      if (!clients.add(req, res)) {
+        return send(res, 503, { error: 'SSE connection limit reached' });
+      }
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
       });
-      res.write(`data: ${JSON.stringify(bot.getState())}\n\n`);
-      clients.add(res);
-      req.on('close', () => clients.delete(res));
+      clients.write(res, `data: ${JSON.stringify(bot.getState())}\n\n`);
       return;
     }
 
@@ -261,6 +257,7 @@ const rsHandler = makeExchangeHandler('/api/rs', rsBot, rsExchange, cfg.rs, rsCl
 
 // ── HTTP 服务器 ───────────────────────────────────────────────────────────────
 const server = http.createServer(async (request, res) => {
+  if (!enforceRequestSecurity(request, res, cfg)) return;
   const url = new URL(request.url, 'http://localhost');
   const p = url.pathname;
 
@@ -276,6 +273,9 @@ const server = http.createServer(async (request, res) => {
 
     // ── 总览 SSE 流 ───────────────────────────────────────────────────────
     if (p === '/api/overview/stream') {
+      if (!overviewClients.add(request, res)) {
+        return send(res, 503, { error: 'SSE connection limit reached' });
+      }
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -288,10 +288,7 @@ const server = http.createServer(async (request, res) => {
         ex: pick(exBot.getState(), cfg.ex.mode),
         rs: pick(rsBot.getState(), cfg.rs.mode),
       };
-      res.write(`data: ${JSON.stringify(initial, (_k, v) => (typeof v === 'bigint' ? v.toString() : v))}\n\n`);
-      const overviewClients = server._overviewClients;
-      overviewClients.add(res);
-      request.on('close', () => overviewClients.delete(res));
+      overviewClients.write(res, `data: ${JSON.stringify(initial, (_k, v) => (typeof v === 'bigint' ? v.toString() : v))}\n\n`);
       return;
     }
 
@@ -319,16 +316,16 @@ const server = http.createServer(async (request, res) => {
     }
     if (p === '/api/ai/analyze' && request.method === 'POST') {
       try {
-        const b = await readBody(request);
+        const b = await readJsonBody(request);
         return send(res, 200, await aiService.analyze(String(b.ex || 'de')));
-      } catch (e) { return send(res, 500, { error: e?.message || String(e) }); }
+      } catch (e) { return send(res, errorStatus(e, 500), { error: e?.message || String(e) }); }
     }
     if (p === '/api/ai/chat' && request.method === 'POST') {
       try {
-        const b = await readBody(request);
+        const b = await readJsonBody(request);
         if (!b.message) return send(res, 400, { error: '消息为空' });
         return send(res, 200, await aiService.chatControl(b.message, Array.isArray(b.history) ? b.history : []));
-      } catch (e) { return send(res, 500, { error: e?.message || String(e) }); }
+      } catch (e) { return send(res, errorStatus(e, 500), { error: e?.message || String(e) }); }
     }
 
     // ── 代理配置 API ──────────────────────────────────────────────────────
@@ -348,7 +345,7 @@ const server = http.createServer(async (request, res) => {
 
     if (p === '/api/env' && request.method === 'POST') {
       try {
-        const { key, value } = await readBody(request);
+        const { key, value } = await readJsonBody(request);
         const PROXY_KEYS = ['GLOBAL_PROXY','DECIBEL_PROXY','EXTENDED_PROXY','RISEX_PROXY'];
         const AI_KEYS = ['AI_PROVIDER','AI_API_KEY','AI_BASE_URL','AI_MODEL','AI_MODEL_SMALL','AI_SENTINEL_MINUTES','AI_MARKET_MINUTES','AI_REPORT_HOUR','TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID','NOTIFY_WEBHOOK'];
         if (!PROXY_KEYS.includes(key) && !AI_KEYS.includes(key)) return send(res, 400, { error: '不允许修改该字段: ' + key });
@@ -391,7 +388,7 @@ const server = http.createServer(async (request, res) => {
         fs.writeFileSync(envFile, content, 'utf8');
         return send(res, 200, { ok: true });
       } catch (e) {
-        return send(res, 500, { error: e.message });
+        return send(res, errorStatus(e, 500), { error: e?.message || String(e) });
       }
     }
 
@@ -404,6 +401,15 @@ const server = http.createServer(async (request, res) => {
     }
     if (p.startsWith('/api/rs/')) {
       return await rsHandler(request, res, p.slice('/api/rs'.length), url);
+    }
+
+    // ── 固定 vendor 资源 ──────────────────────────────────────────────────
+    if (p === '/vendor/chart.js') {
+      if (!fs.existsSync(CHART_JS_FILE)) {
+        return send(res, 500, { error: 'Chart.js is not installed; run npm install' });
+      }
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' });
+      return fs.createReadStream(CHART_JS_FILE).pipe(res);
     }
 
     // ── 静态文件 ──────────────────────────────────────────────────────────
@@ -420,26 +426,21 @@ const server = http.createServer(async (request, res) => {
   }
 });
 
-server._overviewClients = new Set();
-
 // ── SSE 推送定时器 ────────────────────────────────────────────────────────────
 setInterval(() => {
   const stringify = (obj) =>
     JSON.stringify(obj, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
 
   if (deClients.size > 0) {
-    const data = `data: ${stringify(deBot.getState())}\n\n`;
-    for (const r of deClients) { try { r.write(data); } catch { deClients.delete(r); } }
+    deClients.broadcast(`data: ${stringify(deBot.getState())}\n\n`);
   }
   if (exClients.size > 0) {
-    const data = `data: ${stringify(exBot.getState())}\n\n`;
-    for (const r of exClients) { try { r.write(data); } catch { exClients.delete(r); } }
+    exClients.broadcast(`data: ${stringify(exBot.getState())}\n\n`);
   }
   if (rsClients.size > 0) {
-    const data = `data: ${stringify(rsBot.getState())}\n\n`;
-    for (const r of rsClients) { try { r.write(data); } catch { rsClients.delete(r); } }
+    rsClients.broadcast(`data: ${stringify(rsBot.getState())}\n\n`);
   }
-  if (server._overviewClients.size > 0) {
+  if (overviewClients.size > 0) {
     const deState = deBot.getState();
     const exState = exBot.getState();
     const rsState = rsBot.getState();
@@ -448,8 +449,7 @@ setInterval(() => {
       ex: pick(exState, cfg.ex.mode),
       rs: pick(rsState, cfg.rs.mode),
     };
-    const data = `data: ${stringify(overview)}\n\n`;
-    for (const r of server._overviewClients) { try { r.write(data); } catch { server._overviewClients.delete(r); } }
+    overviewClients.broadcast(`data: ${stringify(overview)}\n\n`);
   }
 }, 1000);
 

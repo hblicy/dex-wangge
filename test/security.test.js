@@ -198,3 +198,27 @@ test('SSE 写背压会结束并移除慢客户端', () => {
   assert.equal(pool.size, 0);
   assert.equal(res.ended, true);
 });
+
+const root = new URL('..', import.meta.url);
+const readProject = (file) => fs.readFileSync(new URL(file, root), 'utf8');
+
+test('Chart.js 固定为本地生产依赖和唯一 vendor 路由', () => {
+  const pkg = JSON.parse(readProject('package.json'));
+  const html = readProject('public/index.html');
+  const server = readProject('src/server.js');
+  assert.equal(pkg.dependencies['chart.js'], '4.4.1');
+  assert.match(html, /<script src="\/vendor\/chart\.js"><\/script>/);
+  assert.doesNotMatch(html, /cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net/);
+  assert.match(server, /p === '\/vendor\/chart\.js'/);
+  assert.match(server, /path\.join\(ROOT, 'node_modules', 'chart\.js', 'dist', 'chart\.umd\.js'\)/);
+  assert.doesNotMatch(server, /startsWith\(['"]\/node_modules/);
+});
+
+test('服务端入口统一调用安全边界、严格请求体和有界 SSE', () => {
+  const server = readProject('src/server.js');
+  assert.match(server, /enforceRequestSecurity\(request, res, cfg\)/);
+  assert.doesNotMatch(server, /function readBody\(/);
+  assert.match(server, /readJsonBody\(request\)|readJsonBody\(req\)/);
+  assert.match(server, /new SseClientPool\('de', cfg\.maxSseClients\)/);
+  assert.doesNotMatch(server, /server\._overviewClients/);
+});
