@@ -131,12 +131,10 @@ export class GridBot {
       const oid = String(id);
       this.active.set(oid, { ...info, placedAt: info.placedAt ?? Date.now() });
       if (typeof this.ex.adoptOrder === 'function') {
-        try {
-          this.ex.adoptOrder({
-            orderId: oid, marketId: this.config.marketId, levelIndex: info.levelIndex,
-            side: info.side, price: info.price, sizeBase: info.sizeBase ?? this.config.sizeBase,
-          });
-        } catch { /* best effort */ }
+        this.ex.adoptOrder({
+          orderId: oid, marketId: this.config.marketId, levelIndex: info.levelIndex,
+          side: info.side, price: info.price, sizeBase: info.sizeBase ?? this.config.sizeBase,
+        });
       }
     }
 
@@ -144,10 +142,15 @@ export class GridBot {
     this.ex.on('price', this._onPrice);
     if (typeof this.ex.start === 'function') this.ex.start();
     this.running = true;
-    this._startReconcileTimer();
-    this._alert(`已恢复运行中的 ${this.config.displayName} ${labelMode(this.config.mode)}：接管 ${this.active.size} 个挂单，正在与交易所对账…`);
-    this.reconcileOpenOrders().catch(() => {}); // immediate reconcile
-    this._changed();
+    try {
+      await this.reconcileOpenOrders();
+      this._alert(`已恢复运行中的 ${this.config.displayName} ${labelMode(this.config.mode)}：接管 ${this.active.size} 个挂单并完成对账。`);
+      this._changed();
+      this._startReconcileTimer();
+    } catch (cause) {
+      this._rollbackResume();
+      throw new Error(`恢复初始对账失败：${cause?.message || cause}`, { cause });
+    }
     return this.getState();
   }
 
@@ -165,12 +168,10 @@ export class GridBot {
     for (const [id, info] of (Array.isArray(snap.active) ? snap.active : [])) {
       const oid = String(id);
       this.active.set(oid, { ...info, placedAt: info.placedAt ?? Date.now() });
-      try {
-        this.ex.adoptOrder?.({
-          orderId: oid, marketId: this.config.marketId, levelIndex: info.levelIndex,
-          side: info.side, price: info.price, sizeBase: info.sizeBase ?? this.config.sizeBase,
-        });
-      } catch { /* best effort */ }
+      this.ex.adoptOrder?.({
+        orderId: oid, marketId: this.config.marketId, levelIndex: info.levelIndex,
+        side: info.side, price: info.price, sizeBase: info.sizeBase ?? this.config.sizeBase,
+      });
     }
     this.ex.on('fill', this._onFill);
     this.ex.on('price', this._onPrice);
@@ -180,11 +181,23 @@ export class GridBot {
     const px = await this.ex.getPrice(this.config.marketId).catch(() => null);
     if (px > 0) this.lastPrice = px;
     this._recoveryOccupied = new Set();
-    this._alert(`已恢复 ${this.config.displayName} 的「只减仓回收阶梯」：接管 ${this.active.size} 个挂单，正在与交易所对账…`);
-    await this.reconcileOpenOrders().catch(() => {});
-    this._startReconcileTimer();
-    this._changed();
+    try {
+      await this.reconcileOpenOrders();
+      this._alert(`已恢复 ${this.config.displayName} 的「只减仓回收阶梯」：接管 ${this.active.size} 个挂单并完成对账。`);
+      this._changed();
+      this._startReconcileTimer();
+    } catch (cause) {
+      this._rollbackResume();
+      throw new Error(`恢复初始对账失败：${cause?.message || cause}`, { cause });
+    }
     return this.getState();
+  }
+
+  _rollbackResume() {
+    this.running = false;
+    this._stopReconcileTimer();
+    this.ex.off('fill', this._onFill);
+    this.ex.off('price', this._onPrice);
   }
 
   /**
@@ -193,7 +206,10 @@ export class GridBot {
    */
   async recoverStrayOrders() {
     if (!this.config) return;
-    await this.ex.cancelAll(this.config.marketId).catch(() => {});
+    await this._requireCancelAll(this.config.marketId, '恢复失败清理');
+    this._rollbackResume();
+    this.recovery = false;
+    this.active.clear();
     this._alert('⚠️ 检测到上次运行未正常结束：已撤销该市场遗留挂单。请确认仓位后重新启动网格。');
     this._changed();
   }
@@ -856,9 +872,8 @@ export class GridBot {
     // duplicate ladder orders stack unchecked).
     const ladderPad = (!recovery && this.config.outOfRangeAction === 'recover') ? (this.grid?.count ?? 0) : 0;
     const idxLo = 0 - ladderPad, idxHi = nLevels === Infinity ? Infinity : nLevels + ladderPad;
-    let real;
-    try { real = await this.ex.fetchOpenOrders(this.config.marketId); } catch { return; }
-    if (!Array.isArray(real)) return;
+    const real = await this.ex.fetchOpenOrders(this.config.marketId);
+    if (!Array.isArray(real)) throw new Error('挂单对账失败：交易所返回了无效响应');
     this._exchangeOpenOrders = real.length;
     const realIds = new Set(real.map((o) => String(o.orderId)));
     const now = Date.now();
@@ -932,7 +947,9 @@ export class GridBot {
 
   _startReconcileTimer() {
     if (this._reconTimer) return;
-    this._reconTimer = setInterval(() => { this.reconcileOpenOrders().catch(() => {}); }, RECONCILE_MS);
+    this._reconTimer = setInterval(() => {
+      this.reconcileOpenOrders().catch((error) => this._handleExError(error));
+    }, RECONCILE_MS);
     this._reconTimer.unref?.();
   }
   _stopReconcileTimer() { if (this._reconTimer) { clearInterval(this._reconTimer); this._reconTimer = null; } }

@@ -115,3 +115,33 @@ test('automatic out-of-range stop records cancellation failure', async () => {
   assert.match(errors.join('\n'), /自动停止失败.*撤单失败/);
   assert.equal(bot.running, true);
 });
+
+test('resume rolls back listeners and running state when initial reconciliation fails', async () => {
+  const exchange = new FakeExchange();
+  exchange.fetchOpenOrders = async () => { throw new Error('reconcile failed'); };
+  const bot = new GridBot(exchange);
+  const snapshot = {
+    running: true,
+    config: { ...config, displayName: 'TEST-USD' },
+    active: [],
+  };
+
+  await assert.rejects(bot.resume(snapshot), /reconcile failed/);
+
+  assert.equal(bot.running, false);
+  assert.equal(bot._reconTimer, null);
+  assert.equal(exchange.listenerCount('fill'), 0);
+  assert.equal(exchange.listenerCount('price'), 0);
+});
+
+test('stray-order recovery reports cancellation failure and keeps tracking', async () => {
+  const exchange = new FakeExchange({ cancelResult: false });
+  const bot = new GridBot(exchange);
+  bot.config = { ...config, displayName: 'TEST-USD' };
+  bot.active.set('old-order', { levelIndex: 1, side: 'buy', price: 95 });
+
+  await assert.rejects(bot.recoverStrayOrders(), /撤单失败/);
+
+  assert.equal(bot.active.has('old-order'), true);
+  assert.doesNotMatch(bot.alerts.map((item) => item.message).join('\n'), /已撤销/);
+});

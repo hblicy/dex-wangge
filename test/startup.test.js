@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { createExchange as createRsExchange } from '../src/exchange/rs/index.js';
 import { initializeExchange } from '../src/startup.js';
+import { remapSnapshotMarket, resumeRunningSnapshot } from '../src/recovery.js';
 
 test('RISEx live is rejected before signer key reaches unofficial SDK', () => {
   assert.throws(
@@ -44,4 +45,26 @@ test('paper exchange initialization failure is reported but does not abort start
 
   assert.equal(result, false);
   assert.equal(errors.some((line) => line.includes('market feed unavailable')), true);
+});
+
+test('running snapshot is remapped by displayName before resume', async () => {
+  const snapshot = { running: true, config: { marketId: 99, displayName: 'BTC-USD' } };
+  const exchange = { getMarkets: async () => [{ marketId: 7, displayName: 'BTC-USD' }] };
+
+  const mapped = await remapSnapshotMarket(exchange, snapshot);
+
+  assert.equal(mapped.config.marketId, 7);
+  assert.equal(snapshot.config.marketId, 99);
+});
+
+test('resume receives remapped id and propagates reconciliation failure', async () => {
+  let received;
+  const bot = { resume: async (snapshot) => { received = snapshot; throw new Error('reconcile failed'); } };
+  const exchange = { dataSource: 'real', getMarkets: async () => [{ marketId: 7, displayName: 'BTC-USD' }] };
+
+  await assert.rejects(
+    resumeRunningSnapshot(bot, exchange, { running: true, config: { marketId: 99, displayName: 'BTC-USD' } }),
+    /reconcile failed/,
+  );
+  assert.equal(received.config.marketId, 7);
 });

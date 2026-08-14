@@ -19,6 +19,7 @@ import { createAiService } from './ai/service.js';
 import { enforceRequestSecurity, HttpRequestError, readJsonBody } from './security.js';
 import { SseClientPool } from './sse.js';
 import { initializeExchange } from './startup.js';
+import { remapSnapshotMarket, resumeRunningSnapshot } from './recovery.js';
 
 // ── 启动配置 ─────────────────────────────────────────────────────────────────
 const cfg = getConfig();
@@ -205,12 +206,7 @@ function makeExchangeHandler(prefix, bot, exchange, exCfg, clients, name) {
           const snap = loadSnapshot(key);
           if (snap?.running && snap?.config) {
             try {
-              // marketId 是按连接会话编号的，可能已漂移：按市场名称重新解析
-              const markets = await exchange.getMarkets();
-              const norm = (x) => String(x || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-              const m = markets.find((x) => norm(x.displayName) === norm(snap.config.displayName) || norm(x.name) === norm(snap.config.displayName));
-              if (m) snap.config.marketId = m.marketId;
-              await bot.resume(snap);
+              await resumeRunningSnapshot(bot, exchange, snap);
               resumed = true;
               console.log(`[恢复] ${key.toUpperCase()} 重连成功后已自动续跑，接管挂单并完成对账。`);
             } catch (e) {
@@ -219,7 +215,7 @@ function makeExchangeHandler(prefix, bot, exchange, exCfg, clients, name) {
             }
           }
         }
-        if (bot.running) await bot.reconcileOpenOrders().catch(() => {});
+        if (bot.running && !resumed) await bot.reconcileOpenOrders();
         return send(res, 200, { ok: true, resumed, resumeError, state: bot.getState() });
       } catch (e) {
         return send(res, 500, { error: e?.message || String(e) });
@@ -497,17 +493,18 @@ await Promise.all([
 async function resumeIfWasRunning(bot, exchange, key) {
   const snap = loadSnapshot(key);
   if (!(snap?.running && snap?.config)) return;
-  if (exchange.dataSource == null) {
-    console.log(`[恢复] ${key.toUpperCase()} 交易所未连接，跳过续跑；保留挂单待下次连接。`);
-    return;
-  }
+  if (exchange.dataSource == null) return console.log(`[恢复] ${key.toUpperCase()} 交易所未连接，跳过续跑；保留挂单待下次连接。`);
   try {
     console.log(`[恢复] 检测到 ${key.toUpperCase()} 上次为运行状态，正在接管续跑...`);
-    await bot.resume(snap);
+    await resumeRunningSnapshot(bot, exchange, snap);
     console.log(`[恢复] ${key.toUpperCase()} 已续跑，接管挂单并完成对账。`);
   } catch (e) {
-    console.error(`[恢复] ${key.toUpperCase()} 续跑失败（${e?.message || e}），改为撤销遗留挂单。`);
-    await bot.recoverStrayOrders().catch(() => {});
+    console.error(`[恢复] ${key.toUpperCase()} 续跑失败（${e?.message || e}），正在撤销遗留挂单。`);
+    try {
+      await bot.recoverStrayOrders();
+    } catch (cause) {
+      throw new Error(`${key.toUpperCase()} 恢复失败且遗留挂单撤销失败：${cause?.message || cause}`, { cause });
+    }
   }
 }
 await Promise.all([
@@ -521,18 +518,15 @@ await Promise.all([
 // marketIds every run, so the persisted numeric id may point at the wrong market
 // — re-resolve it by the market NAME, then start watching it so the position is
 // polled into getState.
-const _norm = (x) => String(x || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 async function detectOrphanPosition(bot, ex) {
   if (!bot.config?.displayName || ex.dataSource == null || typeof ex.getMarkets !== 'function') return;
   try {
-    const markets = await ex.getMarkets();
-    const want = _norm(bot.config.displayName);
-    const m = markets.find((x) => _norm(x.displayName) === want || _norm(x.name) === want || _norm(x.symbol) === want);
-    if (m) {
-      bot.config.marketId = m.marketId;            // fix stale/ephemeral id -> current
-      await ex.getPrice(m.marketId).catch(() => {}); // seed watch -> position gets polled
-    }
-  } catch { /* ignore */ }
+    const mapped = await remapSnapshotMarket(ex, bot.snapshot());
+    bot.config = mapped.config;
+    await ex.getPrice(mapped.config.marketId); // seed watch -> position gets polled
+  } catch (error) {
+    console.error(`[恢复] ${bot.config.displayName} 孤立仓位探测失败：${error?.message || error}`);
+  }
 }
 await Promise.all([
   detectOrphanPosition(deBot, deExchange),
