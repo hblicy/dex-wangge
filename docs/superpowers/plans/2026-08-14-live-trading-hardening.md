@@ -18,7 +18,6 @@
 - Create: `test/helpers/fake-exchange.js`
 - Create: `test/bot.test.js`
 - Modify: `src/bot.js:76-77, 110-150, 194-224, 257-317, 326-375, 410-445, 647-690`
-- Modify: `package.json:7-10`
 
 - [ ] **Step 1: 创建可重复的假交易所**
 
@@ -181,20 +180,16 @@ async _closeWithConfirm(marketId, { attempts = 3, waitMs = 8000 } = {}) {
 }
 ```
 
-- [ ] **Step 5: 把新测试加入标准测试命令并确认 GREEN**
+- [ ] **Step 5: 确认 GREEN**
 
-```json
-"test": "node test/grid.test.js && node --test test/security.test.js test/bot.test.js test/exchange-adapters.test.js test/startup.test.js test/persist.test.js"
-```
-
-在后续测试文件尚未创建前，暂时运行：`node --test test/bot.test.js`
+运行：`node --test test/bot.test.js`。完整 `npm test` 命令在所有测试文件创建完成后的 Task 7 一次性更新，保证每个中间提交都可执行。
 
 Expected: Task 1 全部测试通过。
 
 - [ ] **Step 6: 提交 Task 1**
 
 ```bash
-git add src/bot.js test/helpers/fake-exchange.js test/bot.test.js package.json
+git add src/bot.js test/helpers/fake-exchange.js test/bot.test.js
 git commit -m "修复：交易状态机失败时停止并保留订单跟踪"
 ```
 
@@ -375,7 +370,7 @@ export async function initializeExchange(exchange, name, config, logger = consol
 
 Run: `node --test test/startup.test.js`
 
-Expected: 4 项通过。
+Expected: 5 项通过。
 
 - [ ] **Step 5: 提交 Task 3**
 
