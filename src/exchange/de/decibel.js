@@ -580,6 +580,13 @@ export class DecibelExchange extends EventEmitter {
       const o = rows.find((r) => String(r.order_id) === String(id));
       if (o) {
         const st = String(o.status || '');
+        const remaining = Number(o.remaining_size);
+        if (/partial|open|new|resting|pending|acknowledged/i.test(st)
+            && (!Number.isFinite(remaining) || remaining > 0)) {
+          t.goneAttempts = 0;
+          t.seen = true;
+          return;
+        }
         fillSize = confirmedDecibelFillSize(o, t.sizeBase);
         if (fillSize != null) verdict = 'filled';
         else if (/cancel|reject|expire/i.test(st)) verdict = 'cancelled';

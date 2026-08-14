@@ -46,6 +46,9 @@ export class GridBot {
     this._lastErrLogAt = 0;
     this._retryQueue = [];           // failed CLOSING-leg placements awaiting retry (never opening legs)
     this._noPosStreak = 0;           // consecutive empty-position observations (recovery finish guard)
+    this._finishingRecovery = false; // prevents concurrent recovery-finalization attempts
+    this._cancellingRecoveryLadder = false;
+    this._recoveryOrdersPromise = null;
     this._pnlBase = null;            // realizedPnl baseline; resetStats uses an offset because some
                                      // adapters (RISEx) re-fetch realizedPnl from the exchange every poll
   }
@@ -230,6 +233,7 @@ export class GridBot {
         this._rollbackResume();
         this.active.clear();
         this.recovery = false;
+        this._changed();
       }
       throw cause;
     }
@@ -259,7 +263,10 @@ export class GridBot {
     };
   }
 
-  async _requireCancelAll(marketId, action) {
+  async _requireCancelAll(marketId, action, { waitForRecovery = true } = {}) {
+    if (waitForRecovery && this._recoveryOrdersPromise) {
+      await this._recoveryOrdersPromise;
+    }
     let ok;
     try { ok = await this.ex.cancelAll(marketId); }
     catch (cause) {
@@ -341,11 +348,17 @@ export class GridBot {
       let cleanupError = null;
       try { await this._requireCancelAll(market.marketId, '初始挂单失败清理'); }
       catch (e) { cleanupError = e; }
-      this.ex.off('fill', this._onFill);
-      this.ex.off('price', this._onPrice);
       if (cleanupError) {
+        // At least one seed order is still live and cancellation was not
+        // confirmed. Keep the bot fully attached so fills remain managed.
+        this.running = true;
+        this._startReconcileTimer();
+        this._alert(`❌ 初始挂单失败且已接受订单无法确认撤销；机器人继续跟踪 ${this.active.size} 笔订单，请立即检查交易所。`);
+        this._changed();
         throw new Error(`初始挂单失败，且清理已挂订单失败：${cleanupError.message}`, { cause: cleanupError });
       }
+      this.ex.off('fill', this._onFill);
+      this.ex.off('price', this._onPrice);
       this.active.clear();
       throw new Error('初始挂单失败：已撤销本次启动已接受的订单。');
     }
@@ -598,7 +611,10 @@ export class GridBot {
     if (p.marketId !== this.config.marketId) return;
     this.lastPrice = p.price;
     this._drainRetryQueue();
-    if (this.recovery) { this._manageRecoveryStandalone(); return; }
+    if (this.recovery) {
+      this._manageRecoveryStandalone().catch((error) => this._handleExError(error));
+      return;
+    }
     const out = p.price < this.config.lower || p.price > this.config.upper;
     const action = this.config.outOfRangeAction || 'close';
     if (out && !this.outOfRange) {
@@ -606,7 +622,7 @@ export class GridBot {
       const where = p.price < this.config.lower ? '跌破下边界' : '突破上边界';
       if (action === 'recover') {
         this._alert(`⚠️ 价格${where}（${round2(p.price)}），启用「只减仓回收阶梯」：暂停补单，挂出 reduce-only 单等回调分批减仓（只减不加、不自动止损，请自行控制风险）。`);
-        this._placeRecoveryLadder();
+        this._placeRecoveryLadder().catch((error) => this._handleExError(error));
       } else {
         this._alert(`⚠️ 价格${where}（${round2(p.price)}），触发「冲破区间平仓」：撤单 + 平仓 + 停止。`);
         if (!this._stopping) {
@@ -621,11 +637,18 @@ export class GridBot {
         }
       }
     } else if (out && this.outOfRange && action === 'recover') {
-      this._placeRecoveryLadder(); // extend the ladder as price makes new extremes (dedup keeps it idempotent)
+      this._placeRecoveryLadder().catch((error) => this._handleExError(error)); // extend as price makes new extremes
     } else if (!out && this.outOfRange) {
-      this.outOfRange = false;
-      this._cancelRecoveryLadder();
-      this._alert(`价格回到区间内（${round2(p.price)}），撤销回收阶梯，恢复正常网格运行。`);
+      if (this._cancellingRecoveryLadder) return;
+      this._cancellingRecoveryLadder = true;
+      this._cancelRecoveryLadder()
+        .then(() => {
+          this.outOfRange = false;
+          this._alert(`价格回到区间内（${round2(p.price)}），已撤销回收阶梯，恢复正常网格运行。`);
+          this._changed();
+        })
+        .catch((error) => this._handleExError(error))
+        .finally(() => { this._cancellingRecoveryLadder = false; });
     }
   }
 
@@ -634,51 +657,64 @@ export class GridBot {
    * 单。价格每回调一档就分批了结被套住的库存。reduce-only 保证「只减不加」（永远不会
    * 把套牢的仓位越加越大）；本策略不自动止损 —— 趋势继续单边延续会一直扛着。
    */
-  _placeRecoveryLadder() {
+  async _placeRecoveryLadder() {
     if (!this.running || !this.outOfRange || !this.grid) return;
     if ((this.config.outOfRangeAction || 'close') !== 'recover') return;
-    const price = this.lastPrice;
-    if (!Number.isFinite(price) || price <= 0) return;
-    const pos = this.ex.getPosition?.(this.config.marketId);
-    if (!pos || !pos.sizeBase) return; // 没有可减的持仓
-    const sp = this.grid.spacing, lvl0 = this.grid.levels[0];
-    const L = this.config.lower, U = this.config.upper;
-    const long = pos.sizeBase > 0;
-    const existing = new Set([...this.active.values()].filter((o) => o.recovery).map((o) => o.levelIndex));
-    const maxRungs = this.grid.count;
-    let placed = 0;
-    const room = () => existing.size + placed < maxRungs;
-    if (long && price < L) {
-      // 跌破下边界、手里是多头：在「现价 ↔ 下边界」之间挂 reduce-only 卖单
-      for (let lv = L - sp; lv > price && room(); lv -= sp) {
-        const idx = Math.round((lv - lvl0) / sp);
-        if (existing.has(idx)) continue;
-        this._place({ levelIndex: idx, side: 'sell', price: lv, reduceOnly: true, recovery: true, opening: false });
-        placed++;
+    if (this._recoveryOrdersPromise) return this._recoveryOrdersPromise;
+    const managePromise = (async () => {
+      const price = this.lastPrice;
+      if (!Number.isFinite(price) || price <= 0) return;
+      const pos = this.ex.getPosition?.(this.config.marketId);
+      if (!pos || !pos.sizeBase) return; // 没有可减的持仓
+      const sp = this.grid.spacing, lvl0 = this.grid.levels[0];
+      const L = this.config.lower, U = this.config.upper;
+      const long = pos.sizeBase > 0;
+      const existing = new Set([...this.active.values()].filter((o) => o.recovery).map((o) => o.levelIndex));
+      const maxRungs = this.grid.count;
+      let placed = 0;
+      const room = () => existing.size + placed < maxRungs;
+      if (long && price < L) {
+        // 跌破下边界、手里是多头：在「现价 ↔ 下边界」之间挂 reduce-only 卖单
+        for (let lv = L - sp; lv > price && room(); lv -= sp) {
+          const idx = Math.round((lv - lvl0) / sp);
+          if (existing.has(idx)) continue;
+          if (await this._place({ levelIndex: idx, side: 'sell', price: lv, reduceOnly: true, recovery: true, opening: false })) placed++;
+        }
+      } else if (!long && price > U) {
+        // 突破上边界、手里是空头：在「上边界 ↔ 现价」之间挂 reduce-only 买单
+        for (let lv = U + sp; lv < price && room(); lv += sp) {
+          const idx = Math.round((lv - lvl0) / sp);
+          if (existing.has(idx)) continue;
+          if (await this._place({ levelIndex: idx, side: 'buy', price: lv, reduceOnly: true, recovery: true, opening: false })) placed++;
+        }
       }
-    } else if (!long && price > U) {
-      // 突破上边界、手里是空头：在「上边界 ↔ 现价」之间挂 reduce-only 买单
-      for (let lv = U + sp; lv < price && room(); lv += sp) {
-        const idx = Math.round((lv - lvl0) / sp);
-        if (existing.has(idx)) continue;
-        this._place({ levelIndex: idx, side: 'buy', price: lv, reduceOnly: true, recovery: true, opening: false });
-        placed++;
+      if (placed) {
+        this._alert(`回收阶梯：新挂 ${placed} 个 reduce-only ${long ? '卖' : '买'}单，等回调分批减仓。`);
+        this._changed();
       }
-    }
-    if (placed) {
-      this._alert(`回收阶梯：新挂 ${placed} 个 reduce-only ${long ? '卖' : '买'}单，等回调分批减仓。`);
-      this._changed();
+    })();
+    this._recoveryOrdersPromise = managePromise;
+    try { return await managePromise; }
+    finally {
+      if (this._recoveryOrdersPromise === managePromise) this._recoveryOrdersPromise = null;
     }
   }
 
   /** Cancel all recovery-ladder orders (when price returns into range). */
   async _cancelRecoveryLadder() {
+    // A price tick can return into range while the previous tick is still
+    // placing reduce-only orders. Let that placement settle before snapshotting
+    // ids, otherwise a late order can appear after cancellation completes.
+    if (this._recoveryOrdersPromise) await this._recoveryOrdersPromise;
     const ids = [...this.active].filter(([, o]) => o.recovery).map(([id]) => id);
     if (!ids.length) return;
     for (const id of ids) {
-      await this.ex.cancelOrder?.(this.config.marketId, id)?.catch?.(() => {});
-      this.active.delete(id);
+      const cancelled = await this.ex.cancelOrder(this.config.marketId, id);
+      if (cancelled !== true) {
+        throw new Error(`回收阶梯撤单失败：交易所未确认订单 ${id} 已撤销。`);
+      }
     }
+    for (const id of ids) this.active.delete(id);
     this._alert(`已撤销 ${ids.length} 个回收阶梯挂单。`);
     this._changed();
   }
@@ -731,8 +767,16 @@ export class GridBot {
       // a prior recovery session) so we adopt/dedup them instead of stacking a whole
       // new ladder on top — the cause of the runaway open-order count.
       this._recoveryOccupied = new Set();
-      await this.reconcileOpenOrders().catch(() => {});
-      this._manageRecoveryStandalone();
+      try {
+        await this.reconcileOpenOrders();
+      } catch (cause) {
+        this._rollbackResume();
+        this.recovery = false;
+        this.active.clear();
+        this._recoveryOccupied = new Set();
+        throw new Error(`回收启动对账失败：${cause?.message || cause}`, { cause });
+      }
+      await this._manageRecoveryStandalone();
       this._startReconcileTimer(); // keep deduping/pruning the ladder while it runs
       this._changed();
       return this.getState();
@@ -792,72 +836,83 @@ export class GridBot {
   }
 
   /** 独立回收阶梯：始终在现价的"下一档步进"处维持一排 reduce-only 退出单。 */
-  _manageRecoveryStandalone() {
+  async _manageRecoveryStandalone() {
     if (!this.running || !this.recovery || !this.config) return;
-    const price = this.lastPrice;
-    if (!Number.isFinite(price) || price <= 0) return;
-    const pos = this.ex.getPosition?.(this.config.marketId);
-    if (!pos || !pos.sizeBase) {
-      // Require several CONSECUTIVE empty observations before declaring the
-      // recovery finished — a single transient empty response from the position
-      // endpoint (network blip) must not tear down the whole ladder.
-      if (++this._noPosStreak >= 5) this._finishRecovery();
-      return;
-    }
-    this._noPosStreak = 0;
-    const sp = this.config.spacing;
-    if (!(sp > 0)) return;
-    const long = pos.sizeBase > 0;
-    // "只在入场价以上(不亏)减仓"：多头只在 >= 成本价挂卖，空头只在 <= 成本价挂买。
-    const aboveEntry = !!this.config.aboveEntryOnly;
-    const entry = Number(pos.entryPrice) || 0;
-    // Rungs needed = enough to fully exit the CURRENT position (not a fixed 30).
-    // As fills shrink the position, `need` shrinks too, so the ladder never
-    // over-provisions. Hard ceiling guards against a pathological position/step.
-    const HARD_MAX = 80;
-    const perRung = this.config.sizeBase || (Math.abs(pos.sizeBase) / 20);
-    const need = Math.min(HARD_MAX, Math.max(1, Math.ceil(Math.abs(pos.sizeBase) / perRung)));
-    // Occupied = our tracked recovery levels UNION the exchange's real resting
-    // levels (from reconcile). Using the real set means a spurious "order gone"
-    // can't trick us into stacking a second order on a level that is still live.
-    const existing = new Set([...this.active.values()].filter((o) => o.recovery).map((o) => o.levelIndex));
-    for (const idx of this._recoveryOccupied) existing.add(idx);
-    let placed = 0;
-    if (long) {
-      let lv = Math.ceil(price / sp) * sp; if (lv <= price) lv += sp;
-      if (aboveEntry && entry > 0) { const eLv = Math.ceil(entry / sp) * sp; if (lv < eLv) lv = eLv; } // 不在成本价下方卖
-      for (let k = 0; k < HARD_MAX && existing.size + placed < need; k++, lv += sp) {
-        const idx = Math.round(lv / sp);
-        if (existing.has(idx)) continue;
-        this._place({ levelIndex: idx, side: 'sell', price: lv, reduceOnly: true, recovery: true, opening: false });
-        placed++;
+    if (this._recoveryOrdersPromise) return this._recoveryOrdersPromise;
+    const managePromise = (async () => {
+      const price = this.lastPrice;
+      if (!Number.isFinite(price) || price <= 0) return;
+      const pos = this.ex.getPosition?.(this.config.marketId);
+      if (!pos || !pos.sizeBase) {
+        // Require several CONSECUTIVE empty observations before declaring the
+        // recovery finished — a single transient empty response from the position
+        // endpoint (network blip) must not tear down the whole ladder.
+        if (++this._noPosStreak >= 5) await this._finishRecovery();
+        return;
       }
-    } else {
-      let lv = Math.floor(price / sp) * sp; if (lv >= price) lv -= sp;
-      if (aboveEntry && entry > 0) { const eLv = Math.floor(entry / sp) * sp; if (lv > eLv) lv = eLv; } // 不在成本价上方买
-      for (let k = 0; k < HARD_MAX && existing.size + placed < need; k++, lv -= sp) {
-        const idx = Math.round(lv / sp);
-        if (existing.has(idx)) continue;
-        this._place({ levelIndex: idx, side: 'buy', price: lv, reduceOnly: true, recovery: true, opening: false });
-        placed++;
+      this._noPosStreak = 0;
+      const sp = this.config.spacing;
+      if (!(sp > 0)) return;
+      const long = pos.sizeBase > 0;
+      // "只在入场价以上(不亏)减仓"：多头只在 >= 成本价挂卖，空头只在 <= 成本价挂买。
+      const aboveEntry = !!this.config.aboveEntryOnly;
+      const entry = Number(pos.entryPrice) || 0;
+      // Rungs needed = enough to fully exit the CURRENT position (not a fixed 30).
+      // As fills shrink the position, `need` shrinks too, so the ladder never
+      // over-provisions. Hard ceiling guards against a pathological position/step.
+      const HARD_MAX = 80;
+      const perRung = this.config.sizeBase || (Math.abs(pos.sizeBase) / 20);
+      const need = Math.min(HARD_MAX, Math.max(1, Math.ceil(Math.abs(pos.sizeBase) / perRung)));
+      // Occupied = our tracked recovery levels UNION the exchange's real resting
+      // levels (from reconcile). Using the real set means a spurious "order gone"
+      // can't trick us into stacking a second order on a level that is still live.
+      const existing = new Set([...this.active.values()].filter((o) => o.recovery).map((o) => o.levelIndex));
+      for (const idx of this._recoveryOccupied) existing.add(idx);
+      let placed = 0;
+      if (long) {
+        let lv = Math.ceil(price / sp) * sp; if (lv <= price) lv += sp;
+        if (aboveEntry && entry > 0) { const eLv = Math.ceil(entry / sp) * sp; if (lv < eLv) lv = eLv; } // 不在成本价下方卖
+        for (let k = 0; k < HARD_MAX && existing.size + placed < need; k++, lv += sp) {
+          const idx = Math.round(lv / sp);
+          if (existing.has(idx)) continue;
+          if (await this._place({ levelIndex: idx, side: 'sell', price: lv, reduceOnly: true, recovery: true, opening: false })) placed++;
+        }
+      } else {
+        let lv = Math.floor(price / sp) * sp; if (lv >= price) lv -= sp;
+        if (aboveEntry && entry > 0) { const eLv = Math.floor(entry / sp) * sp; if (lv > eLv) lv = eLv; } // 不在成本价上方买
+        for (let k = 0; k < HARD_MAX && existing.size + placed < need; k++, lv -= sp) {
+          const idx = Math.round(lv / sp);
+          if (existing.has(idx)) continue;
+          if (await this._place({ levelIndex: idx, side: 'buy', price: lv, reduceOnly: true, recovery: true, opening: false })) placed++;
+        }
       }
+      if (placed) this._changed();
+    })();
+    this._recoveryOrdersPromise = managePromise;
+    try { return await managePromise; }
+    finally {
+      if (this._recoveryOrdersPromise === managePromise) this._recoveryOrdersPromise = null;
     }
-    if (placed) this._changed();
   }
 
   /** 持仓已减完 -> 结束回收。 */
-  _finishRecovery() {
-    if (!this.recovery) return;
-    this.recovery = false;
-    this._stopReconcileTimer();
-    this._recoveryOccupied = new Set();
-    this.ex.off('fill', this._onFill);
-    this.ex.off('price', this._onPrice);
-    this.ex.cancelAll?.(this.config.marketId)?.catch?.(() => {});
-    this.active.clear();
-    this.running = false;
-    this._alert('回收完成：持仓已全部减完，回收阶梯已停止。');
-    this._changed();
+  async _finishRecovery() {
+    if (!this.recovery || this._finishingRecovery) return;
+    this._finishingRecovery = true;
+    try {
+      await this._requireCancelAll(this.config.marketId, '回收完成', { waitForRecovery: false });
+      this.recovery = false;
+      this._stopReconcileTimer();
+      this._recoveryOccupied = new Set();
+      this.ex.off('fill', this._onFill);
+      this.ex.off('price', this._onPrice);
+      this.active.clear();
+      this.running = false;
+      this._alert('回收完成：持仓已全部减完，回收阶梯已停止。');
+      this._changed();
+    } finally {
+      this._finishingRecovery = false;
+    }
   }
 
   /**
@@ -935,14 +990,21 @@ export class GridBot {
           // opening/closing heuristic (mirrors _handleFill's fallback): in short
           // mode buys close, otherwise sells close.
           const closing = recovery ? true : ((this.config.mode === 'short') ? side === 'buy' : side === 'sell');
-          try { this.ex.adoptOrder?.({ orderId: o.orderId, marketId: this.config.marketId, levelIndex: idx, side, price: px, sizeBase: this.config.sizeBase }); } catch { /* ignore */ }
+          this.ex.adoptOrder?.({ orderId: o.orderId, marketId: this.config.marketId, levelIndex: idx, side, price: px, sizeBase: this.config.sizeBase });
           this.active.set(String(o.orderId), { levelIndex: idx, side, price: px, opening: !closing, recovery, placedAt: now });
           adopted++;
         }
         continue;
       }
-      try { await this.ex.cancelOrder(this.config.marketId, o.orderId); this.active.delete(String(o.orderId)); trimmed++; }
-      catch { /* leave it; next cycle retries */ }
+      try {
+        const cancelled = await this.ex.cancelOrder(this.config.marketId, o.orderId);
+        if (cancelled !== true) throw new Error(`重复挂单撤销未确认：${o.orderId}`);
+        this.active.delete(String(o.orderId));
+        trimmed++;
+      } catch (error) {
+        // Keep tracking and make the failed cleanup visible; the next cycle retries.
+        this._handleExError(error);
+      }
     }
     if (recovery) this._recoveryOccupied = occupied;
 

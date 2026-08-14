@@ -443,21 +443,19 @@ export class ExtendedExchange extends EventEmitter {
       if (o) {
         const fq = Number(o.filledQty ?? 0);
         const st = String(o.status || '');
-        if (fq > 0 || /FILLED/i.test(st)) {            // positive confirmation only
+        if (/NEW|OPEN|ACCEPTED|PENDING|UNTRIGGERED|PARTIAL/i.test(st)) {
+          // A partial fill still has a live remainder. Keep tracking it; only a
+          // terminal status may emit the executed quantity as a completed fill.
+          t.goneAttempts = 0;
+          t.seen = true;
+          return;
+        } else if (fq > 0 || /FILLED/i.test(st)) {     // positive confirmation only
           verdict = 'filled';
           if (fq > 0) fillSize = fq;
           const avg = Number(o.averagePrice ?? 0);
           if (avg > 0) fillPrice = avg;
         } else if (/CANCELLED|REJECTED|EXPIRED/i.test(st)) {
           verdict = 'cancelled';
-        } else if (/NEW|OPEN|ACCEPTED|PENDING|UNTRIGGERED|PARTIAL/i.test(st)) {
-          // History says the order is STILL LIVE: the open-orders snapshot that
-          // reported it "gone" was a glitch. Revive tracking and bail out —
-          // counting these toward the give-up threshold used to drop dozens of
-          // perfectly live orders during an API hiccup.
-          t.goneAttempts = 0;
-          t.seen = true;
-          return;
         }
       }
     } catch { /* keep 'unknown' */ }

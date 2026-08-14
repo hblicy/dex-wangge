@@ -56,6 +56,36 @@ test('Extended mass cancellation only clears tracking after confirmed success', 
   assert.equal(exchange._tracked.has('order-1'), false);
 });
 
+test('Extended keeps a partially filled live order tracked', async () => {
+  const exchange = new ExtendedExchange({
+    apiKey: 'x', vault: '1', privateKey: '1', apiUrl: 'https://invalid.local',
+  });
+  const id = 'order-1';
+  const tracked = {
+    marketId: 1,
+    externalId: id,
+    side: 'buy',
+    price: 100,
+    sizeBase: 1,
+    levelIndex: 1,
+  };
+  exchange.markets.set(1, { marketId: 1, name: 'BTC-USD' });
+  exchange._tracked.set(id, tracked);
+  exchange._get = async () => [{
+    externalId: id,
+    status: 'PARTIALLY_FILLED',
+    filledQty: '0.25',
+    remainingQty: '0.75',
+  }];
+  const fills = [];
+  exchange.on('fill', (fill) => fills.push(fill));
+
+  await exchange._resolveGone(id, tracked);
+
+  assert.equal(exchange._tracked.has(id), true);
+  assert.equal(fills.length, 0);
+});
+
 test('Decibel partial fill returns only executed quantity', () => {
   assert.equal(
     confirmedDecibelFillSize({ orig_size: '1', remaining_size: '0.75', status: 'CANCELLED' }, 1),
@@ -69,6 +99,37 @@ test('Decibel partial fill returns only executed quantity', () => {
     confirmedDecibelFillSize({ orig_size: '1', remaining_size: '1', status: 'CANCELLED' }, 1),
     null,
   );
+});
+
+test('Decibel keeps a partially filled live order tracked', async () => {
+  const exchange = new DecibelExchange({ apiKey: 'x', privateKey: '1' });
+  const id = 'order-1';
+  const tracked = {
+    marketId: 1,
+    side: 'buy',
+    price: 100,
+    sizeBase: 1,
+    levelIndex: 1,
+  };
+  exchange.subaccount = '0x1';
+  exchange._tracked.set(id, tracked);
+  exchange.read = {
+    userOrderHistory: {
+      getByAddr: async () => [{
+        order_id: id,
+        status: 'PARTIALLY_FILLED',
+        orig_size: '1',
+        remaining_size: '0.75',
+      }],
+    },
+  };
+  const fills = [];
+  exchange.on('fill', (fill) => fills.push(fill));
+
+  await exchange._resolveGone(id, tracked);
+
+  assert.equal(exchange._tracked.has(id), true);
+  assert.equal(fills.length, 0);
 });
 
 test('Decibel cancelAll reports failure and retains failed order tracking', async () => {
