@@ -3,6 +3,7 @@ import test from 'node:test';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import * as security from '../src/security.js';
+import { SseClientPool } from '../src/sse.js';
 
 function fakeResponse() {
   return {
@@ -156,4 +157,44 @@ test('严格 JSON 解析接受空正文和合法对象', async () => {
   valid.emit('data', Buffer.from('{"closePosition":false}'));
   valid.emit('end');
   assert.deepEqual(await validPromise, { closePosition: false });
+});
+
+function fakeSseResponse(writeResult = true) {
+  const res = new EventEmitter();
+  res.ended = false;
+  res.writes = [];
+  res.write = (value) => {
+    res.writes.push(value);
+    return writeResult;
+  };
+  res.end = () => { res.ended = true; };
+  return res;
+}
+
+test('SSE 达到上限时拒绝新连接，关闭后释放配额', () => {
+  assert.equal(typeof SseClientPool, 'function');
+  const logger = { warn() {} };
+  const pool = new SseClientPool('test', 1, logger);
+  const req1 = new EventEmitter();
+  const res1 = fakeSseResponse();
+  assert.equal(pool.add(req1, res1), true);
+  assert.equal(pool.add(new EventEmitter(), fakeSseResponse()), false);
+  req1.emit('close');
+  assert.equal(pool.size, 0);
+  const req2 = new EventEmitter();
+  const res2 = fakeSseResponse();
+  assert.equal(pool.add(req2, res2), true);
+  res2.emit('close');
+  assert.equal(pool.size, 0);
+});
+
+test('SSE 写背压会结束并移除慢客户端', () => {
+  assert.equal(typeof SseClientPool, 'function');
+  const logger = { warn() {} };
+  const pool = new SseClientPool('test', 1, logger);
+  const res = fakeSseResponse(false);
+  pool.add(new EventEmitter(), res);
+  pool.broadcast('data: {}\n\n');
+  assert.equal(pool.size, 0);
+  assert.equal(res.ended, true);
 });
