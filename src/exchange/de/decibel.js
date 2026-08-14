@@ -71,6 +71,18 @@ export function pickNum(obj, ...keys) {
   return null;
 }
 
+export function confirmedDecibelFillSize(order, fallbackSize) {
+  const original = Number(order?.orig_size);
+  const remaining = Number(order?.remaining_size);
+  const filled = original - remaining;
+  if (Number.isFinite(filled) && filled > 0) return filled;
+  const fallback = Number(fallbackSize);
+  if (/fill|matched|closed/i.test(String(order?.status || '')) && Number.isFinite(fallback) && fallback > 0) {
+    return fallback;
+  }
+  return null;
+}
+
 export class DecibelExchange extends EventEmitter {
   constructor(opts = {}) {
     super();
@@ -340,23 +352,33 @@ export class DecibelExchange extends EventEmitter {
 
   async cancelOrder(marketId, orderId) {
     const m = this._market(marketId);
-    this._tracked.delete(String(orderId));
-    return this.write.cancelOrder({ orderId: String(orderId), marketName: m.name, subaccountAddr: this.subaccount });
+    const id = String(orderId);
+    await this.write.cancelOrder({ orderId: id, marketName: m.name, subaccountAddr: this.subaccount });
+    this._tracked.delete(id);
+    return true;
   }
 
   async cancelAll(marketId) {
     const m = this._market(marketId);
-    for (const [id, o] of this._tracked) if (o.marketId === m.marketId) this._tracked.delete(id);
     try {
       const open = await this._openOrders();
+      const expected = new Set(
+        [...this._tracked].filter(([, order]) => order.marketId === m.marketId).map(([id]) => id),
+      );
+      const seen = new Set();
+      let allCancelled = true;
       for (const o of open) {
         if (String(o.market) !== m.addr && String(o.market) !== m.name) continue;
         if (o.is_tpsl) continue; // leave TP/SL attached to positions alone
+        const id = String(o.order_id);
+        seen.add(id);
         try {
-          await this.write.cancelOrder({ orderId: String(o.order_id), marketName: m.name, subaccountAddr: this.subaccount });
-        } catch (e) { this.emit('error', e); }
+          await this.write.cancelOrder({ orderId: id, marketName: m.name, subaccountAddr: this.subaccount });
+          this._tracked.delete(id);
+        } catch (e) { allCancelled = false; this.emit('error', e); }
       }
-      return true;
+      for (const id of expected) if (!seen.has(id)) allCancelled = false;
+      return allCancelled;
     } catch (e) { this.emit('error', e); return false; }
   }
 
@@ -551,15 +573,15 @@ export class DecibelExchange extends EventEmitter {
     // same-side orders. We only emit a fill when the order history shows it
     // actually executed (filledQty > 0 / status FILLED). Anything inconclusive
     // defaults to "not filled": stop tracking, do NOT re-quote.
-    let verdict = 'unknown';
+    let verdict = 'unknown', fillSize = null;
     try {
       const h = await this.read.userOrderHistory.getByAddr({ subAddr: this.subaccount, limit: 100, offset: 0 });
       const rows = Array.isArray(h) ? h : (h?.items || []);
       const o = rows.find((r) => String(r.order_id) === String(id));
       if (o) {
         const st = String(o.status || '');
-        const fillQty = Number(o.orig_size ?? 0) - Number(o.remaining_size ?? 0);
-        if (fillQty > 0 || /fill|filled|matched|closed/i.test(st)) verdict = 'filled';
+        fillSize = confirmedDecibelFillSize(o, t.sizeBase);
+        if (fillSize != null) verdict = 'filled';
         else if (/cancel|reject|expire/i.test(st)) verdict = 'cancelled';
         else if (/open|new|resting|pending|acknowledged/i.test(st)) {
           // history says the order is STILL LIVE: the open-orders snapshot that
@@ -579,7 +601,7 @@ export class DecibelExchange extends EventEmitter {
     }
     this._tracked.delete(id);
     if (verdict === 'filled') {
-      this.emit('fill', { orderId: id, marketId: t.marketId, side: t.side, price: t.price, sizeBase: t.sizeBase, levelIndex: t.levelIndex });
+      this.emit('fill', { orderId: id, marketId: t.marketId, side: t.side, price: t.price, sizeBase: fillSize, levelIndex: t.levelIndex });
     } else {
       this.emit('error', new Error(`订单 ${id}（${t.side} @ ${t.price}）未确认成交，已停止跟踪（不补单）。`));
     }
