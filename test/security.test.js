@@ -255,3 +255,18 @@ test('外部字符串不再插入 innerHTML', () => {
   assert.match(html, /option\.textContent = String\(market\.displayName/);
   assert.match(html, /item\.textContent = `\$\{new Date\(alert\.t\)/);
 });
+
+test('示例配置和 README 记录认证及 Tailscale 安全边界', () => {
+  const envExample = readProject('.env.example');
+  const readme = readProject('README.md');
+  for (const key of ['HOST=127.0.0.1', 'DASHBOARD_TOKEN=', 'DASHBOARD_ORIGINS=', 'MAX_SSE_CLIENTS=10']) {
+    assert.match(envExample, new RegExp(key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  }
+  assert.match(readme, /用户名.*admin/);
+  assert.match(readme, /tailscale serve --bg 8080/);
+  assert.match(readme, /DASHBOARD_ORIGINS=https:\/\//);
+  assert.match(readme, /不要使用.*tailscale funnel/i);
+  for (const script of ['一键启动.bat', '实盘启动.bat']) {
+    assert.match(readProject(script), /DASHBOARD_TOKEN/);
+  }
+});

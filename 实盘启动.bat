@@ -45,6 +45,16 @@ if not exist ".env" (
   exit /b 1
 )
 
+findstr /r /c:"^DASHBOARD_TOKEN=................" ".env" >nul
+if errorlevel 1 (
+  echo.
+  echo [安全配置] .env 中的 DASHBOARD_TOKEN 未填写或不足 16 个字符。
+  echo            请按 README.md 生成随机令牌并写入 .env。
+  echo            浏览器登录用户名固定为 admin。
+  pause
+  exit /b 1
+)
+
 rem ── 第 3 步：安装依赖，仅首次 ──────────────────
 if not exist "node_modules" (
   echo [安装] 首次运行，正在安装依赖，需要联网，约 1-3 分钟...

@@ -36,7 +36,17 @@ for /f "delims=" %%v in ('node -v') do echo [环境] Node.js %%v 已就绪
 rem ── 第 2 步：初始化配置文件 ────────────────────
 if not exist ".env" (
   copy ".env.example" ".env" >nul
-  echo [初始化] 已从模板创建 .env —— 默认全模拟模式，无需填写任何密钥
+  echo [初始化] 已从模板创建 .env
+)
+
+findstr /r /c:"^DASHBOARD_TOKEN=................" ".env" >nul
+if errorlevel 1 (
+  echo.
+  echo [安全配置] .env 中的 DASHBOARD_TOKEN 未填写或不足 16 个字符。
+  echo            请按 README.md 的“首次启动认证配置”生成随机令牌，
+  echo            写入 .env 后重新双击本脚本。浏览器用户名固定为 admin。
+  pause
+  exit /b 1
 )
 
 rem ── 第 3 步：安装依赖，仅首次 ──────────────────
