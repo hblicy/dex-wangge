@@ -123,7 +123,9 @@ DASHBOARD_TOKEN=这里粘贴刚生成的随机值
 2. 在项目文件夹打开终端，执行：
    ```bash
    npm install        # 安装依赖
+   umask 077
    cp .env.example .env   # Windows 用: copy .env.example .env
+   chmod 600 .env     # Linux/macOS：只允许当前用户读取密钥
    openssl rand -hex 32   # 将输出写入 .env 的 DASHBOARD_TOKEN
    npm start              # 启动，等价于 node src/server.js
    ```
@@ -133,6 +135,8 @@ DASHBOARD_TOKEN=这里粘贴刚生成的随机值
 ### 4.1 VPS 安全部署：SSH 或 Tailscale
 
 VPS 上仍保持服务只监听回环地址，不要把 8080 暴露到公网：
+
+请为机器人创建独立的 Linux 服务用户，并确保项目目录和 `.env` 不允许其他用户读取。程序会在启动时拒绝权限宽于 `0600` 的 `.env`。
 
 ```dotenv
 HOST=127.0.0.1

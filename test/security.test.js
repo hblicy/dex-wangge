@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import * as security from '../src/security.js';
 import { SseClientPool } from '../src/sse.js';
+import { assertEnvFileSecure, writeEnvFile } from '../src/envfile.js';
 
 function fakeResponse() {
   return {
@@ -269,4 +270,43 @@ test('示例配置和 README 记录认证及 Tailscale 安全边界', () => {
   for (const script of ['一键启动.bat', '实盘启动.bat']) {
     assert.match(readProject(script), /DASHBOARD_TOKEN/);
   }
+});
+
+test('env writer uses and enforces owner-only mode on POSIX', () => {
+  const calls = [];
+  const fs = {
+    existsSync: () => true,
+    chmodSync: (...args) => calls.push(['chmod', ...args]),
+    writeFileSync: (...args) => calls.push(['write', ...args]),
+  };
+
+  writeEnvFile('/app/.env', 'TOKEN=x\n', { fsImpl: fs, platform: 'linux' });
+
+  assert.deepEqual(calls[0], ['chmod', '/app/.env', 0o600]);
+  assert.equal(calls[1][3].mode, 0o600);
+  assert.deepEqual(calls[2], ['chmod', '/app/.env', 0o600]);
+});
+
+test('startup rejects group-readable env file', () => {
+  const fs = { existsSync: () => true, statSync: () => ({ mode: 0o100644 }) };
+  assert.throws(
+    () => assertEnvFileSecure('/app/.env', { fsImpl: fs, platform: 'linux' }),
+    /chmod 600/,
+  );
+});
+
+test('owner-only env file is accepted', () => {
+  const fs = { existsSync: () => true, statSync: () => ({ mode: 0o100600 }) };
+  assert.doesNotThrow(
+    () => assertEnvFileSecure('/app/.env', { fsImpl: fs, platform: 'linux' }),
+  );
+});
+
+test('config loading and dashboard writes both enforce the env permission boundary', () => {
+  const configSource = fs.readFileSync(new URL('../src/config.js', import.meta.url), 'utf8');
+  const serverSource = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
+
+  assert.match(configSource, /assertEnvFileSecure\(file\)/);
+  assert.match(serverSource, /writeEnvFile\(envFile, content\)/);
+  assert.doesNotMatch(serverSource, /fs\.writeFileSync\(envFile/);
 });

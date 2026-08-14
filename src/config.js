@@ -4,11 +4,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getSecurityConfig } from './security.js';
+import { assertEnvFileSecure } from './envfile.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 export function loadEnv() {
   const file = path.join(root, '.env');
+  assertEnvFileSecure(file);
   if (fs.existsSync(file)) {
     for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
       const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)$/);

@@ -20,6 +20,7 @@ import { enforceRequestSecurity, HttpRequestError, readJsonBody } from './securi
 import { SseClientPool } from './sse.js';
 import { initializeExchange } from './startup.js';
 import { remapSnapshotMarket, resumeRunningSnapshot } from './recovery.js';
+import { writeEnvFile } from './envfile.js';
 
 // ── 启动配置 ─────────────────────────────────────────────────────────────────
 const cfg = getConfig();
@@ -366,8 +367,6 @@ const server = http.createServer(async (request, res) => {
             if (!/^https?:\/\/\S+$/i.test(val)) return send(res, 400, { error: '必须是 http(s):// 开头的 URL。' });
           }
         }
-        // 更新内存中的环境变量
-        if (val) process.env[key] = val; else delete process.env[key];
         // 写入 .env 文件
         const envFile = path.join(ROOT, '.env');
         let content = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf8') : '';
@@ -378,7 +377,9 @@ const server = http.createServer(async (request, res) => {
         } else {
           content = content.trimEnd() + '\n' + line + '\n';
         }
-        fs.writeFileSync(envFile, content, 'utf8');
+        writeEnvFile(envFile, content);
+        // 文件落盘成功后再更新内存，避免写入失败造成运行态与磁盘配置不一致。
+        if (val) process.env[key] = val; else delete process.env[key];
         return send(res, 200, { ok: true });
       } catch (e) {
         return send(res, errorStatus(e, 500), { error: e?.message || String(e) });
