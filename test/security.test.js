@@ -222,3 +222,36 @@ test('服务端入口统一调用安全边界、严格请求体和有界 SSE', (
   assert.match(server, /new SseClientPool\('de', cfg\.maxSseClients\)/);
   assert.doesNotMatch(server, /server\._overviewClients/);
 });
+
+test('页面所有 API fetch 都通过统一助手添加 POST 标记', () => {
+  const html = readProject('public/index.html');
+  assert.match(html, /function apiFetch\(input, init = \{\}\)/);
+  assert.match(html, /headers\.set\('X-Dex-Request', '1'\)/);
+  assert.equal([...html.matchAll(/\bfetch\((['"`])\/api\//g)].length, 0);
+});
+
+test('外部字符串不再插入 innerHTML', () => {
+  const html = readProject('public/index.html');
+  const unsafeFragments = [
+    "P('market').innerHTML = markets.map",
+    "P('smart-note').innerHTML =",
+    "P('st-pos').innerHTML =",
+    "P('orphan-info').innerHTML =",
+    "P('fills').innerHTML =",
+    "P('alerts').innerHTML = (s.alerts||[]).map",
+    'box.innerHTML = `🔴 ${sym}',
+    'box.innerHTML = `⚠️ ${sym}',
+    '$(statusId).innerHTML = `<span class="up">✓ 已写入',
+    '$(statusId).innerHTML = `<span class="down">✗ 写入失败：${e.message}',
+    'el.innerHTML = `<span class="up">✓ 代理正常',
+    'el.innerHTML = `<span class="down">✗ 代理无法联网：${j.error}',
+    'el.innerHTML = `<span class="down">✗ 检测请求失败：${e.message}',
+    'badge.innerHTML = `<span class="ai-badge ${lv}">',
+    'gc.innerHTML = `<div class="gc-title">',
+  ];
+  for (const fragment of unsafeFragments) {
+    assert.equal(html.includes(fragment), false, fragment);
+  }
+  assert.match(html, /option\.textContent = String\(market\.displayName/);
+  assert.match(html, /item\.textContent = `\$\{new Date\(alert\.t\)/);
+});
