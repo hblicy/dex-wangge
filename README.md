@@ -62,18 +62,38 @@
 - AI 永远不进交易快回路，下单补单对账全部是纯规则代码
 - AI 对话只能"提议"操作，必须由你在网页上点确认才会执行
 - 私钥只存在本机 `.env` 文件，程序不上传任何数据
+- 仪表盘和全部 API 使用 HTTP Basic Auth；登录用户名固定为 `admin`，密码来自 `.env` 的 `DASHBOARD_TOKEN`
+- 所有控制类 POST 请求都校验 JSON、自定义请求头和 Origin，页面不再运行时加载第三方 CDN 脚本
+- 服务默认只监听 `127.0.0.1`，远程访问使用 SSH 隧道或 Tailscale Serve
 
 ---
 
 ## 二、三分钟快速上手（模拟模式）
 
-模拟模式**不需要任何 API 密钥、不需要任何账号**，用虚拟的 10000 USDC 和真实行情练手。
+模拟模式**不需要交易所 API 密钥或账号**，用虚拟的 10000 USDC 和真实行情练手。仪表盘仍必须配置独立登录令牌，防止本机或代理误暴露后被他人操作。
 
 1. **下载本项目**到电脑任意文件夹（如果是 zip 包，先解压）。
-2. **双击 `一键启动.bat`**。脚本会自动完成所有准备工作（没装 Node.js 会帮你装，详见下一节）。
-3. 等待窗口显示"已启动"，浏览器会**自动打开** `http://localhost:8080`。
-4. 在网页里任选一个交易所（比如 Decibel），点 **🎯 智能填充参数**，再点 **启动 Decibel 网格**。
-5. 完成！观察总览页的盈亏变化。想停就点 **停止 + 撤单 + 平仓**，想关程序就关掉那个黑色命令行窗口。
+2. 第一次**双击 `一键启动.bat`**会创建 `.env`。脚本提示安全配置缺失时，按下面“首次启动认证配置”生成令牌并写入 `.env`。
+3. 再次双击 `一键启动.bat`。脚本会完成环境和依赖准备，随后自动打开 `http://localhost:8080`。
+4. 浏览器弹出登录框时，用户名输入 `admin`，密码输入你保存的 `DASHBOARD_TOKEN`。
+5. 在网页里任选一个交易所（比如 Decibel），点 **🎯 智能填充参数**，再点 **启动 Decibel 网格**。
+6. 完成！观察总览页的盈亏变化。想停就点 **停止 + 撤单 + 平仓**，想关程序就关掉那个黑色命令行窗口。
+
+### 首次启动认证配置
+
+在 PowerShell 运行以下命令生成 64 位随机十六进制令牌：
+
+```powershell
+$tokenBytes = New-Object byte[] 32
+[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($tokenBytes)
+-join ($tokenBytes | ForEach-Object { $_.ToString('x2') })
+```
+
+把输出值写入本机 `.env`，不要加到 README、截图或 Git 提交中：
+
+```dotenv
+DASHBOARD_TOKEN=这里粘贴刚生成的随机值
+```
 
 ---
 
@@ -85,7 +105,7 @@
    - 已安装 → 直接进入下一步；
    - 未安装 → 自动调用 Windows 自带的 winget 静默安装 Node.js LTS 版；
    - winget 也不可用（老系统）→ 自动打开 Node.js 官网下载页 `https://nodejs.org/zh-cn/download`，你手动安装后重新双击脚本即可。
-2. **初始化配置**：如果没有 `.env` 文件，自动从 `.env.example` 复制一份。默认配置就是全模拟模式，零填写。
+2. **初始化配置**：如果没有 `.env` 文件，自动从 `.env.example` 复制一份；若 `DASHBOARD_TOKEN` 未填写或不足 16 个字符，脚本会明确提示并停止，不会以无认证状态启动。
 3. **安装依赖**：如果没有 `node_modules` 文件夹（首次运行），自动执行 `npm install`，约 1–3 分钟。失败时会提示切换国内 npm 镜像的命令。
 4. **启动程序**：运行 `node src/server.js`，4 秒后自动打开浏览器仪表盘。
 
@@ -104,10 +124,41 @@
    ```bash
    npm install        # 安装依赖
    cp .env.example .env   # Windows 用: copy .env.example .env
-   npm start          # 启动，等价于 node src/server.js
+   openssl rand -hex 32   # 将输出写入 .env 的 DASHBOARD_TOKEN
+   npm start              # 启动，等价于 node src/server.js
    ```
-3. 浏览器打开 `http://localhost:8080`。
+3. 浏览器打开 `http://localhost:8080`，用户名使用 `admin`，密码使用 `DASHBOARD_TOKEN`。
 4. 运行测试（可选）：`npm test`。
+
+### 4.1 VPS 安全部署：SSH 或 Tailscale
+
+VPS 上仍保持服务只监听回环地址，不要把 8080 暴露到公网：
+
+```dotenv
+HOST=127.0.0.1
+PORT=8080
+DASHBOARD_TOKEN=使用_openssl_rand_hex_32_生成并只保存在VPS
+MAX_SSE_CLIENTS=10
+DASHBOARD_ORIGINS=https://your-vps.your-tailnet.ts.net
+```
+
+SSH 隧道访问：
+
+```bash
+ssh -L 8080:127.0.0.1:8080 user@vps
+```
+
+随后在本机浏览器访问 `http://127.0.0.1:8080`。
+
+已在 VPS 安装并登录 Tailscale 时，可以把本机 8080 发布到 tailnet：
+
+```bash
+sudo tailscale up
+sudo tailscale serve --bg 8080
+tailscale serve status
+```
+
+访问命令输出的 `https://your-vps.your-tailnet.ts.net` 地址。Tailscale ACL/Grants 是外层访问控制，应用自身的 Basic Auth 仍然启用。不要使用 `tailscale funnel`，Funnel 会把服务发布到公网。8080 也不应在云安全组或 VPS 防火墙中开放。Tailscale Serve 的当前命令与行为以[官方文档](https://tailscale.com/docs/features/tailscale-serve)为准。
 
 ---
 
@@ -383,6 +434,10 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
 | `PORT` | `8080` | 仪表盘端口，被占用时改成 8081 等 |
+| `HOST` | `127.0.0.1` | 监听地址；VPS 保持回环监听 |
+| `DASHBOARD_TOKEN` | 无，必填 | Basic Auth 密码，至少 16 字符；用户名固定 `admin` |
+| `DASHBOARD_ORIGINS` | 空 | 允许的反向代理 Origin，多个值用英文逗号分隔 |
+| `MAX_SSE_CLIENTS` | `10` | 每类 SSE 流最大连接数，范围 1-100 |
 | `PAPER_BALANCE` | `10000` | 模拟模式初始虚拟余额（USDC） |
 | `GLOBAL_PROXY` | 空 | 全局代理，见第八节 |
 | `DECIBEL_PROXY` / `EXTENDED_PROXY` / `RISEX_PROXY` | 空 | 各所独立代理 |
@@ -425,7 +480,7 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 
 ## 十三、REST API 一览（进阶）
 
-服务是纯 HTTP + SSE，可以自行编程调用。`{ex}` 为 `de` / `ex` / `rs`：
+服务是纯 HTTP + SSE，可以自行编程调用。`{ex}` 为 `de` / `ex` / `rs`。所有请求都需要 HTTP Basic Auth（用户名 `admin`）；所有 POST 还必须使用 `Content-Type: application/json` 并携带 `X-Dex-Request: 1`：
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
@@ -515,11 +570,12 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 ## 十六、安全须知
 
 1. **`.env` 是最高机密**：里面的私钥等于你的资金控制权。不要截图、不要发群、不要提交到任何代码仓库（`.gitignore` 已默认排除，fork 后请保留）。
-2. **优先使用交易所的 API 钱包 / API Key**，而不是主钱包私钥——API 凭据通常只有交易权限、无提币权限，泄露损失可控。
-3. **实盘前先模拟**：同样的参数先在 paper 模式跑几天，理解成交节奏和风险再上真钱。
-4. **小资金起步**：首次实盘用你亏得起的钱。
-5. **仪表盘默认只监听本机**（localhost）。若日志提示监听 `0.0.0.0`，说明局域网内其他设备也能访问，请确保网络环境可信。
-6. 本程序没有远程服务器、不上传任何数据，所有状态都在你本机。
+2. **`DASHBOARD_TOKEN` 也属于机密**：使用随机值，不要与交易所或 VPS 登录密码复用，泄露后立即更换并重启服务。
+3. **优先使用交易所的 API 钱包 / API Key**，而不是主钱包私钥——API 凭据通常只有交易权限、无提币权限，泄露损失可控。
+4. **实盘前先模拟**：同样的参数先在 paper 模式跑几天，理解成交节奏和风险再上真钱。
+5. **小资金起步**：首次实盘用你亏得起的钱。
+6. **仪表盘默认只监听本机**（localhost）。VPS 通过 SSH 隧道或 Tailscale Serve 访问，不要在安全组或防火墙公开 8080，也不要使用 Tailscale Funnel。
+7. 本程序没有远程服务器、不上传任何数据，所有状态都在你本机。
 
 ---
 

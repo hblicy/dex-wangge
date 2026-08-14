@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>网格交易总控台</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="/vendor/chart.js"></script>
 <style>
 :root {
   --bg: #0a0e17;
@@ -999,6 +999,24 @@ const cls = (v) => v == null ? '' : (v >= 0 ? 'up' : 'down');
 const round = (x) => Math.round(x * 100) / 100;
 const pnlHtml = (v) => v == null ? '—' : `<span class="${cls(v)}">${signed(v)}</span>`;
 
+function apiFetch(input, init = {}) {
+  const options = { ...init };
+  if (String(options.method || 'GET').toUpperCase() === 'POST') {
+    const headers = new Headers(options.headers || {});
+    headers.set('X-Dex-Request', '1');
+    options.headers = headers;
+  }
+  return fetch(input, options);
+}
+
+function setStatusText(element, className, message) {
+  element.replaceChildren();
+  const span = document.createElement('span');
+  span.className = className;
+  span.textContent = message;
+  element.appendChild(span);
+}
+
 const RISK = {
   steady:     { rMul:4, rMin:.02, rMax:.06, sMul:.5, sMin:.5, sMax:1, lev:{hi:2,mid:2,lo:3}, budget:.70, skew:1.2, hint:'成交少·更安全·覆盖广' },
   aggressive: { rMul:2.5, rMin:.015, rMax:.04, sMul:.25, sMin:.2, sMax:.5, lev:{hi:3,mid:5,lo:8}, budget:.90, skew:1.4, hint:'成交频繁·收益与风险更高' },
@@ -1052,7 +1070,7 @@ function makeExchangeCtrl(prefix, chartId) {
 
   async function loadMarkets() {
     try {
-      const r = await fetch(`/api/${prefix}/markets`);
+      const r = await apiFetch(`/api/${prefix}/markets`);
       const j = await r.json();
       markets = j.markets;
       // Update header badge
@@ -1060,7 +1078,13 @@ function makeExchangeCtrl(prefix, chartId) {
       hdrBadge.textContent = prefix.toUpperCase() + ': ' + j.mode.toUpperCase();
       hdrBadge.className = 'badge ' + (j.mode === 'live' ? 'badge-live' : 'badge-paper');
 
-      P('market').innerHTML = markets.map(m => `<option value="${m.marketId}">${m.displayName}</option>`).join('');
+      P('market').replaceChildren();
+      for (const market of markets) {
+        const option = document.createElement('option');
+        option.value = String(market.marketId);
+        option.textContent = String(market.displayName || market.name || market.marketId);
+        P('market').appendChild(option);
+      }
       if (markets[0]) P('size-base').value = markets[0].minOrderSize || 0.001;
       await refreshTrend();
     } catch (e) {
@@ -1072,7 +1096,7 @@ function makeExchangeCtrl(prefix, chartId) {
     const marketId = P('market').value;
     P('rec-tag').textContent = '分析中…';
     try {
-      const r = await fetch(`/api/${prefix}/trend?marketId=${marketId}&intervalSec=${P('interval').value}`);
+      const r = await apiFetch(`/api/${prefix}/trend?marketId=${marketId}&intervalSec=${P('interval').value}`);
       const j = await r.json();
       if (j.error) throw new Error(j.error);
       curTrend = j.analysis;
@@ -1128,7 +1152,7 @@ function makeExchangeCtrl(prefix, chartId) {
     autoSizePerGrid(p, lev);
     updateRiskPreview();
     const modeTxt = curTrend.recommended === 'long' ? '做多' : curTrend.recommended === 'short' ? '做空' : '中性';
-    P('smart-note').innerHTML = `✅ [${riskProfile === 'aggressive' ? '激进' : '稳健'}] <b>${modeTxt}网格</b> · ${P('grid-count').value} 格 · ${P('leverage').value}x`;
+    P('smart-note').textContent = `✅ [${riskProfile === 'aggressive' ? '激进' : '稳健'}] ${modeTxt}网格 · ${P('grid-count').value} 格 · ${P('leverage').value}x`;
   }
 
   function setMode(mode) {
@@ -1183,27 +1207,27 @@ function makeExchangeCtrl(prefix, chartId) {
       gridCount: +P('grid-count').value, sizeBase: +P('size-base').value,
       leverage: +P('leverage').value, outOfRangeAction: P('auto-stop').value,
     };
-    const r = await fetch(`/api/${prefix}/start`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+    const r = await apiFetch(`/api/${prefix}/start`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
     const j = await r.json();
     if (j.error) alert('启动失败：' + j.error);
   };
 
   P('stop-btn').onclick = async () => {
-    await fetch(`/api/${prefix}/stop`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({closePosition:true}) });
+    await apiFetch(`/api/${prefix}/stop`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({closePosition:true}) });
   };
 
   P('adjust-btn').onclick = async () => {
     const lower = +P('lower').value, upper = +P('upper').value;
     if (!(upper > lower)) { alert('请先填写有效的上/下边界'); return; }
     if (!confirm(`确认将运行中的网格区间调整为 [${lower}, ${upper}]？\n会撤销现有挂单并按新区间重新挂单（持仓保留、网格不停止）。`)) return;
-    const r = await fetch(`/api/${prefix}/adjust`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ lower, upper }) });
+    const r = await apiFetch(`/api/${prefix}/adjust`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ lower, upper }) });
     const j = await r.json();
     if (j.error) alert('调整失败：' + j.error);
   };
 
   P('reset-btn').onclick = async () => {
     if (!confirm('确认重置该交易所的统计？\n已实现盈亏、收益率、成交量、完成格数将清零，并以当前权益为新基准。\n（不影响持仓与挂单）')) return;
-    const r = await fetch(`/api/${prefix}/reset`, { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
+    const r = await apiFetch(`/api/${prefix}/reset`, { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
     const j = await r.json();
     if (j.error) alert('重置失败：' + j.error);
   };
@@ -1212,7 +1236,7 @@ function makeExchangeCtrl(prefix, chartId) {
 
   P('cancel-orders-btn').onclick = async () => {
     if (!confirm('确认一键撤销该交易所的全部挂单？\n持仓不受影响（不会平仓）。网格将停止，需要时可重新启动。')) return;
-    const r = await fetch(`/api/${prefix}/cancel-orders`, { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
+    const r = await apiFetch(`/api/${prefix}/cancel-orders`, { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
     const j = await r.json();
     if (j.error) alert('撤单失败：' + j.error);
   };
@@ -1223,7 +1247,7 @@ function makeExchangeCtrl(prefix, chartId) {
     const modeTxt = aboveEntryOnly ? '仅在成本价以上（不亏）分批减仓' : '任何反弹都分批减仓';
     if (!confirm(`对当前持仓启用「只减仓回收阶梯」？\n${modeTxt}；挂 reduce-only 单只减不加、不自动止损，需自行控制风险。`)) return;
     const marketId = lastState?.config?.marketId;
-    const r = await fetch(`/api/${prefix}/start-recovery`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ marketId, aboveEntryOnly }) });
+    const r = await apiFetch(`/api/${prefix}/start-recovery`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ marketId, aboveEntryOnly }) });
     const j = await r.json();
     if (j.error) alert('启用失败：' + j.error);
   };
@@ -1236,14 +1260,14 @@ function makeExchangeCtrl(prefix, chartId) {
     if (!(upper > lower) || !n || !sz) { alert('无法自动计算区间，请在左侧手动填写参数后点"启动"。'); return; }
     if (!confirm(`按现价重开网格：区间 [${lower}, ${upper}]，${n} 格，每格 ${sz}，${lev}x。\n现有持仓将作为网格库存保留。继续？`)) return;
     const body = { marketId: +P('market').value, mode: 'neutral', lower, upper, gridCount: n, sizeBase: sz, leverage: lev, outOfRangeAction: P('auto-stop').value };
-    const r = await fetch(`/api/${prefix}/start`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+    const r = await apiFetch(`/api/${prefix}/start`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
     const j = await r.json();
     if (j.error) alert('启动失败：' + j.error);
   };
   P('orphan-close').onclick = async () => {
     if (!confirm('确认市价平掉当前持仓？\n将撤销该市场全部挂单并立即市价平仓（此操作不可撤销）。')) return;
     const marketId = lastState?.config?.marketId;
-    const r = await fetch(`/api/${prefix}/close-position`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ marketId }) });
+    const r = await apiFetch(`/api/${prefix}/close-position`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ marketId }) });
     const j = await r.json();
     if (j.error) alert('平仓失败：' + j.error);
   };
@@ -1269,8 +1293,16 @@ function makeExchangeCtrl(prefix, chartId) {
 
     if (s.position) {
       const long = s.position.sizeBase > 0;
-      const levTxt = s.position.leverage ? ` <span class="muted">@${s.position.leverage}x</span>` : '';
-      P('st-pos').innerHTML = `<span class="${long?'up':'down'}">${long?'多':'空'} ${Math.abs(s.position.sizeBase)}</span>${levTxt}`;
+      const side = document.createElement('span');
+      side.className = long ? 'up' : 'down';
+      side.textContent = `${long ? '多' : '空'} ${Math.abs(Number(s.position.sizeBase))}`;
+      P('st-pos').replaceChildren(side);
+      if (s.position.leverage) {
+        const leverage = document.createElement('span');
+        leverage.className = 'muted';
+        leverage.textContent = ` @${Number(s.position.leverage)}x`;
+        P('st-pos').appendChild(leverage);
+      }
       P('st-entry').textContent = s.position.entryPrice || '—';
       P('st-upnl').innerHTML = pnlHtml(s.position.unrealizedPnl);
     } else {
@@ -1285,16 +1317,60 @@ function makeExchangeCtrl(prefix, chartId) {
       orphan.style.display = showOrphan ? 'block' : 'none';
       if (showOrphan) {
         const long = s.position.sizeBase > 0;
-        P('orphan-info').innerHTML = `未托管持仓：<b class="${long ? 'up' : 'down'}">${long ? '多' : '空'} ${Math.abs(s.position.sizeBase)}</b> @ 均价 ${s.position.entryPrice} · 未实现盈亏 ${pnlHtml(s.position.unrealizedPnl)}。程序当前未在管理这笔仓位，请选择处理方式。`;
+        P('orphan-info').textContent = `未托管持仓：${long ? '多' : '空'} ${Math.abs(Number(s.position.sizeBase))} @ 均价 ${fmt(s.position.entryPrice, 8)} · 未实现盈亏 ${signed(s.position.unrealizedPnl)}。程序当前未在管理这笔仓位，请选择处理方式。`;
       }
     }
-    P('st-total').innerHTML = `${pnlHtml(s.totalPnl)} <span class="muted">/ ${s.returnPct != null ? `<span class="${cls(s.returnPct)}">${s.returnPct>=0?'+':''}${s.returnPct}%</span>` : '—'}</span>`;
+    const totalPnl = document.createElement('span');
+    totalPnl.className = cls(s.totalPnl);
+    totalPnl.textContent = signed(s.totalPnl);
+    const totalReturn = document.createElement('span');
+    totalReturn.className = 'muted';
+    totalReturn.append(' / ');
+    if (s.returnPct == null) {
+      totalReturn.append('—');
+    } else {
+      const returnValue = document.createElement('span');
+      returnValue.className = cls(s.returnPct);
+      returnValue.textContent = `${signed(s.returnPct)}%`;
+      totalReturn.appendChild(returnValue);
+    }
+    P('st-total').replaceChildren(totalPnl, totalReturn);
     P('st-orders').textContent = `${s.openOrders ?? 0} 单 / ${s.stats?.completedRungs ?? 0} 格`;
 
-    P('fills').innerHTML = (s.fills||[]).map(f =>
-      `<tr><td>${new Date(f.t).toLocaleTimeString()}</td><td><span class="pill ${f.side==='buy'?'pill-buy':'pill-sell'}">${f.side==='buy'?'买':'卖'}</span></td><td>${round(f.price)}</td><td>${f.size}</td></tr>`
-    ).join('');
-    P('alerts').innerHTML = (s.alerts||[]).map(a => `<div class="log-item">${new Date(a.t).toLocaleTimeString()} · ${a.message}</div>`).join('') || '<div class="log-item muted">暂无日志</div>';
+    P('fills').replaceChildren();
+    for (const fill of (s.fills || [])) {
+      const row = document.createElement('tr');
+      const time = document.createElement('td');
+      time.textContent = new Date(fill.t).toLocaleTimeString();
+      const sideCell = document.createElement('td');
+      const sidePill = document.createElement('span');
+      const isBuy = fill.side === 'buy';
+      sidePill.className = `pill ${isBuy ? 'pill-buy' : 'pill-sell'}`;
+      sidePill.textContent = isBuy ? '买' : '卖';
+      sideCell.appendChild(sidePill);
+      const price = document.createElement('td');
+      price.textContent = String(round(Number(fill.price)));
+      const size = document.createElement('td');
+      size.textContent = String(fill.size ?? '');
+      row.append(time, sideCell, price, size);
+      P('fills').appendChild(row);
+    }
+
+    const alerts = s.alerts || [];
+    P('alerts').replaceChildren();
+    if (alerts.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'log-item muted';
+      empty.textContent = '暂无日志';
+      P('alerts').appendChild(empty);
+    } else {
+      for (const alert of alerts) {
+        const item = document.createElement('div');
+        item.className = 'log-item';
+        item.textContent = `${new Date(alert.t).toLocaleTimeString()} · ${String(alert.message || '')}`;
+        P('alerts').appendChild(item);
+      }
+    }
     P('range-warn').innerHTML = s.outOfRange ? `<div class="warn-box">⚠️ 价格已脱离网格区间，已暂停区间外补单。</div>` : '';
 
     if (s.grid && s.config) drawGridOverlay(s);
@@ -1393,7 +1469,7 @@ async function refreshProxyStatus() {
   const el = $('hdr-proxy'), txt = $('hdr-proxy-txt');
   if (!el || !txt) return;
   let cfg = {};
-  try { cfg = await (await fetch('/api/proxy-config')).json(); } catch {}
+  try { cfg = await (await apiFetch('/api/proxy-config')).json(); } catch {}
   const configured = !!(cfg.global || cfg.de || cfg.ex || cfg.rs);
   if (!configured) {
     el.className = 'conn'; txt.textContent = '直连模式'; el.title = '未配置代理（直连出网）';
@@ -1401,7 +1477,7 @@ async function refreshProxyStatus() {
   }
   el.className = 'conn warn'; txt.textContent = '代理检测中…';
   try {
-    const r = await (await fetch('/api/proxy-check')).json();
+    const r = await (await apiFetch('/api/proxy-check')).json();
     if (r.ok) {
       el.className = 'conn online'; txt.textContent = '代理正常';
       el.title = `全局代理正常 · 出口 IP：${r.ip}` + (cfg.global ? '' : '（使用交易所独立代理）');
@@ -1434,7 +1510,7 @@ async function scanTrends() {
       continue;
     }
     try {
-      const r = await fetch(`/api/${p}/trend?marketId=${d.config.marketId}&intervalSec=3600`);
+      const r = await apiFetch(`/api/${p}/trend?marketId=${d.config.marketId}&intervalSec=3600`);
       const j = await r.json();
       if (!j.analysis) throw new Error('no analysis');
       renderTrendWarn(box, d.config.mode, j.analysis, d.config.displayName);
@@ -1458,13 +1534,13 @@ function renderTrendWarn(box, mode, a, name) {
   const reversed = (mode === 'long' && rec === 'short') || (mode === 'short' && rec === 'long');
   if (reversed) {
     box.className = 'trend-box trend-alert';
-    box.innerHTML = `🔴 ${sym} 趋势反转为<b>${tl}</b>（强度${pct}%），当前为${MODE_LABEL[mode]}网格，风险较高，建议尽快复核`;
+    box.textContent = `🔴 ${sym} 趋势反转为${tl}（强度${pct}%），当前为${MODE_LABEL[mode]}网格，风险较高，建议尽快复核`;
   } else if (mode === 'neutral') {
     box.className = 'trend-box trend-watch';
-    box.innerHTML = `⚠️ ${sym} 出现<b>${tl}</b>趋势（强度${pct}%），中性网格或将单边突破区间`;
+    box.textContent = `⚠️ ${sym} 出现${tl}趋势（强度${pct}%），中性网格或将单边突破区间`;
   } else {
     box.className = 'trend-box trend-watch';
-    box.innerHTML = `⚠️ ${sym} 趋势转为<b>${tl}</b>（强度${pct}%），与${MODE_LABEL[mode]}网格不一致`;
+    box.textContent = `⚠️ ${sym} 趋势转为${tl}（强度${pct}%），与${MODE_LABEL[mode]}网格不一致`;
   }
 }
 scanTrends();
@@ -1475,7 +1551,7 @@ async function reconnectEx(p, btn) {
   const orig = btn ? btn.textContent : '';
   if (btn) { btn.disabled = true; btn.textContent = '⏳ 重连中…'; }
   try {
-    const r = await fetch(`/api/${p}/reconnect`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const r = await apiFetch(`/api/${p}/reconnect`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     const j = await r.json();
     if (j.error) {
       alert(`${p.toUpperCase()} 重连失败：${j.error}\n\n请检查网络/代理后再试。`);
@@ -1533,7 +1609,7 @@ function renderOverview(data) {
     setExHealth(p, d.health, true);
 
     $(`ov-${p}-pnl`).innerHTML = `<span class="${cls(d.totalPnl)}">${signed(d.totalPnl)}</span>`;
-    $(`ov-${p}-ret`).innerHTML = d.returnPct != null ? `<span class="${cls(d.returnPct)}">收益率 ${d.returnPct >= 0 ? '+' : ''}${d.returnPct}%</span>` : '收益率 —';
+    $(`ov-${p}-ret`).innerHTML = d.returnPct != null ? `<span class="${cls(d.returnPct)}">收益率 ${signed(d.returnPct)}%</span>` : '收益率 —';
     $(`ov-${p}-bal`).textContent = fmt(d.balance);
     $(`ov-${p}-eq`).textContent = fmt(d.equity);
     $(`ov-${p}-rpnl`).innerHTML = `<span class="${cls(d.realizedPnl)}">${signed(d.realizedPnl)}</span>`;
@@ -1550,19 +1626,29 @@ function renderOverview(data) {
       const c = d.config;
       if (d.running && c && c.mode === 'recovery') {
         gc.style.display = '';
-        gc.innerHTML = `<div class="gc-title">本次启动参数</div>`
-          + `回收阶梯模式（只减仓）· 阶梯间距 <b>${c.spacing ?? '—'}</b> · 每档 <b>${c.sizeBase ?? '—'}</b>`;
+        const title = document.createElement('div');
+        title.className = 'gc-title';
+        title.textContent = '本次启动参数';
+        const detail = document.createElement('div');
+        detail.textContent = `回收阶梯模式（只减仓）· 阶梯间距 ${c.spacing ?? '—'} · 每档 ${c.sizeBase ?? '—'}`;
+        gc.replaceChildren(title, detail);
       } else if (d.running && c && c.lower != null) {
         const sl = c.outOfRangeAction === 'recover' ? '只减仓回收阶梯' : '冲破区间平仓';
         const modeTxt = c.mode === 'long' ? '做多' : c.mode === 'short' ? '做空' : '中性';
         gc.style.display = '';
-        gc.innerHTML = `<div class="gc-title">本次启动参数（${modeTxt}网格）</div>`
-          + `下边界 <b>${c.lower}</b> · 上边界 <b>${c.upper}</b><br>`
-          + `网格 <b>${c.gridCount}</b> 格 · 每格 <b>${c.sizeBase}</b><br>`
-          + `杠杆 <b>${c.leverage}x</b> · 区间外策略 <b>${sl}</b>`;
+        const title = document.createElement('div');
+        title.className = 'gc-title';
+        title.textContent = `本次启动参数（${modeTxt}网格）`;
+        const range = document.createElement('div');
+        range.textContent = `下边界 ${c.lower} · 上边界 ${c.upper}`;
+        const grid = document.createElement('div');
+        grid.textContent = `网格 ${c.gridCount} 格 · 每格 ${c.sizeBase}`;
+        const risk = document.createElement('div');
+        risk.textContent = `杠杆 ${c.leverage}x · 区间外策略 ${sl}`;
+        gc.replaceChildren(title, range, grid, risk);
       } else {
         gc.style.display = 'none';
-        gc.innerHTML = '';
+        gc.replaceChildren();
       }
     }
   });
@@ -1598,40 +1684,40 @@ async function applyProxy(target) {
   };
 
   try {
-    const r = await fetch('/api/env', {
+    const r = await apiFetch('/api/env', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ key: fieldMap[target], value }),
     });
     const j = await r.json();
     if (j.error) throw new Error(j.error);
-    $(statusId).innerHTML = `<span class="up">✓ 已写入 .env（${fieldMap[target]}=${value || '（已清空）'}）。重启服务器后生效。</span>`;
+    setStatusText($(statusId), 'up', `✓ 已写入 .env（${fieldMap[target]}=${value || '（已清空）'}）。重启服务器后生效。`);
     refreshProxyStatus();
   } catch (e) {
-    $(statusId).innerHTML = `<span class="down">✗ 写入失败：${e.message}</span>`;
+    setStatusText($(statusId), 'down', `✗ 写入失败：${e.message}`);
   }
 }
 
 async function testProxy() {
   const el = $('ip-test-result');
-  el.innerHTML = '<span class="muted">检测中...</span>';
+  setStatusText(el, 'muted', '检测中...');
   try {
-    const r = await fetch('/api/proxy-check');
+    const r = await apiFetch('/api/proxy-check');
     const j = await r.json();
     if (j.ok) {
-      el.innerHTML = `<span class="up">✓ 代理正常，当前出口 IP：<strong>${j.ip}</strong></span>`;
+      setStatusText(el, 'up', `✓ 代理正常，当前出口 IP：${j.ip}`);
     } else {
-      el.innerHTML = `<span class="down">✗ 代理无法联网：${j.error}。请检查代理地址是否正确。</span>`;
+      setStatusText(el, 'down', `✗ 代理无法联网：${j.error}。请检查代理地址是否正确。`);
     }
   } catch (e) {
-    el.innerHTML = `<span class="down">✗ 检测请求失败：${e.message}</span>`;
+    setStatusText(el, 'down', `✗ 检测请求失败：${e.message}`);
   }
 }
 
 // ── 加载代理配置 ─────────────────────────────────────────────────────────────
 async function loadProxyConfig() {
   try {
-    const r = await fetch('/api/proxy-config');
+    const r = await apiFetch('/api/proxy-config');
     const j = await r.json();
     if (j.global) $('ip-global').value = j.global;
     if (j.de) $('ip-de').value = j.de;
@@ -1678,7 +1764,7 @@ function aiVendorChange() {
   $('ai-model').value = v.main;
   $('ai-model-small').value = v.small;
   const dl = $('ai-model-list');
-  dl.innerHTML = '';
+  dl.replaceChildren();
   for (const m of v.models) { const o = document.createElement('option'); o.value = m; dl.appendChild(o); }
   $('ai-cfg-status').textContent = `已按 ${v.name} 预填接口地址和推荐模型（模型可下拉换或手动输入），填好 API Key 后点「保存配置」。`;
 }
@@ -1702,7 +1788,7 @@ async function aiSaveConfig(btn) {
       if (v) items.push([key, v]); // 留空不覆盖已有配置
     }
     for (const [key, value] of items) {
-      const r = await fetch('/api/env', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ key, value }) });
+      const r = await apiFetch('/api/env', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ key, value }) });
       const j = await r.json();
       if (j.error) { $('ai-cfg-status').textContent = `❌ ${key}：${j.error}`; if (btn) btn.disabled = false; return; }
       saved++;
@@ -1716,7 +1802,7 @@ async function aiSaveConfig(btn) {
 async function aiTest(btn) {
   if (btn) { btn.disabled = true; btn.textContent = '测试中…'; }
   try {
-    const r = await fetch('/api/ai/test', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
+    const r = await apiFetch('/api/ai/test', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
     const j = await r.json();
     $('ai-cfg-status').textContent = j.ok
       ? `✅ 连接正常：${j.provider} · ${j.model} · ${j.ms}ms · 回复「${j.reply}」`
@@ -1729,7 +1815,7 @@ function aiFmtTime(t) { return t ? new Date(t).toLocaleString('zh-CN', { hour12:
 
 async function aiRefreshStatus() {
   try {
-    const r = await fetch('/api/ai/status');
+    const r = await apiFetch('/api/ai/status');
     const s = await r.json();
     // ── 已保存配置回填（仅页面加载后执行一次，避免覆盖正在编辑的内容）──
     // 配置本身保存在 .env，重启不丢；这里把它回显到表单，密钥只显示掩码。
@@ -1741,7 +1827,7 @@ async function aiRefreshStatus() {
       if (vend) {
         $('ai-vendor').value = vend;
         const dl = $('ai-model-list');
-        dl.innerHTML = '';
+        dl.replaceChildren();
         for (const m of (AI_VENDORS[vend].models || [])) { const o = document.createElement('option'); o.value = m; dl.appendChild(o); }
       }
       if (s.configured || s.baseUrl) $('ai-baseurl').value = s.baseUrl || '';
@@ -1768,8 +1854,16 @@ async function aiRefreshStatus() {
     // 哨兵
     const badge = $('ai-sent-badge');
     if (s.sentinel) {
-      const lv = s.sentinel.level;
-      badge.innerHTML = `<span class="ai-badge ${lv}">${lv === 'ok' ? '正常' : lv === 'warn' ? '注意' : '严重'}</span>`;
+      const levelMap = {
+        ok: { className: 'ok', text: '正常' },
+        warn: { className: 'warn', text: '注意' },
+        critical: { className: 'critical', text: '严重' },
+      };
+      const level = levelMap[s.sentinel.level] || { className: 'unknown', text: '未知' };
+      const levelBadge = document.createElement('span');
+      levelBadge.className = `ai-badge ${level.className}`;
+      levelBadge.textContent = level.text;
+      badge.replaceChildren(levelBadge);
       $('ai-sentinel-box').className = 'ai-box';
       let sentTxt = `[巡检时间 ${aiFmtTime(s.sentinel.t)}] ${s.sentinel.summary}`;
       if (s.sentinel.per) {
@@ -1784,7 +1878,7 @@ async function aiRefreshStatus() {
       }
       $('ai-sentinel-box').textContent = sentTxt;
     } else if (s.sentinelError) {
-      badge.innerHTML = '';
+      badge.replaceChildren();
       $('ai-sentinel-box').textContent = '巡检出错：' + s.sentinelError;
     }
     // ── 总览页：BTC 市况报告 + 各所哨兵报告 ──
@@ -1829,7 +1923,7 @@ async function aiRefreshStatus() {
 async function aiSentinelRun(btn) {
   if (btn) { btn.disabled = true; btn.textContent = '巡检中…'; }
   try {
-    const r = await fetch('/api/ai/sentinel-run', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
+    const r = await apiFetch('/api/ai/sentinel-run', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
     const j = await r.json();
     if (j.error) alert('巡检失败：' + j.error); else aiRefreshStatus();
   } catch (e) { alert('巡检失败：' + e.message); }
@@ -1839,7 +1933,7 @@ async function aiSentinelRun(btn) {
 async function aiReport(btn) {
   if (btn) { btn.disabled = true; btn.textContent = '生成中…'; }
   try {
-    const r = await fetch('/api/ai/report', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
+    const r = await apiFetch('/api/ai/report', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
     const j = await r.json();
     if (j.error) alert('生成失败：' + j.error); else aiRefreshStatus();
   } catch (e) { alert('生成失败：' + e.message); }
@@ -1850,7 +1944,7 @@ async function aiAnalyze(p, btn) {
   if (btn) { btn.disabled = true; btn.textContent = '分析中…'; }
   const box = $('ai-analyze-box');
   try {
-    const r = await fetch('/api/ai/analyze', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ ex: p }) });
+    const r = await apiFetch('/api/ai/analyze', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ ex: p }) });
     const j = await r.json();
     if (j.error) { box.textContent = '❌ ' + j.error; }
     else {
@@ -1888,7 +1982,7 @@ async function aiChatSend() {
   aiChatHistory.push({ role:'user', content: msg });
   const waiting = aiChatAppend('sys', 'AI 思考中…');
   try {
-    const r = await fetch('/api/ai/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ message: msg, history: aiChatHistory.slice(0, -1) }) });
+    const r = await apiFetch('/api/ai/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ message: msg, history: aiChatHistory.slice(0, -1) }) });
     const j = await r.json();
     waiting.remove();
     if (j.error) { aiChatAppend('sys', '❌ ' + j.error); return; }
@@ -1944,7 +2038,7 @@ async function aiExecAction(action, card, okBtn) {
   const m = MAP[action.type];
   if (!m) { aiChatAppend('sys', '❌ 未知操作类型'); card.remove(); return; }
   try {
-    const r = await fetch(`/api/${p}/${m[0]}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(m[1]) });
+    const r = await apiFetch(`/api/${p}/${m[0]}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(m[1]) });
     const j = await r.json();
     aiChatAppend('sys', j.error ? `❌ 执行失败：${j.error}` : `✅ 已执行：${exn} ${label}`);
   } catch (e) { aiChatAppend('sys', '❌ 执行失败：' + e.message); }
@@ -1965,7 +2059,7 @@ function aiRegimeText(j) {
 async function aiMarketRun(btn) {
   if (btn) { btn.disabled = true; btn.textContent = '分析中…'; }
   try {
-    const r = await fetch('/api/ai/market-run', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
+    const r = await apiFetch('/api/ai/market-run', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
     const j = await r.json();
     if (j.error) alert('市况分析失败：' + j.error); else aiRefreshStatus();
   } catch (e) { alert('市况分析失败：' + e.message); }
@@ -1981,7 +2075,7 @@ async function aiSaveIntervals(btn) {
     if ($('ov-ai-sent-min').value.trim() !== '') pairs.push(['AI_SENTINEL_MINUTES', $('ov-ai-sent-min').value.trim()]);
     if (!pairs.length) { st.textContent = '未填写，无变更'; if (btn) btn.disabled = false; return; }
     for (const [key, value] of pairs) {
-      const r = await fetch('/api/env', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ key, value }) });
+      const r = await apiFetch('/api/env', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ key, value }) });
       const j = await r.json();
       if (j.error) { st.textContent = '❌ ' + j.error; if (btn) btn.disabled = false; return; }
     }
