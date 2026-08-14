@@ -14,10 +14,13 @@ import { createExchange as createRsExchange } from './exchange/rs/index.js';
 import { GridBot } from './bot.js';
 import { analyzeTrend } from './trend.js';
 import { setupProxies, checkProxy } from './proxy.js';
-import { loadSnapshot, saveSnapshot } from './persist.js';
+import { flushState, loadSnapshot, saveSnapshot } from './persist.js';
 import { createAiService } from './ai/service.js';
 import { enforceRequestSecurity, HttpRequestError, readJsonBody } from './security.js';
 import { SseClientPool } from './sse.js';
+import { initializeExchange } from './startup.js';
+import { remapSnapshotMarket, resumeRunningSnapshot } from './recovery.js';
+import { writeEnvFile } from './envfile.js';
 
 // ── 启动配置 ─────────────────────────────────────────────────────────────────
 const cfg = getConfig();
@@ -34,10 +37,6 @@ const cfg = getConfig();
     if (!cfg.ex.vault) missing.push(['Extended', 'EXTENDED_VAULT', '同上，创建 API Key 时一并显示']);
     if (!cfg.ex.starkPrivateKey) missing.push(['Extended', 'EXTENDED_STARK_PRIVATE_KEY', '同上，只显示一次务必保存']);
   }
-  if (cfg.rs.mode === 'live') {
-    if (!cfg.rs.account) missing.push(['RISEx   ', 'ACCOUNT_ADDRESS', 'RISEx 应用的账户 / API 设置']);
-    if (!cfg.rs.signerKey) missing.push(['RISEx   ', 'SIGNER_PRIVATE_KEY', 'RISEx 应用的账户 / API 设置']);
-  }
   if (missing.length) {
     console.error('\n[启动失败] 有交易所被设为 live 实盘模式，但 .env 里还缺以下凭据：\n');
     for (const [ex, key, where] of missing) {
@@ -47,7 +46,7 @@ const cfg = getConfig();
     console.error('\n解决办法（二选一）：');
     console.error('  1. 用记事本打开项目里的 .env，补齐上面列出的字段');
     console.error('     （详细获取教程见 README.md 第七节）');
-    console.error('  2. 暂时不实盘：把 .env 里对应的 DE_MODE / EX_MODE / RS_MODE 改回 paper\n');
+    console.error('  2. 暂时不实盘：把 .env 里对应的 DE_MODE / EX_MODE 改回 paper\n');
     process.exit(1);
   }
 }
@@ -208,12 +207,7 @@ function makeExchangeHandler(prefix, bot, exchange, exCfg, clients, name) {
           const snap = loadSnapshot(key);
           if (snap?.running && snap?.config) {
             try {
-              // marketId 是按连接会话编号的，可能已漂移：按市场名称重新解析
-              const markets = await exchange.getMarkets();
-              const norm = (x) => String(x || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-              const m = markets.find((x) => norm(x.displayName) === norm(snap.config.displayName) || norm(x.name) === norm(snap.config.displayName));
-              if (m) snap.config.marketId = m.marketId;
-              await bot.resume(snap);
+              await resumeRunningSnapshot(bot, exchange, snap);
               resumed = true;
               console.log(`[恢复] ${key.toUpperCase()} 重连成功后已自动续跑，接管挂单并完成对账。`);
             } catch (e) {
@@ -222,7 +216,7 @@ function makeExchangeHandler(prefix, bot, exchange, exCfg, clients, name) {
             }
           }
         }
-        if (bot.running) await bot.reconcileOpenOrders().catch(() => {});
+        if (bot.running && !resumed) await bot.reconcileOpenOrders();
         return send(res, 200, { ok: true, resumed, resumeError, state: bot.getState() });
       } catch (e) {
         return send(res, 500, { error: e?.message || String(e) });
@@ -373,8 +367,6 @@ const server = http.createServer(async (request, res) => {
             if (!/^https?:\/\/\S+$/i.test(val)) return send(res, 400, { error: '必须是 http(s):// 开头的 URL。' });
           }
         }
-        // 更新内存中的环境变量
-        if (val) process.env[key] = val; else delete process.env[key];
         // 写入 .env 文件
         const envFile = path.join(ROOT, '.env');
         let content = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf8') : '';
@@ -385,7 +377,9 @@ const server = http.createServer(async (request, res) => {
         } else {
           content = content.trimEnd() + '\n' + line + '\n';
         }
-        fs.writeFileSync(envFile, content, 'utf8');
+        writeEnvFile(envFile, content);
+        // 文件落盘成功后再更新内存，避免写入失败造成运行态与磁盘配置不一致。
+        if (val) process.env[key] = val; else delete process.env[key];
         return send(res, 200, { ok: true });
       } catch (e) {
         return send(res, errorStatus(e, 500), { error: e?.message || String(e) });
@@ -486,31 +480,10 @@ server.on('error', (e) => {
 });
 
 // ── 初始化各交易所 ────────────────────────────────────────────────────────────
-async function initExchange(exchange, name, exCfg) {
-  try {
-    await exchange.init();
-    console.log(`[${name}] ✓ 连接成功 [${exCfg.mode.toUpperCase()} 模式]`);
-  } catch (e) {
-    console.error(`\n[${name}] ✗ 初始化失败：${e?.message || e}`);
-    console.error(`  目标接口: ${exCfg.apiUrl}   网络: ${exCfg.network}`);
-    const cause = e?.cause || {};
-    const code = cause.code || '';
-    if (code === 'ENOTFOUND') {
-      console.error('  ➤ 域名解析失败：检查网络，或配置代理。');
-    } else if (code === 'ECONNREFUSED' && String(cause.address || '').includes('127.0.0.1')) {
-      console.error('  ➤ 本机代理端口连不上，检查代理软件是否开启。');
-    } else if (code === 'UND_ERR_CONNECT_TIMEOUT' || /timeout/i.test(cause.message || '')) {
-      console.error('  ➤ 连接超时，接口被网络拦截，或代理未正确转发。');
-    }
-    console.error(`  该交易所将以离线模式运行（行情可能使用合成数据）。\n`);
-    // 不退出，让其他交易所继续工作
-  }
-}
-
 await Promise.all([
-  initExchange(deExchange, 'Decibel', cfg.de),
-  initExchange(exExchange, 'Extended', cfg.ex),
-  initExchange(rsExchange, 'RISEx', cfg.rs),
+  initializeExchange(deExchange, 'Decibel', cfg.de),
+  initializeExchange(exExchange, 'Extended', cfg.ex),
+  initializeExchange(rsExchange, 'RISEx', cfg.rs),
 ]);
 
 // ── 崩溃恢复 / 续跑 ────────────────────────────────────────────────────────────
@@ -521,17 +494,18 @@ await Promise.all([
 async function resumeIfWasRunning(bot, exchange, key) {
   const snap = loadSnapshot(key);
   if (!(snap?.running && snap?.config)) return;
-  if (exchange.dataSource == null) {
-    console.log(`[恢复] ${key.toUpperCase()} 交易所未连接，跳过续跑；保留挂单待下次连接。`);
-    return;
-  }
+  if (exchange.dataSource == null) return console.log(`[恢复] ${key.toUpperCase()} 交易所未连接，跳过续跑；保留挂单待下次连接。`);
   try {
     console.log(`[恢复] 检测到 ${key.toUpperCase()} 上次为运行状态，正在接管续跑...`);
-    await bot.resume(snap);
+    await resumeRunningSnapshot(bot, exchange, snap);
     console.log(`[恢复] ${key.toUpperCase()} 已续跑，接管挂单并完成对账。`);
   } catch (e) {
-    console.error(`[恢复] ${key.toUpperCase()} 续跑失败（${e?.message || e}），改为撤销遗留挂单。`);
-    await bot.recoverStrayOrders().catch(() => {});
+    console.error(`[恢复] ${key.toUpperCase()} 续跑失败（${e?.message || e}），正在撤销遗留挂单。`);
+    try {
+      await bot.recoverStrayOrders();
+    } catch (cause) {
+      throw new Error(`${key.toUpperCase()} 恢复失败且遗留挂单撤销失败：${cause?.message || cause}`, { cause });
+    }
   }
 }
 await Promise.all([
@@ -545,18 +519,15 @@ await Promise.all([
 // marketIds every run, so the persisted numeric id may point at the wrong market
 // — re-resolve it by the market NAME, then start watching it so the position is
 // polled into getState.
-const _norm = (x) => String(x || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 async function detectOrphanPosition(bot, ex) {
   if (!bot.config?.displayName || ex.dataSource == null || typeof ex.getMarkets !== 'function') return;
   try {
-    const markets = await ex.getMarkets();
-    const want = _norm(bot.config.displayName);
-    const m = markets.find((x) => _norm(x.displayName) === want || _norm(x.name) === want || _norm(x.symbol) === want);
-    if (m) {
-      bot.config.marketId = m.marketId;            // fix stale/ephemeral id -> current
-      await ex.getPrice(m.marketId).catch(() => {}); // seed watch -> position gets polled
-    }
-  } catch { /* ignore */ }
+    const mapped = await remapSnapshotMarket(ex, bot.snapshot());
+    bot.config = mapped.config;
+    await ex.getPrice(mapped.config.marketId); // seed watch -> position gets polled
+  } catch (error) {
+    console.error(`[恢复] ${bot.config.displayName} 孤立仓位探测失败：${error?.message || error}`);
+  }
 }
 await Promise.all([
   detectOrphanPosition(deBot, deExchange),
@@ -576,7 +547,27 @@ server.listen(cfg.port, cfg.host, () => {
   console.log(`${'─'.repeat(52)}`);
   if (cfg.de.mode === 'paper' || cfg.ex.mode === 'paper' || cfg.rs.mode === 'paper') {
     console.log('  ⚠ 部分交易所为模拟模式，不涉及真实资金。');
-    console.log('    在 .env 中设置 DE_MODE/EX_MODE/RS_MODE=live 切换实盘。');
+    console.log('    Decibel/Extended 可在 .env 中切换 live；RISEx 当前仅支持 paper。');
   }
   console.log('');
 });
+
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[退出] 收到 ${signal}，正在停止服务并刷写状态。`);
+  let exitCode = 0;
+  try {
+    server.close();
+    for (const exchange of [deExchange, exExchange, rsExchange]) exchange.stop?.();
+    flushState();
+  } catch (error) {
+    exitCode = 1;
+    console.error(`[退出] 状态刷写失败：${error?.message || error}`);
+  }
+  process.exit(exitCode);
+}
+
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));

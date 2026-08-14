@@ -13,6 +13,7 @@
 // (a FILLED order leaves the open-orders endpoint, so history is the only place
 // that reports its filledQty); only a positively-confirmed fill is reported.
 import { EventEmitter } from 'node:events';
+import { randomInt } from 'node:crypto';
 import {
   selfTest, orderMsgHash, starkSign, settlementAmounts, alignToStep, parseDec, toHex,
   publicKeyFromPrivate,
@@ -26,6 +27,15 @@ const INTERVALS = { 60: 'PT1M', 300: 'PT5M', 900: 'PT15M', 1800: 'PT30M', 3600: 
 const ORDER_EXPIRY_DAYS = 90;          // resting grid orders live this long (max GTT; longer = less decay on long-running grids)
 const SETTLEMENT_BUFFER_DAYS = 14;     // same buffer as the official SDK
 const USER_AGENT = 'ExtendedGridBot/1.0';
+
+export function generateOrderNonce() {
+  return randomInt(1, 2 ** 31 + 1);
+}
+
+export function externalOrderId(order) {
+  const value = order?.externalId;
+  return typeof value === 'string' && value.length ? value : null;
+}
 
 export class ExtendedExchange extends EventEmitter {
   constructor(opts = {}) {
@@ -210,7 +220,7 @@ export class ExtendedExchange extends EventEmitter {
       qty: qtyStr, price: priceStr, feeRate: this.feeRate,
       synRes: m.l2.synRes, colRes: m.l2.colRes, isBuy,
     });
-    const nonce = Math.floor(Math.random() * 0xFFFFFFFF);
+    const nonce = generateOrderNonce();
     const expiryEpochMillis = Date.now() + ORDER_EXPIRY_DAYS * 86400_000;
     const expirationSec = Math.ceil(expiryEpochMillis / 1000) + SETTLEMENT_BUFFER_DAYS * 86400;
     const synId = BigInt(m.l2.syntheticId), colId = BigInt(m.l2.collateralId);
@@ -242,8 +252,8 @@ export class ExtendedExchange extends EventEmitter {
         collateralPosition: String(this.vault),
       },
     };
-    const data = await this._req('POST', '/api/v1/user/order', payload);
-    return { orderId: String(data?.id ?? payload.id), externalId: payload.id };
+    await this._req('POST', '/api/v1/user/order', payload);
+    return { orderId: payload.id, externalId: payload.id };
   }
 
   async placeLimitOrder(o) {
@@ -270,14 +280,19 @@ export class ExtendedExchange extends EventEmitter {
   }
 
   async cancelOrder(marketId, orderId) {
-    this._tracked.delete(String(orderId));
-    return this._req('DELETE', `/api/v1/user/order/${orderId}`);
+    const id = String(orderId);
+    await this._req('DELETE', `/api/v1/user/order/${encodeURIComponent(id)}`);
+    this._tracked.delete(id);
+    return true;
   }
 
   async cancelAll(marketId) {
     const m = this._market(marketId);
-    for (const [id, o] of this._tracked) if (o.marketId === m.marketId) this._tracked.delete(id);
-    try { return await this._req('POST', '/api/v1/user/order/massCancel', { markets: [m.name] }); }
+    try {
+      await this._req('POST', '/api/v1/user/order/massCancel', { markets: [m.name] });
+      for (const [id, o] of this._tracked) if (o.marketId === m.marketId) this._tracked.delete(id);
+      return true;
+    }
     catch (e) { this.emit('error', e); return false; }
   }
 
@@ -292,11 +307,15 @@ export class ExtendedExchange extends EventEmitter {
     // A missing/malformed payload is NOT "zero orders" — return null so the
     // reconciler skips this cycle instead of pruning live orders off tracking.
     if (!Array.isArray(data)) return null;
-    return data.map((o) => ({
-      orderId: String(o.id),
-      price: Number(o.price),
-      side: String(o.side || '').toLowerCase() === 'buy' ? 'buy' : 'sell',
-    }));
+    return data.flatMap((o) => {
+      const orderId = externalOrderId(o);
+      if (!orderId) return [];
+      return [{
+        orderId,
+        price: Number(o.price),
+        side: String(o.side || '').toLowerCase() === 'buy' ? 'buy' : 'sell',
+      }];
+    });
   }
 
   /** Re-attach a previously-placed order to this adapter's tracking (resume). */
@@ -420,26 +439,23 @@ export class ExtendedExchange extends EventEmitter {
       const mkt = this.markets.get(t.marketId)?.name;
       const data = await this._get(`/api/v1/user/orders/history?limit=200` + (mkt ? `&market=${encodeURIComponent(mkt)}` : ''));
       const rows = Array.isArray(data) ? data : [];
-      const o = rows.find((x) =>
-        (t.externalId && String(x.externalId) === String(t.externalId)) || String(x.id) === String(id));
+      const o = rows.find((x) => t.externalId && externalOrderId(x) === String(t.externalId));
       if (o) {
         const fq = Number(o.filledQty ?? 0);
         const st = String(o.status || '');
-        if (fq > 0 || /FILLED/i.test(st)) {            // positive confirmation only
+        if (/NEW|OPEN|ACCEPTED|PENDING|UNTRIGGERED|PARTIAL/i.test(st)) {
+          // A partial fill still has a live remainder. Keep tracking it; only a
+          // terminal status may emit the executed quantity as a completed fill.
+          t.goneAttempts = 0;
+          t.seen = true;
+          return;
+        } else if (fq > 0 || /FILLED/i.test(st)) {     // positive confirmation only
           verdict = 'filled';
           if (fq > 0) fillSize = fq;
           const avg = Number(o.averagePrice ?? 0);
           if (avg > 0) fillPrice = avg;
         } else if (/CANCELLED|REJECTED|EXPIRED/i.test(st)) {
           verdict = 'cancelled';
-        } else if (/NEW|OPEN|ACCEPTED|PENDING|UNTRIGGERED|PARTIAL/i.test(st)) {
-          // History says the order is STILL LIVE: the open-orders snapshot that
-          // reported it "gone" was a glitch. Revive tracking and bail out —
-          // counting these toward the give-up threshold used to drop dozens of
-          // perfectly live orders during an API hiccup.
-          t.goneAttempts = 0;
-          t.seen = true;
-          return;
         }
       }
     } catch { /* keep 'unknown' */ }

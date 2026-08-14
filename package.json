@@ -1,11 +1,11 @@
 {
   "name": "grid-bot-all",
   "version": "1.0.0",
-  "description": "三交易所整合网格交易机器人：Decibel / Extended / RISEx，统一仪表盘，支持同时运行三个网格策略。",
+  "description": "三交易所整合网格交易机器人：Decibel / Extended 支持实盘，RISEx 仅模拟盘。",
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node test/grid.test.js && node --test test/security.test.js"
+    "test": "node test/grid.test.js && node --test test/security.test.js test/bot.test.js test/exchange-adapters.test.js test/startup.test.js test/persist.test.js"
   },
   "engines": {
     "node": ">=20"
@@ -16,8 +16,5 @@
     "chart.js": "4.4.1",
     "undici": "^6.19.8",
     "zod": "^3.25.62"
-  },
-  "optionalDependencies": {
-    "risex-client": "^0.1.0"
   }
 }

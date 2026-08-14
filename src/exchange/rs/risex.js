@@ -52,37 +52,7 @@ export class RisexExchange extends EventEmitter {
   }
 
   async init() {
-    let SDK;
-    try { SDK = await import('risex-client'); }
-    catch (e) { throw new Error('未安装 risex-client，请先 npm install。原始错误：' + e.message); }
-    const { InfoClient, ExchangeClient } = SDK;
-    const opts = {};
-    if (this.baseUrl) opts.baseUrl = this.baseUrl;
-    if (this.wsUrl) opts.wsUrl = this.wsUrl;
-    this._info = new InfoClient(opts);
-    this._client = new ExchangeClient({ account: this.account, signerKey: this.signerKey, ...opts });
-    await this._client.init(); // fetches EIP-712 domain + contract addresses
-
-    const markets = await this._info.getMarkets();
-    for (const m of markets) {
-      const cfg = m.config || {};
-      this.markets.set(Number(m.market_id), {
-        marketId: Number(m.market_id), displayName: m.display_name || cfg.name,
-        symbol: m.base_asset_symbol, lastPrice: Number(m.mark_price || m.last_price || 0),
-        stepSize: Number(cfg.step_size), stepPrice: Number(cfg.step_price),
-        maxLeverage: Number(cfg.max_leverage || 20), minOrderSize: Number(cfg.min_order_size || cfg.step_size),
-      });
-      this._prices.set(Number(m.market_id), Number(m.mark_price || m.last_price || 0));
-    }
-    this.dataSource = 'real';
-    this.lastOkAt = Date.now();
-    this.network = (this.baseUrl || '').includes('testnet') ? 'testnet' : 'mainnet';
-    this.apiUrl = this.baseUrl; // for logging/UI
-    const first = this.markets.keys().next().value;
-    if (first != null) this._watch.add(Number(first));
-    await this._refreshAccount().catch(() => {});
-    this.start(); // begin background polling so account/price populate immediately
-    return true;
+    throw new Error('RISEx 实盘已禁用：当前 risex-client 未达到生产可用标准，请改用 RS_MODE=paper。');
   }
 
   /**
@@ -92,23 +62,7 @@ export class RisexExchange extends EventEmitter {
    * restart polling. Order tracking is preserved. Throws if still unreachable.
    */
   async reconnect() {
-    this.stop();          // clear the poll timer
-    this._busy = false;   // break a poll wedged on a hung request
-    this.lastError = null;
-    if (!this._info || !this.markets.size) return this.init(); // never came up: full init
-    const SDK = await import('risex-client');
-    const opts = {};
-    if (this.baseUrl) opts.baseUrl = this.baseUrl;
-    if (this.wsUrl) opts.wsUrl = this.wsUrl;
-    this._info = new SDK.InfoClient(opts);
-    this._client = new SDK.ExchangeClient({ account: this.account, signerKey: this.signerKey, ...opts });
-    await this._client.init();
-    this._txQueue = Promise.resolve(); // discard a wedged serialization chain
-    const b = await this._info.getBalance(this.account); // probe: throws if still down
-    if (b != null) this.balance = Number(b);
-    this.lastOkAt = Date.now();
-    this.start();
-    return true;
+    throw new Error('RISEx 实盘已禁用：当前 risex-client 未达到生产可用标准，请改用 RS_MODE=paper。');
   }
 
   async getMarkets() { return [...this.markets.values()]; }
