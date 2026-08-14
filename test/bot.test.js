@@ -145,3 +145,16 @@ test('stray-order recovery reports cancellation failure and keeps tracking', asy
   assert.equal(bot.active.has('old-order'), true);
   assert.doesNotMatch(bot.alerts.map((item) => item.message).join('\n'), /已撤销/);
 });
+
+test('start cancels accepted orders when durable state cannot be written', async () => {
+  const exchange = new FakeExchange();
+  const bot = new GridBot(exchange, { onChange: () => { throw new Error('disk full'); } });
+
+  await assert.rejects(bot.start(config), /disk full/);
+
+  assert.equal(exchange.orders.size, 0);
+  assert.equal(bot.active.size, 0);
+  assert.equal(bot.running, false);
+  assert.equal(exchange.listenerCount('fill'), 0);
+  assert.equal(exchange.listenerCount('price'), 0);
+});

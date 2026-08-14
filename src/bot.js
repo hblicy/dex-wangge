@@ -218,7 +218,21 @@ export class GridBot {
   async start(cfg) {
     if (this.running || this._starting) throw new Error('机器人已在运行或正在启动，请勿重复点击。');
     this._starting = true;
-    try { return await this._start(cfg); }
+    try {
+      return await this._start(cfg);
+    } catch (cause) {
+      if (this.running && this.config) {
+        try {
+          await this._requireCancelAll(this.config.marketId, '启动状态持久化失败清理');
+        } catch (cleanupCause) {
+          throw new Error(`启动状态写入失败，且已接受挂单无法确认撤销：${cleanupCause.message}`, { cause: cleanupCause });
+        }
+        this._rollbackResume();
+        this.active.clear();
+        this.recovery = false;
+      }
+      throw cause;
+    }
     finally { this._starting = false; }
   }
 

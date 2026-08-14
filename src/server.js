@@ -14,7 +14,7 @@ import { createExchange as createRsExchange } from './exchange/rs/index.js';
 import { GridBot } from './bot.js';
 import { analyzeTrend } from './trend.js';
 import { setupProxies, checkProxy } from './proxy.js';
-import { loadSnapshot, saveSnapshot } from './persist.js';
+import { flushState, loadSnapshot, saveSnapshot } from './persist.js';
 import { createAiService } from './ai/service.js';
 import { enforceRequestSecurity, HttpRequestError, readJsonBody } from './security.js';
 import { SseClientPool } from './sse.js';
@@ -550,3 +550,23 @@ server.listen(cfg.port, cfg.host, () => {
   }
   console.log('');
 });
+
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[退出] 收到 ${signal}，正在停止服务并刷写状态。`);
+  let exitCode = 0;
+  try {
+    server.close();
+    for (const exchange of [deExchange, exExchange, rsExchange]) exchange.stop?.();
+    flushState();
+  } catch (error) {
+    exitCode = 1;
+    console.error(`[退出] 状态刷写失败：${error?.message || error}`);
+  }
+  process.exit(exitCode);
+}
+
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
