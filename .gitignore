@@ -9,6 +9,7 @@
 
 # 依赖缓存
 node_modules/
+.worktrees/
 
 # 日志（可能含代理账号、出口 IP 等）
 *.log
