@@ -77,3 +77,83 @@ test('未认证请求得到 401 和 Basic challenge', () => {
   assert.equal(res.statusCode, 401);
   assert.equal(res.headers['WWW-Authenticate'], 'Basic realm="dex-wangge"');
 });
+
+function authHeader(token = '0123456789abcdef') {
+  return `Basic ${Buffer.from(`admin:${token}`).toString('base64')}`;
+}
+
+function request({
+  method = 'POST',
+  contentType = 'application/json',
+  marker = '1',
+  origin,
+  host = '127.0.0.1:8080',
+} = {}) {
+  return {
+    method,
+    headers: {
+      authorization: authHeader(),
+      host,
+      ...(contentType === null ? {} : { 'content-type': contentType }),
+      ...(marker === null ? {} : { 'x-dex-request': marker }),
+      ...(origin === undefined ? {} : { origin }),
+    },
+  };
+}
+
+test('POST 要求 JSON Content-Type 和 X-Dex-Request', () => {
+  const config = { dashboardToken: '0123456789abcdef', dashboardOrigins: [] };
+  for (const [req, status] of [
+    [request({ contentType: 'application/x-www-form-urlencoded' }), 415],
+    [request({ marker: null }), 403],
+  ]) {
+    const res = fakeResponse();
+    assert.equal(security.enforceRequestSecurity(req, res, config), false);
+    assert.equal(res.statusCode, status);
+  }
+});
+
+test('POST 接受本机 Origin 和配置的 Tailscale Origin，拒绝其他 Origin', () => {
+  const config = {
+    dashboardToken: '0123456789abcdef',
+    dashboardOrigins: ['https://vps.tail.example'],
+  };
+  for (const origin of ['http://127.0.0.1:8080', 'https://vps.tail.example']) {
+    assert.equal(security.enforceRequestSecurity(request({ origin }), fakeResponse(), config), true);
+  }
+  const res = fakeResponse();
+  assert.equal(
+    security.enforceRequestSecurity(request({ origin: 'https://evil.example' }), res, config),
+    false,
+  );
+  assert.equal(res.statusCode, 403);
+});
+
+test('严格 JSON 解析拒绝非法和超限正文', async () => {
+  assert.equal(typeof security.readJsonBody, 'function');
+  const invalid = new EventEmitter();
+  const invalidPromise = security.readJsonBody(invalid);
+  invalid.emit('data', Buffer.from('{bad'));
+  invalid.emit('end');
+  await assert.rejects(invalidPromise, (error) => error.statusCode === 400);
+
+  const oversized = new EventEmitter();
+  const oversizedPromise = security.readJsonBody(oversized, 4);
+  oversized.emit('data', Buffer.from('12345'));
+  oversized.emit('end');
+  await assert.rejects(oversizedPromise, (error) => error.statusCode === 413);
+});
+
+test('严格 JSON 解析接受空正文和合法对象', async () => {
+  assert.equal(typeof security.readJsonBody, 'function');
+  const empty = new EventEmitter();
+  const emptyPromise = security.readJsonBody(empty);
+  empty.emit('end');
+  assert.deepEqual(await emptyPromise, {});
+
+  const valid = new EventEmitter();
+  const validPromise = security.readJsonBody(valid);
+  valid.emit('data', Buffer.from('{"closePosition":false}'));
+  valid.emit('end');
+  assert.deepEqual(await validPromise, { closePosition: false });
+});

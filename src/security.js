@@ -64,6 +64,68 @@ export function isAuthorized(header, dashboardToken) {
   return timingSafeEqual(candidate, expected) && sameLength;
 }
 
+function requestHeader(req, name) {
+  const value = req.headers?.[name];
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function requestOrigin(req) {
+  const value = requestHeader(req, 'origin');
+  if (value === undefined) return null;
+  try {
+    const parsed = new URL(value);
+    if (
+      !['http:', 'https:'].includes(parsed.protocol)
+      || parsed.username
+      || parsed.password
+      || parsed.pathname !== '/'
+      || parsed.search
+      || parsed.hash
+    ) return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+function hostOrigin(req) {
+  const host = requestHeader(req, 'host');
+  if (!host) return null;
+  try {
+    const parsed = new URL(`http://${host}`);
+    if (parsed.username || parsed.password || parsed.pathname !== '/') return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+export function validateMutationRequest(req, dashboardOrigins) {
+  if (req.method !== 'POST') return;
+
+  const contentType = String(requestHeader(req, 'content-type') || '')
+    .split(';', 1)[0]
+    .trim()
+    .toLowerCase();
+  if (contentType !== 'application/json') {
+    throw new HttpRequestError(415, 'POST requests require application/json');
+  }
+  if (requestHeader(req, 'x-dex-request') !== '1') {
+    throw new HttpRequestError(403, 'missing X-Dex-Request header');
+  }
+
+  const rawOrigin = requestHeader(req, 'origin');
+  if (rawOrigin !== undefined) {
+    const origin = requestOrigin(req);
+    const allowed = new Set(dashboardOrigins);
+    const local = hostOrigin(req);
+    if (local) allowed.add(local);
+    if (!origin || !allowed.has(origin)) {
+      throw new HttpRequestError(403, 'request Origin is not allowed');
+    }
+  }
+}
+
 function sendJsonError(res, statusCode, message, headers = {}) {
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -79,5 +141,53 @@ export function enforceRequestSecurity(req, res, config) {
     });
     return false;
   }
-  return true;
+  try {
+    validateMutationRequest(req, config.dashboardOrigins);
+    return true;
+  } catch (error) {
+    if (!(error instanceof HttpRequestError)) throw error;
+    sendJsonError(res, error.statusCode, error.message);
+    return false;
+  }
+}
+
+export function readJsonBody(req, maxBytes = 1_000_000) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let bytes = 0;
+    let settled = false;
+
+    req.on('data', (chunk) => {
+      if (settled) return;
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buffer.length;
+      if (bytes > maxBytes) {
+        settled = true;
+        reject(new HttpRequestError(413, 'request body too large'));
+        return;
+      }
+      chunks.push(buffer);
+    });
+
+    req.once('end', () => {
+      if (settled) return;
+      settled = true;
+      const body = Buffer.concat(chunks).toString('utf8');
+      if (!body) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(body));
+      } catch {
+        reject(new HttpRequestError(400, 'invalid JSON body'));
+      }
+    });
+
+    req.once('error', (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+  });
 }
