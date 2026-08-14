@@ -18,6 +18,7 @@ import { loadSnapshot, saveSnapshot } from './persist.js';
 import { createAiService } from './ai/service.js';
 import { enforceRequestSecurity, HttpRequestError, readJsonBody } from './security.js';
 import { SseClientPool } from './sse.js';
+import { initializeExchange } from './startup.js';
 
 // ── 启动配置 ─────────────────────────────────────────────────────────────────
 const cfg = getConfig();
@@ -33,10 +34,6 @@ const cfg = getConfig();
     if (!cfg.ex.apiKey) missing.push(['Extended', 'EXTENDED_API_KEY', 'app.extended.exchange → API Management']);
     if (!cfg.ex.vault) missing.push(['Extended', 'EXTENDED_VAULT', '同上，创建 API Key 时一并显示']);
     if (!cfg.ex.starkPrivateKey) missing.push(['Extended', 'EXTENDED_STARK_PRIVATE_KEY', '同上，只显示一次务必保存']);
-  }
-  if (cfg.rs.mode === 'live') {
-    if (!cfg.rs.account) missing.push(['RISEx   ', 'ACCOUNT_ADDRESS', 'RISEx 应用的账户 / API 设置']);
-    if (!cfg.rs.signerKey) missing.push(['RISEx   ', 'SIGNER_PRIVATE_KEY', 'RISEx 应用的账户 / API 设置']);
   }
   if (missing.length) {
     console.error('\n[启动失败] 有交易所被设为 live 实盘模式，但 .env 里还缺以下凭据：\n');
@@ -486,31 +483,10 @@ server.on('error', (e) => {
 });
 
 // ── 初始化各交易所 ────────────────────────────────────────────────────────────
-async function initExchange(exchange, name, exCfg) {
-  try {
-    await exchange.init();
-    console.log(`[${name}] ✓ 连接成功 [${exCfg.mode.toUpperCase()} 模式]`);
-  } catch (e) {
-    console.error(`\n[${name}] ✗ 初始化失败：${e?.message || e}`);
-    console.error(`  目标接口: ${exCfg.apiUrl}   网络: ${exCfg.network}`);
-    const cause = e?.cause || {};
-    const code = cause.code || '';
-    if (code === 'ENOTFOUND') {
-      console.error('  ➤ 域名解析失败：检查网络，或配置代理。');
-    } else if (code === 'ECONNREFUSED' && String(cause.address || '').includes('127.0.0.1')) {
-      console.error('  ➤ 本机代理端口连不上，检查代理软件是否开启。');
-    } else if (code === 'UND_ERR_CONNECT_TIMEOUT' || /timeout/i.test(cause.message || '')) {
-      console.error('  ➤ 连接超时，接口被网络拦截，或代理未正确转发。');
-    }
-    console.error(`  该交易所将以离线模式运行（行情可能使用合成数据）。\n`);
-    // 不退出，让其他交易所继续工作
-  }
-}
-
 await Promise.all([
-  initExchange(deExchange, 'Decibel', cfg.de),
-  initExchange(exExchange, 'Extended', cfg.ex),
-  initExchange(rsExchange, 'RISEx', cfg.rs),
+  initializeExchange(deExchange, 'Decibel', cfg.de),
+  initializeExchange(exExchange, 'Extended', cfg.ex),
+  initializeExchange(rsExchange, 'RISEx', cfg.rs),
 ]);
 
 // ── 崩溃恢复 / 续跑 ────────────────────────────────────────────────────────────
