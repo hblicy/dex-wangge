@@ -105,6 +105,26 @@ test('orders parser accepts current mainnet decimal values and preserves cursor'
   assert.deepEqual(order.cursor, { block: 12n, log: 3n, timestamp: 99n });
 });
 
+test('orders update parser uses block timestamp before server timestamp', () => {
+  const [order] = parseOrderEnvelope({
+    ...orderEnvelope(),
+    block_timestamp: '101',
+    timestamp: '102',
+  });
+
+  assert.equal(order.cursor.timestamp, 101n);
+});
+
+test('orders update parser uses row created_at when envelope timestamps are absent or empty', () => {
+  const message = orderEnvelope({ ...rawOrder, created_at: '103' });
+  delete message.timestamp;
+  const emptyTimestampMessage = orderEnvelope({ ...rawOrder, created_at: '104' });
+  emptyTimestampMessage.timestamp = '';
+
+  assert.equal(parseOrderEnvelope(message)[0].cursor.timestamp, 103n);
+  assert.equal(parseOrderEnvelope(emptyTimestampMessage)[0].cursor.timestamp, 104n);
+});
+
 test('fills parser accepts the official decimal object format', () => {
   const [fill] = parseFillEnvelope({
     channel: 'fills', type: 'update', block_number: 13, log_index: 4,
@@ -127,6 +147,10 @@ test('WS parsers reject unknown status, malformed IDs and impossible values', ()
   assert.throws(() => parseOrderEnvelope(orderEnvelope({ ...rawOrder, price: '6.1e4' })), /price.*十进制数字字符串/);
   assert.throws(() => parseOrderEnvelope(orderEnvelope({ ...rawOrder, filled_size: '0.005' })), /超过订单总量/);
   assert.throws(() => parseOrderEnvelope({ ...orderEnvelope(), data: rawOrder }), /data.*数组/);
+  assert.throws(() => parseOrderEnvelope({
+    ...orderEnvelope({ ...rawOrder, created_at: '103' }),
+    block_timestamp: 'invalid',
+  }), /timestamp.*非负整数字符串/);
   assert.throws(() => parseFillEnvelope({
     channel: 'fills', type: 'update', block_number: 1, log_index: 1, timestamp: '1',
     data: { order_id: 'o1', market_id: '1', side: 'BUY', size: '0.1', price: '100' },

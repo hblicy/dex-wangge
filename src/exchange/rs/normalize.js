@@ -69,10 +69,12 @@ function cursorPart(value, field) {
 }
 
 function cursorFrom(message, item = {}) {
+  const timestamp = [message.block_timestamp, message.timestamp, item.created_at, item.time]
+    .find((value) => value !== undefined && value !== null && value !== '');
   return {
     block: cursorPart(item.block_number ?? item.blockchain_data?.block_number ?? message.block_number, 'block_number'),
     log: cursorPart(item.log_index ?? item.blockchain_data?.log_index ?? message.log_index, 'log_index'),
-    timestamp: cursorPart(message.timestamp ?? message.block_timestamp ?? item.time, 'timestamp'),
+    timestamp: cursorPart(timestamp, 'timestamp'),
   };
 }
 

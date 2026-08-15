@@ -203,6 +203,7 @@ test('Orders parse diagnostics expose schema types without secrets', async () =>
   assert.match(error.message, /type=update/);
   assert.match(error.message, /order=o-invalid/);
   assert.match(error.message, /size:number,price:string/);
+  assert.match(error.message, /cursor=timestamp:string,block_timestamp:undefined,created_at:undefined,time:undefined,block_number:string,log_index:string/);
   assert.doesNotMatch(error.message, /signature|permit|signerKey/i);
 });
 
