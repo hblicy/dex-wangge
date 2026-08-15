@@ -73,18 +73,30 @@ function makeHarness({
   packageVersion = '0.1.11',
   placeOrderImpl,
   updateLeverageImpl,
+  cancelOrderImpl,
+  cancelAllImpl,
+  openOrdersImpl,
+  orderHistoryImpl,
+  positionReadImpl,
   sleep = async () => {},
 } = {}) {
   const trace = [];
   const stream = new FakeStream(streamEvents, trace);
   const info = {
     async getMarkets() { trace.push('rest:markets'); return markets; },
-    async getOpenOrders(_account, marketId) { trace.push(`rest:open:${marketId}`); return openByMarket.get(marketId) || []; },
-    async getOrderHistory(_account, marketId) { trace.push(`rest:history:${marketId}`); return historyByMarket.get(marketId) || []; },
+    async getOpenOrders(_account, marketId) {
+      trace.push(`rest:open:${marketId}`);
+      return openOrdersImpl ? openOrdersImpl(marketId) : (openByMarket.get(marketId) || []);
+    },
+    async getOrderHistory(_account, marketId) {
+      trace.push(`rest:history:${marketId}`);
+      return orderHistoryImpl ? orderHistoryImpl(marketId) : (historyByMarket.get(marketId) || []);
+    },
     async getAccountTradeHistory(_account, marketId) { trace.push(`rest:fills:${marketId}`); return fillsByMarket.get(marketId) || []; },
     async getAllPositions() { trace.push('rest:positions'); return positions; },
     async getPosition(marketId) {
       trace.push(`rest:position:${marketId}`);
+      if (positionReadImpl) return positionReadImpl(marketId);
       return positions.find((position) => Number(position.market_id) === marketId) || null;
     },
     async getBalance() { trace.push('rest:balance'); return balance; },
@@ -102,6 +114,15 @@ function makeHarness({
     async updateLeverage(marketId, leverage) {
       trace.push('write:leverage');
       return updateLeverageImpl ? updateLeverageImpl(marketId, leverage) : { success: true };
+    },
+    async cancelOrder(params) {
+      trace.push('write:cancel');
+      if (!cancelOrderImpl) throw new Error('unexpected cancelOrder');
+      return cancelOrderImpl(params, stream);
+    },
+    async cancelAllOrders(marketId) {
+      trace.push('write:cancelAll');
+      return cancelAllImpl ? cancelAllImpl(marketId, stream) : { success: true };
     },
   };
   const exchange = new RisexExchange(config, {
@@ -357,4 +378,212 @@ test('RISEx setLeverage uses the write queue and reads back an existing position
   assert.equal(await exchange.setLeverage(1, 3), true);
   assert.deepEqual(called, [1, 3n]);
   assert.ok(trace.includes('rest:position:1'));
+});
+
+function setOwnedOpenSnapshot(exchange, orderId = 'o1') {
+  exchange.setRecoverySnapshot({
+    running: true,
+    config: { displayName: 'BTC-PERP', sizeBase: 0.001 },
+    active: [[orderId, { side: 'buy', price: 60000, sizeBase: 0.001, levelIndex: 2 }]],
+  });
+}
+
+test('RISEx cancel uses the REST resting ID and waits for an official terminal state', async () => {
+  let received;
+  const openByMarket = new Map([[1, [rawOpen('o-cancel')]]]);
+  const { exchange } = makeHarness({
+    openByMarket,
+    streamEvents: [wsOpen('o-cancel')],
+    cancelOrderImpl: async (params, stream) => {
+      received = params;
+      stream.emit('order', liveOrder('o-cancel', 'CANCELLED', 0, 0, 11));
+      return { success: true };
+    },
+  });
+  setOwnedOpenSnapshot(exchange, 'o-cancel');
+  await exchange.init();
+
+  assert.equal(await exchange.cancelOrder(1, 'o-cancel'), true);
+  assert.deepEqual(received, { market_id: 1, order_id: 'o-cancel', resting_order_id: 'r-o-cancel' });
+  assert.equal(exchange.orderState.get('o-cancel').status, 'CANCELLED');
+  assert.equal(exchange.getOpenOrders(1).length, 0);
+});
+
+test('RISEx cancel failures and unknown terminal states preserve tracking', async () => {
+  for (const [name, cancelOrderImpl, expected] of [
+    ['request', async () => ({ success: false }), /撤单请求未成功/],
+    ['terminal', async () => ({ success: true }), /未确认终态/],
+  ]) {
+    const openByMarket = new Map([[1, [rawOpen(`o-${name}`)]]]);
+    const { exchange } = makeHarness({
+      openByMarket,
+      streamEvents: [wsOpen(`o-${name}`)],
+      cancelOrderImpl,
+    });
+    setOwnedOpenSnapshot(exchange, `o-${name}`);
+    await exchange.init();
+    await assert.rejects(exchange.cancelOrder(1, `o-${name}`), expected);
+    assert.equal(exchange.orderState.get(`o-${name}`).status, 'OPEN');
+    assert.equal(exchange.getOpenOrders(1).length, 1);
+  }
+});
+
+test('RISEx cancel accepts a FILLED race and emits the actual fill once', async () => {
+  const openByMarket = new Map([[1, [rawOpen('o-race')]]]);
+  const { exchange } = makeHarness({
+    openByMarket,
+    streamEvents: [wsOpen('o-race')],
+    cancelOrderImpl: async (_params, stream) => {
+      stream.emit('fill', liveFill('o-race', 'f-race', 0.001, 59999, 11));
+      stream.emit('order', liveOrder('o-race', 'FILLED', 0.001, 59999, 12));
+      return { success: true };
+    },
+  });
+  setOwnedOpenSnapshot(exchange, 'o-race');
+  await exchange.init();
+  const fills = [];
+  exchange.on('fill', (fill) => fills.push(fill));
+
+  assert.equal(await exchange.cancelOrder(1, 'o-race'), true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0].sizeBase, 0.001);
+});
+
+test('RISEx bulk cancel blocks placements and returns only after REST open orders reach zero', async () => {
+  let openReads = 0;
+  let releaseCancel;
+  const cancelGate = new Promise((resolve) => { releaseCancel = resolve; });
+  const { exchange } = makeHarness({
+    streamEvents: [wsOpen('o-bulk')],
+    openOrdersImpl: (marketId) => {
+      if (marketId !== 1) return [];
+      openReads += 1;
+      return openReads <= 2 ? [rawOpen('o-bulk')] : [];
+    },
+    cancelAllImpl: async () => { await cancelGate; return { success: true }; },
+  });
+  setOwnedOpenSnapshot(exchange, 'o-bulk');
+  await exchange.init();
+
+  const cancelling = exchange.cancelAll(1);
+  await assert.rejects(
+    exchange.placeLimitOrder({ marketId: 1, side: 'buy', price: 60000, sizeBase: 0.001 }),
+    /批量撤单/,
+  );
+  releaseCancel();
+  assert.equal(await cancelling, true);
+  assert.ok(openReads >= 3);
+  assert.equal(exchange.getOpenOrders(1).length, 0);
+});
+
+test('RISEx bulk-cancel terminal fills suppress re-quoting', async () => {
+  let openReads = 0;
+  const { exchange } = makeHarness({
+    streamEvents: [wsOpen('o-bulk-fill')],
+    openOrdersImpl: (marketId) => {
+      if (marketId !== 1) return [];
+      return openReads++ === 0 ? [rawOpen('o-bulk-fill')] : [];
+    },
+    cancelAllImpl: async (_marketId, stream) => {
+      stream.emit('fill', liveFill('o-bulk-fill', 'f-bulk', 0.001, 59999, 11));
+      stream.emit('order', liveOrder('o-bulk-fill', 'FILLED', 0.001, 59999, 12));
+      return { success: true };
+    },
+  });
+  setOwnedOpenSnapshot(exchange, 'o-bulk-fill');
+  await exchange.init();
+  const fills = [];
+  exchange.on('fill', (fill) => fills.push(fill));
+
+  assert.equal(await exchange.cancelAll(1), true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0].suppressRequote, true);
+});
+
+test('RISEx bulk cancel halts when bounded REST checks still show open orders', async () => {
+  const { exchange } = makeHarness({
+    streamEvents: [wsOpen('o-stuck')],
+    openOrdersImpl: (marketId) => (marketId === 1 ? [rawOpen('o-stuck')] : []),
+  });
+  setOwnedOpenSnapshot(exchange, 'o-stuck');
+  await exchange.init();
+
+  await assert.rejects(exchange.cancelAll(1), /仍有挂单.*o-stuck/);
+  assert.equal(exchange.connectionState, 'HALTED');
+  assert.equal(exchange.orderState.get('o-stuck').status, 'OPEN');
+});
+
+for (const [label, side, expectedSide] of [['long', 0, 1], ['short', 1, 0]]) {
+  test(`RISEx close confirms ${label} is flat twice and always sends reduce-only`, async () => {
+    const rawPosition = {
+      market_id: '1', side, size: '0.001', entry_price: '60000',
+      unrealized_pnl: '0', leverage: '3',
+    };
+    const positionReads = [rawPosition, null, null];
+    let placed;
+    const { exchange } = makeHarness({
+      positions: [rawPosition],
+      positionReadImpl: () => positionReads.shift(),
+      placeOrderImpl: async (params) => { placed = params; return { order_id: `close-${label}` }; },
+    });
+    exchange.setRecoverySnapshot({
+      running: true, config: { displayName: 'BTC-PERP', sizeBase: 0.001 }, active: [],
+    });
+    await exchange.init();
+
+    assert.equal(await exchange.closePosition(1), true);
+    assert.equal(placed.side, expectedSide);
+    assert.equal(placed.order_type, 0);
+    assert.equal(placed.price_ticks, 0);
+    assert.equal(placed.size_steps, 10);
+    assert.equal(placed.time_in_force, 3);
+    assert.equal(placed.reduce_only, true);
+    assert.equal(placed.post_only, false);
+    assert.equal(placed.stp_mode, 1);
+  });
+}
+
+test('RISEx close halts when REST never confirms a flat position', async () => {
+  const rawPosition = {
+    market_id: '1', side: 0, size: '0.001', entry_price: '60000',
+    unrealized_pnl: '0', leverage: '3',
+  };
+  const { exchange } = makeHarness({
+    positions: [rawPosition],
+    positionReadImpl: () => rawPosition,
+    placeOrderImpl: async () => ({ order_id: 'close-stuck' }),
+  });
+  exchange.setRecoverySnapshot({
+    running: true, config: { displayName: 'BTC-PERP', sizeBase: 0.001 }, active: [],
+  });
+  await exchange.init();
+
+  await assert.rejects(exchange.closePosition(1), /仓位仍未归零/);
+  assert.equal(exchange.connectionState, 'HALTED');
+});
+
+test('RISEx close halts when the REST position read fails after submission', async () => {
+  const rawPosition = {
+    market_id: '1', side: 0, size: '0.001', entry_price: '60000',
+    unrealized_pnl: '0', leverage: '3',
+  };
+  let reads = 0;
+  const { exchange } = makeHarness({
+    positions: [rawPosition],
+    positionReadImpl: () => {
+      reads += 1;
+      if (reads === 1) return rawPosition;
+      throw new Error('position unavailable');
+    },
+    placeOrderImpl: async () => ({ order_id: 'close-rest-error' }),
+  });
+  exchange.setRecoverySnapshot({
+    running: true, config: { displayName: 'BTC-PERP', sizeBase: 0.001 }, active: [],
+  });
+  await exchange.init();
+
+  await assert.rejects(exchange.closePosition(1), /position unavailable/);
+  assert.equal(exchange.connectionState, 'HALTED');
 });

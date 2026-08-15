@@ -596,7 +596,7 @@ export class GridBot {
 
     // Recovery-ladder fills are pure reduce-only EXITS of stranded inventory —
     // never re-quote a replacement for them.
-    if (!isRecovery && this.grid) {
+    if (!isRecovery && !f.suppressRequote && this.grid) {
       const repl = replacementFor({ side: f.side, levelIndex }, this.grid.levels, this.config.mode);
       if (repl && !this.outOfRange && this.running) {
         repl.opening = closing; // replacement is the opposite leg

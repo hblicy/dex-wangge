@@ -17,7 +17,7 @@
 // Market   { marketId, displayName, symbol, lastPrice, stepSize, stepPrice, maxLeverage, minOrderSize }
 // Candle   { time, open, high, low, close, volume }
 // Order    { orderId, marketId, side, price, sizeBase, reduceOnly, levelIndex, clientOrderId }
-// Fill     { orderId, marketId, side, price, sizeBase, levelIndex, clientOrderId }
+// Fill     { orderId, marketId, side, price, sizeBase, levelIndex, clientOrderId, suppressRequote? }
 // Position { sizeBase(signed +long/-short), entryPrice, unrealizedPnl }
 
 export const SIDE = { BUY: 0, SELL: 1 };

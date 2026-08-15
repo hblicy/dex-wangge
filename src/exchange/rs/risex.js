@@ -89,6 +89,7 @@ export class RisexExchange extends EventEmitter {
     this._pendingPlaceCount = 0;
     this._orderWaiters = new Map();
     this._bulkCancel = false;
+    this._closingPosition = false;
     this._initializing = false;
     this._timer = null;
     this._info = null;
@@ -330,8 +331,67 @@ export class RisexExchange extends EventEmitter {
       if (this._pendingPlaceCount === 0) this._assertNoUnexpectedPrivateOrders();
     }
   }
-  async cancelOrder() { throw new Error('RISEx cancelOrder 尚未完成实现。'); }
-  async cancelAll() { throw new Error('RISEx cancelAll 尚未完成实现。'); }
+  async cancelOrder(marketId, orderId) {
+    const id = Number(marketId);
+    this._assertWritable(id, '撤单');
+    if (typeof orderId !== 'string' || !orderId) throw new Error('RISEx 撤单 orderId 必须是非空字符串。');
+    let record = this.orderState.get(orderId);
+    if (!record || record.marketId !== id) throw new Error(`RISEx 无法撤销未知订单 ${orderId}。`);
+    if (record.status === 'FILLED' || record.status === 'CANCELLED') return true;
+
+    const open = await this._readOpenOrders(id);
+    const target = open.find((order) => order.orderId === orderId);
+    if (!target) {
+      await this._confirmOrderFromRest(orderId, id);
+      record = this.orderState.get(orderId);
+      if (record?.status === 'FILLED' || record?.status === 'CANCELLED') return true;
+      throw new Error(`RISEx 订单 ${orderId} 未在开放订单中，且历史未确认终态。`);
+    }
+    this._restingIds.set(orderId, target.restingOrderId);
+
+    const response = await this._serialWrite('单笔撤单', () => this._client.cancelOrder({
+      market_id: id,
+      order_id: orderId,
+      resting_order_id: target.restingOrderId,
+    }));
+    if (response?.success !== true) throw new Error(`RISEx 订单 ${orderId} 撤单请求未成功。`);
+
+    record = this.orderState.get(orderId);
+    if (record?.status !== 'FILLED' && record?.status !== 'CANCELLED') {
+      await this._waitForOrderUpdate(orderId, 10_000);
+      record = this.orderState.get(orderId);
+    }
+    if (record?.status !== 'FILLED' && record?.status !== 'CANCELLED') {
+      await this._confirmOrderFromRest(orderId, id);
+      record = this.orderState.get(orderId);
+    }
+    if (record?.status !== 'FILLED' && record?.status !== 'CANCELLED') {
+      throw new Error(`RISEx 订单 ${orderId} 撤单后未确认终态，仍保留跟踪。`);
+    }
+    return true;
+  }
+
+  async cancelAll(marketId) {
+    const id = Number(marketId);
+    this._assertWritable(id, '批量撤单');
+    this._bulkCancel = true;
+    try {
+      const response = await this._serialWrite('批量撤单', () => this._client.cancelAllOrders(id));
+      if (response?.success !== true) throw new Error(`RISEx market ${id} 批量撤单请求未成功。`);
+
+      let remaining = [];
+      for (let attempt = 1; attempt <= 5; attempt += 1) {
+        remaining = await this._readOpenOrders(id);
+        this._replaceOfficialOpenFromRest(id, remaining);
+        this._logger.log?.(`[RISEx] market ${id} 批量撤单确认 ${attempt}/5，剩余订单：${remaining.map((order) => order.orderId).join(', ') || '0'}`);
+        if (remaining.length === 0) return true;
+        if (attempt < 5) await this._sleep(1_000);
+      }
+      this._haltAndThrow(`RISEx market ${id} 批量撤单后仍有挂单：${remaining.map((order) => order.orderId).join(', ')}。`);
+    } finally {
+      this._bulkCancel = false;
+    }
+  }
 
   getOpenOrders(marketId) {
     return [...(this._officialOpen.get(Number(marketId)) || new Map()).values()]
@@ -357,7 +417,80 @@ export class RisexExchange extends EventEmitter {
     return position && position.sizeBase !== 0 ? { ...position } : null;
   }
 
-  async closePosition() { throw new Error('RISEx closePosition 尚未完成实现。'); }
+  async closePosition(marketId) {
+    const id = Number(marketId);
+    this._assertWritable(id, '平仓');
+    await this.cancelAll(id);
+    this._closingPosition = true;
+    try {
+      let position = await this._readPosition(id);
+      if (!position) {
+        await this._sleep(1_000);
+        position = await this._readPosition(id);
+        if (!position) return true;
+      }
+
+      const market = this.markets.get(id);
+      const sizeSteps = Math.round(Math.abs(position.sizeBase) / market.stepSize);
+      if (!Number.isSafeInteger(sizeSteps) || sizeSteps <= 0) {
+        this._haltAndThrow(`RISEx market ${id} 仓位数量无法对齐 size step。`);
+      }
+      const side = position.sizeBase > 0 ? 'sell' : 'buy';
+      const clientOrderId = BigInt(`0x${randomBytes(8).toString('hex')}`).toString();
+      this._pendingPlaceCount += 1;
+      try {
+        const response = await this._serialWrite('市价平仓', () => this._client.placeOrder({
+          market_id: id,
+          side: side === 'buy' ? Side.Long : Side.Short,
+          order_type: OrderType.Market,
+          price_ticks: 0,
+          size_steps: sizeSteps,
+          time_in_force: TimeInForce.ImmediateOrCancel,
+          post_only: false,
+          reduce_only: true,
+          stp_mode: StpMode.ExpireTaker,
+          ttl_units: 0,
+          client_order_id: clientOrderId,
+        }));
+        if (typeof response?.order_id !== 'string' || !response.order_id) {
+          this._haltAndThrow('RISEx 平仓响应缺少非空字符串订单 ID。');
+        }
+        const result = this.orderState.track({
+          orderId: response.order_id,
+          marketId: id,
+          side,
+          price: 0,
+          sizeBase: sizeSteps * market.stepSize,
+          reduceOnly: true,
+          clientOrderId,
+          sizeTolerance: market.stepSize / 2,
+        });
+        this._handleOrderResult(result, {
+          orderId: response.order_id,
+          marketId: id,
+        });
+        this._syncOfficialOrder(response.order_id);
+      } finally {
+        this._pendingPlaceCount -= 1;
+        if (this._pendingPlaceCount === 0) this._assertNoUnexpectedPrivateOrders();
+      }
+
+      let zeroStreak = 0;
+      for (let attempt = 1; attempt <= 6; attempt += 1) {
+        const current = await this._readPosition(id);
+        zeroStreak = current ? 0 : zeroStreak + 1;
+        this._logger.log?.(`[RISEx] market ${id} 平仓确认 ${attempt}/6，连续空仓 ${zeroStreak}/2`);
+        if (zeroStreak >= 2) return true;
+        if (attempt < 6) await this._sleep(1_000);
+      }
+      this._haltAndThrow(`RISEx market ${id} 平仓后仓位仍未归零。`);
+    } catch (cause) {
+      if (this.connectionState === 'HALTED') throw cause;
+      this._haltAndThrow(`RISEx market ${id} 平仓确认失败：${cause?.message || String(cause)}`);
+    } finally {
+      this._closingPosition = false;
+    }
+  }
   start() {}
 
   stop() {
@@ -550,11 +683,55 @@ export class RisexExchange extends EventEmitter {
     return true;
   }
 
+  async _readOpenOrders(marketId) {
+    const market = this.markets.get(Number(marketId));
+    if (!market) throw new Error(`RISEx market ${marketId} 不受支持。`);
+    const rows = await this._info.getOpenOrders(this.account, market.marketId);
+    if (!Array.isArray(rows)) throw new Error(`RISEx market ${market.marketId} REST 开放订单格式非法。`);
+    this.lastRestAt = this._now();
+    return rows.map((row) => normalizeRestOpenOrder(row, market));
+  }
+
+  _replaceOfficialOpenFromRest(marketId, orders) {
+    const id = Number(marketId);
+    const next = new Map();
+    for (const order of orders) {
+      const record = this.orderState.get(order.orderId);
+      if (!record) this._haltAndThrow(`RISEx market ${id} REST 出现无法归属的订单 ${order.orderId}。`);
+      this.orderState.track({
+        ...record.meta,
+        orderId: order.orderId,
+        marketId: order.marketId,
+        side: order.side,
+        sizeBase: order.sizeBase,
+        price: order.price,
+        sizeTolerance: this.markets.get(id).stepSize / 2,
+      });
+      this._restingIds.set(order.orderId, order.restingOrderId);
+      if (record.status === 'OPEN' || record.status === 'PARTIAL') next.set(order.orderId, order);
+    }
+    this._officialOpen.set(id, next);
+  }
+
+  async _readPosition(marketId) {
+    const id = Number(marketId);
+    const position = normalizeRestPosition(await this._info.getPosition(id, this.account));
+    this.lastRestAt = this._now();
+    if (!position || position.sizeBase === 0) {
+      this._positions.delete(id);
+      return null;
+    }
+    if (position.marketId !== id) throw new Error(`RISEx market ${id} 仓位回读市场不匹配。`);
+    this._positions.set(id, position);
+    return position;
+  }
+
   _assertWritable(marketId, action) {
     if (this.connectionState !== 'READY') {
       throw new Error(`RISEx ${action}被拒绝：${this.connectionState} ${this.haltReason || ''}`.trim());
     }
     if (this._bulkCancel) throw new Error(`RISEx ${action}被拒绝：正在批量撤单。`);
+    if (this._closingPosition) throw new Error(`RISEx ${action}被拒绝：正在确认平仓。`);
     this._assertAllowedMarket(marketId, action);
   }
 
