@@ -91,6 +91,7 @@ export class RisexExchange extends EventEmitter {
     this._pendingPlaceCount = 0;
     this._orderWaiters = new Map();
     this._bulkCancel = false;
+    this._suppressRequoteOrderIds = new Set();
     this._closingPosition = false;
     this._initializing = false;
     this._manualReconnecting = false;
@@ -400,6 +401,8 @@ export class RisexExchange extends EventEmitter {
   async cancelAll(marketId) {
     const id = Number(marketId);
     this._assertWritable(id, '批量撤单');
+    const affectedOrderIds = this.orderState.getOpen(id).map((order) => order.orderId);
+    for (const orderId of affectedOrderIds) this._suppressRequoteOrderIds.add(orderId);
     this._bulkCancel = true;
     try {
       const response = await this._serialWrite(
@@ -411,14 +414,32 @@ export class RisexExchange extends EventEmitter {
       if (response?.success !== true) throw new Error(`RISEx market ${id} 批量撤单请求未成功。`);
 
       let remaining = [];
+      let unresolved = [...affectedOrderIds];
       for (let attempt = 1; attempt <= 5; attempt += 1) {
         remaining = await this._readOpenOrders(id);
         this._replaceOfficialOpenFromRest(id, remaining);
-        this._logger.log?.(`[RISEx] market ${id} 批量撤单确认 ${attempt}/5，剩余订单：${remaining.map((order) => order.orderId).join(', ') || '0'}`);
-        if (remaining.length === 0) return true;
+        if (remaining.length === 0) {
+          unresolved = [];
+          for (const orderId of affectedOrderIds) {
+            let record = this.orderState.get(orderId);
+            if (record?.status !== 'FILLED' && record?.status !== 'CANCELLED') {
+              await this._confirmOrderFromRest(orderId, id);
+              record = this.orderState.get(orderId);
+            }
+            if (record?.status !== 'FILLED' && record?.status !== 'CANCELLED') {
+              unresolved.push(orderId);
+            }
+          }
+        }
+        this._logger.log?.(
+          `[RISEx] market ${id} 批量撤单确认 ${attempt}/5，剩余开放订单：${remaining.map((order) => order.orderId).join(', ') || '0'}，未确认终态：${unresolved.join(', ') || '0'}`,
+        );
+        if (remaining.length === 0 && unresolved.length === 0) return true;
         if (attempt < 5) await this._sleep(1_000);
       }
-      this._haltAndThrow(`RISEx market ${id} 批量撤单后仍有挂单：${remaining.map((order) => order.orderId).join(', ')}。`);
+      this._haltAndThrow(
+        `RISEx market ${id} 批量撤单未完成；剩余开放订单：${remaining.map((order) => order.orderId).join(', ') || '0'}；未确认终态：${unresolved.join(', ') || '0'}。`,
+      );
     } finally {
       this._bulkCancel = false;
     }
@@ -897,9 +918,10 @@ export class RisexExchange extends EventEmitter {
 
   _handleOrderResult(result, context) {
     if (!result?.terminal) return;
-    this._officialOpen.get(Number(context.marketId))?.delete(String(context.orderId));
+    const orderId = String(context.orderId);
+    this._officialOpen.get(Number(context.marketId))?.delete(orderId);
+    const suppressRequote = this._suppressRequoteOrderIds.delete(orderId);
     if (!result.terminalFill) return;
-    const suppressRequote = this._bulkCancel;
     this._defer(() => this.emit('fill', { ...result.terminalFill, suppressRequote }));
   }
 
@@ -949,11 +971,13 @@ export class RisexExchange extends EventEmitter {
   }
 
   async _confirmOrderFromRest(orderId, marketId) {
-    const rows = await this._info.getOrderHistory(this.account, marketId, 100);
-    if (!Array.isArray(rows)) throw new Error(`RISEx market ${marketId} REST 历史订单格式非法。`);
+    const raw = await this._client.getOrderById(orderId, marketId);
     this.lastRestAt = this._now();
-    const confirmed = rows.map(normalizeRestOrderHistory).find((order) => order.orderId === orderId);
-    if (!confirmed) return false;
+    if (raw == null) return false;
+    const confirmed = normalizeRestOrderHistory(raw);
+    if (confirmed.orderId !== orderId || confirmed.marketId !== marketId) {
+      throw new Error(`RISEx 订单 ${orderId} 单笔确认身份不匹配。`);
+    }
     const result = this.orderState.applyOrder(confirmed);
     this._handleOrderResult(result, confirmed);
     this._syncOfficialOrder(orderId);

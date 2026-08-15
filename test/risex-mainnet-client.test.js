@@ -78,7 +78,7 @@ test('RISEx mainnet permit signs the next official nonce anchor', async () => {
   assert.equal(permit.nonce_bitmap_index, 7);
 });
 
-test('RISEx mainnet signed writes send permit_params required by the live API', async () => {
+test('RISEx mainnet signed writes use endpoint-specific permit fields', async () => {
   const { client, calls } = makeClient();
   await client.updateLeverage(1, 25n);
   await client.placeOrder({
@@ -103,9 +103,39 @@ test('RISEx mainnet signed writes send permit_params required by the live API', 
     '/v1/orders/cancel',
     '/v1/orders/cancel-all',
   ]);
-  for (const { body } of calls) {
-    assert.equal(body.permit_params, PERMIT_PARAMS);
-    assert.equal(Object.hasOwn(body, 'permit'), false);
+  assert.equal(calls[0].body.permit_params, PERMIT_PARAMS);
+  assert.equal(Object.hasOwn(calls[0].body, 'permit'), false);
+  for (const { body } of calls.slice(1)) {
+    assert.equal(body.permit, PERMIT_PARAMS);
+    assert.equal(Object.hasOwn(body, 'permit_params'), false);
   }
   assert.equal(calls[0].body.leverage, '25');
+});
+
+test('RISEx mainnet fetches one order by the exact string ID', async () => {
+  const { client, calls } = makeClient();
+  const id = '0x1234567890abcdef1234567890abcdef1234567890abcdef';
+  client.info.http.get = async (path) => {
+    calls.push({ path });
+    return { order: { id, market_id: '1' } };
+  };
+
+  assert.deepEqual(await client.getOrderById(id, 1), { id, market_id: '1' });
+  assert.equal(
+    calls.at(-1).path,
+    `/v1/orders/by-id/${encodeURIComponent(id)}?market_id=1`,
+  );
+});
+
+test('RISEx mainnet single-order lookup treats only HTTP 404 as not found', async () => {
+  const { client } = makeClient();
+  client.info.http.get = async () => {
+    throw Object.assign(new Error('not found'), { status: 404 });
+  };
+  assert.equal(await client.getOrderById('0xmissing', 1), null);
+
+  client.info.http.get = async () => {
+    throw Object.assign(new Error('server failed'), { status: 500 });
+  };
+  await assert.rejects(client.getOrderById('0xfailed', 1), /server failed/);
 });

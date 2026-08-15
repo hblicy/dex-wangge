@@ -22,6 +22,8 @@ const eth = {
   last_price: '3000', mark_price: '3001', visible: true,
   config: { step_size: '0.001', step_price: '0.01', min_order_size: '0.01', max_leverage: '50' },
 };
+const WAD = 10n ** 18n;
+const wad = (value) => (BigInt(value) * WAD).toString();
 
 const rawOrder = {
   id: '90071992547409931234', market_id: '1', side: 'BUY',
@@ -130,7 +132,7 @@ test('WS parsers reject unknown status, malformed IDs and impossible values', ()
   }), /side/);
 });
 
-test('REST normalizers preserve IDs and explicitly convert ticks and steps', () => {
+test('REST normalizers preserve open-order IDs and explicitly convert ticks and steps', () => {
   const market = { marketId: 1, stepPrice: 0.1, stepSize: 0.001 };
   const open = normalizeRestOpenOrder({
     order_id: '90071992547409931234', resting_order_id: '77', market_id: 1,
@@ -141,22 +143,49 @@ test('REST normalizers preserve IDs and explicitly convert ticks and steps', () 
   assert.ok(Math.abs(open.price - 60000.1) < 1e-9);
   assert.ok(Math.abs(open.sizeBase - 0.003) < 1e-12);
   assert.equal(open.side, 'buy');
+});
 
+test('REST normalizers parse current RISEx order, fill and position schemas', () => {
   const history = normalizeRestOrderHistory({
-    order_id: 'o1', market_id: '1', side: 0, size: '1', price: '100',
-    filled_size: '0.25', status: 'CANCELLED', timestamp: '10', avg_price: '99',
+    id: '0xorder1', market_id: '1', side: 'BUY', size: wad(1), price: wad(100),
+    filled_size: (WAD / 4n).toString(), avg_price: wad(99),
+    status: 'ORDER_STATUS_CANCELLED', created_at: '20', block_number: '7', log_index: '2',
   });
-  assert.equal(history.filledSize, 0.25);
-  assert.equal(history.avgPrice, 99);
+  assert.deepEqual({
+    orderId: history.orderId,
+    side: history.side,
+    sizeBase: history.sizeBase,
+    filledSize: history.filledSize,
+    avgPrice: history.avgPrice,
+    cursor: history.cursor,
+  }, {
+    orderId: '0xorder1',
+    side: 'buy',
+    sizeBase: 1,
+    filledSize: 0.25,
+    avgPrice: 99,
+    cursor: { block: 7n, log: 2n, timestamp: 20n },
+  });
 
-  assert.equal(normalizeRestFill({
-    fill_id: 'f1', order_id: 'o1', market_id: '1', side: 0,
-    size: '0.25', price: '99', timestamp: '11', fee: '0.1',
-  }).fillId, 'f1');
+  const fill = normalizeRestFill({
+    id: 'fill1', order_id: '0xorder1', market_id: '1', side: 'BUY',
+    size: '0.25', price: '99', fee: '0.1', time: '21',
+    blockchain_data: { block_number: '7', log_index: '3' },
+  });
+  assert.deepEqual(fill.cursor, { block: 7n, log: 3n, timestamp: 21n });
+
+  const position = normalizeRestPosition({
+    market_id: '1', side: 'SELL', size: (WAD / 2n).toString(),
+    avg_entry_price: wad(100), unrealized_pnl: wad(2), leverage: wad(3),
+  });
+  assert.deepEqual(position, {
+    marketId: 1, sizeBase: -0.5, entryPrice: 100, unrealizedPnl: 2, leverage: 3,
+  });
+
   assert.equal(normalizeRestPosition({
-    market_id: '1', side: 1, size: '0.5', entry_price: '100',
-    unrealized_pnl: '2', leverage: '3',
-  }).sizeBase, -0.5);
+    market_id: '1', side: 0, size: (WAD / 2n).toString(),
+    avg_entry_price: wad(100), unrealized_pnl: wad(2), leverage: wad(3),
+  }).sizeBase, 0.5);
 });
 
 test('REST normalizers reject missing resting IDs, unknown status and incomplete positions', () => {
@@ -165,12 +194,12 @@ test('REST normalizers reject missing resting IDs, unknown status and incomplete
     order_id: 'o1', market_id: 1, side: 0, price_ticks: 1, size_steps: 1,
   }, market), /resting_order_id/);
   assert.throws(() => normalizeRestOrderHistory({
-    order_id: 'o1', market_id: '1', side: 0, size: '1', price: '100',
-    filled_size: '0', status: 'MYSTERY', timestamp: '10',
+    id: 'o1', market_id: '1', side: 'BUY', size: wad(1), price: wad(100),
+    filled_size: '0', avg_price: '0', status: 'MYSTERY', created_at: '10',
   }), /MYSTERY/);
   assert.throws(() => normalizeRestPosition({
-    market_id: '1', side: 0, size: '1', entry_price: '',
-  }), /entry_price/);
+    market_id: '1', side: 'BUY', size: wad(1), avg_entry_price: '',
+  }), /avg_entry_price/);
 });
 
 test('cursor comparison uses block then log then timestamp', () => {

@@ -13,6 +13,13 @@ const AUTH_TYPES = {
   ],
 };
 
+function positiveTimeout(value, field) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`RISEx ${field} 必须是安全正整数毫秒。`);
+  }
+  return value;
+}
+
 export class RisexPrivateStream extends EventEmitter {
   constructor({
     account,
@@ -27,6 +34,11 @@ export class RisexPrivateStream extends EventEmitter {
     now = Date.now,
     setTimer = setTimeout,
     clearTimer = clearTimeout,
+    connectTimeoutMs = 15_000,
+    snapshotTimeoutMs = 15_000,
+    requestTimeoutMs = 15_000,
+    setDeadline = setTimeout,
+    clearDeadline = clearTimeout,
     logger = console,
   }) {
     super();
@@ -54,11 +66,17 @@ export class RisexPrivateStream extends EventEmitter {
     this._now = now;
     this._setTimer = setTimer;
     this._clearTimer = clearTimer;
+    this._connectTimeoutMs = positiveTimeout(connectTimeoutMs, 'WebSocket 认证超时');
+    this._snapshotTimeoutMs = positiveTimeout(snapshotTimeoutMs, 'Orders 快照超时');
+    this._requestTimeoutMs = positiveTimeout(requestTimeoutMs, '认证 GET 超时');
+    this._setDeadline = setDeadline;
+    this._clearDeadline = clearDeadline;
     this._logger = logger;
     this._socket = null;
     this._connectPromise = null;
     this._connectResolve = null;
     this._connectReject = null;
+    this._connectDeadline = null;
     this._authAttempt = 0;
     this._domain = null;
     this._stopped = true;
@@ -82,6 +100,7 @@ export class RisexPrivateStream extends EventEmitter {
       this._connectResolve = resolve;
       this._connectReject = reject;
     });
+    this._startConnectDeadline();
     try {
       this._socket = new this._WebSocket(this.wsUrl);
       this._bindSocket(this._socket);
@@ -108,7 +127,16 @@ export class RisexPrivateStream extends EventEmitter {
 
   async waitForOrderSnapshot() {
     if (this._orderSnapshotSeen) return;
-    return new Promise((resolve, reject) => this._snapshotWaiters.push({ resolve, reject }));
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve, reject, deadline: null };
+      waiter.deadline = this._setDeadline(() => {
+        waiter.deadline = null;
+        const index = this._snapshotWaiters.indexOf(waiter);
+        if (index >= 0) this._snapshotWaiters.splice(index, 1);
+        reject(new Error(`RISEx 私有 Orders 快照 ${this._snapshotTimeoutMs}ms 超时。`));
+      }, this._snapshotTimeoutMs);
+      this._snapshotWaiters.push(waiter);
+    });
   }
 
   stop() {
@@ -196,11 +224,27 @@ export class RisexPrivateStream extends EventEmitter {
   }
 
   async _getJson(url) {
-    const response = await this._fetch(url, { method: 'GET', redirect: 'error' });
-    if (!response?.ok) {
-      throw new Error(`RISEx GET ${new URL(url).pathname} 失败：HTTP ${response?.status ?? 'unknown'}。`);
+    const controller = new AbortController();
+    const pathname = new URL(url).pathname;
+    const deadline = this._setDeadline(() => controller.abort(), this._requestTimeoutMs);
+    try {
+      const response = await this._fetch(url, {
+        method: 'GET',
+        redirect: 'error',
+        signal: controller.signal,
+      });
+      if (!response?.ok) {
+        throw new Error(`RISEx GET ${pathname} 失败：HTTP ${response?.status ?? 'unknown'}。`);
+      }
+      return await response.json();
+    } catch (error) {
+      if (error?.name === 'AbortError') {
+        throw new Error(`RISEx GET ${pathname} ${this._requestTimeoutMs}ms 超时。`, { cause: error });
+      }
+      throw error;
+    } finally {
+      this._clearDeadline(deadline);
     }
-    return response.json();
   }
 
   _handleMessage(event) {
@@ -234,7 +278,7 @@ export class RisexPrivateStream extends EventEmitter {
         }
         if (message.type === 'snapshot') {
           this._orderSnapshotSeen = true;
-          for (const waiter of this._snapshotWaiters.splice(0)) waiter.resolve();
+          this._resolveSnapshotWaiters();
         }
         return;
       }
@@ -324,6 +368,7 @@ export class RisexPrivateStream extends EventEmitter {
   }
 
   _resolveConnect() {
+    this._clearConnectDeadline();
     const resolve = this._connectResolve;
     this._connectResolve = null;
     this._connectReject = null;
@@ -332,6 +377,7 @@ export class RisexPrivateStream extends EventEmitter {
   }
 
   _rejectConnect(error) {
+    this._clearConnectDeadline();
     const reject = this._connectReject;
     this._connectResolve = null;
     this._connectReject = null;
@@ -340,6 +386,32 @@ export class RisexPrivateStream extends EventEmitter {
   }
 
   _rejectSnapshotWaiters(error) {
-    for (const waiter of this._snapshotWaiters.splice(0)) waiter.reject(error);
+    for (const waiter of this._snapshotWaiters.splice(0)) {
+      if (waiter.deadline != null) this._clearDeadline(waiter.deadline);
+      waiter.deadline = null;
+      waiter.reject(error);
+    }
+  }
+
+  _resolveSnapshotWaiters() {
+    for (const waiter of this._snapshotWaiters.splice(0)) {
+      if (waiter.deadline != null) this._clearDeadline(waiter.deadline);
+      waiter.deadline = null;
+      waiter.resolve();
+    }
+  }
+
+  _startConnectDeadline() {
+    this._clearConnectDeadline();
+    this._connectDeadline = this._setDeadline(() => {
+      this._connectDeadline = null;
+      this._fatal(new Error(`RISEx 私有 WebSocket 认证 ${this._connectTimeoutMs}ms 超时。`));
+    }, this._connectTimeoutMs);
+  }
+
+  _clearConnectDeadline() {
+    if (this._connectDeadline == null) return;
+    this._clearDeadline(this._connectDeadline);
+    this._connectDeadline = null;
   }
 }
