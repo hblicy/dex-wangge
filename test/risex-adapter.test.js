@@ -12,6 +12,15 @@ const config = {
   wsUrl: 'wss://api.rise.trade/ws/',
   network: 'mainnet',
 };
+const WAD = 10n ** 18n;
+
+function toWad(value) {
+  const text = String(value);
+  const match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(text);
+  if (!match || (match[3]?.length || 0) > 18) throw new Error(`invalid test decimal ${text}`);
+  const raw = BigInt(match[2]) * WAD + BigInt((match[3] || '').padEnd(18, '0') || '0');
+  return `${match[1]}${raw}`;
+}
 
 const rawMarkets = [
   {
@@ -57,27 +66,41 @@ function rawOpen(orderId = 'o1', marketId = 1) {
 
 function rawHistory(orderId, status, filledSize, avgPrice = '0') {
   return {
-    order_id: orderId,
+    id: orderId,
     market_id: '1',
-    side: 0,
-    size: '0.001',
-    price: '60000',
-    filled_size: String(filledSize),
-    avg_price: String(avgPrice),
+    side: 'BUY',
+    size: toWad('0.001'),
+    price: toWad('60000'),
+    filled_size: toWad(filledSize),
+    avg_price: toWad(avgPrice),
     status,
-    timestamp: '20',
+    created_at: '20',
+    block_number: '2',
+    log_index: '0',
   };
 }
 
 function rawRestFill(orderId, fillId, size = '0.001', price = '59999') {
   return {
-    fill_id: fillId,
+    id: fillId,
     order_id: orderId,
     market_id: '1',
-    side: 0,
+    side: 'BUY',
     size,
     price,
-    timestamp: '19',
+    time: '19',
+    blockchain_data: { block_number: '1', log_index: '9' },
+  };
+}
+
+function rawPosition(side = 'BUY', size = '0.001', entryPrice = '60000', pnl = '0', leverage = '3') {
+  return {
+    market_id: '1',
+    side,
+    size: toWad(size),
+    avg_entry_price: toWad(entryPrice),
+    unrealized_pnl: toWad(pnl),
+    leverage: toWad(leverage),
   };
 }
 
@@ -221,7 +244,7 @@ test('RISEx init halts when an idle account has target-market open orders', asyn
 
 test('RISEx init halts when an idle account has a target-market position', async () => {
   const { exchange } = makeHarness({
-    positions: [{ market_id: '1', side: 0, size: '0.1', entry_price: '60000', unrealized_pnl: '1', leverage: '3' }],
+    positions: [rawPosition('BUY', '0.1', '60000', '1', '3')],
   });
   await assert.rejects(exchange.init(), /没有运行快照.*遗留仓位/);
   assert.equal(exchange.connectionState, 'HALTED');
@@ -442,7 +465,7 @@ test('RISEx place confirmation timeout queries REST then halts when still unknow
 test('RISEx setLeverage uses the write queue and reads back an existing position', async () => {
   let called;
   const { exchange, trace } = makeHarness({
-    positions: [{ market_id: '1', side: 0, size: '0.1', entry_price: '60000', unrealized_pnl: '1', leverage: '3' }],
+    positions: [rawPosition('BUY', '0.1', '60000', '1', '3')],
     updateLeverageImpl: async (marketId, leverage) => { called = [marketId, leverage]; return { success: true }; },
   });
   exchange.setRecoverySnapshot({ running: true, config: { displayName: 'BTC-PERP', sizeBase: 0.001 }, active: [] });
@@ -589,16 +612,13 @@ test('RISEx bulk cancel halts when bounded REST checks still show open orders', 
   assert.equal(exchange.orderState.get('o-stuck').status, 'OPEN');
 });
 
-for (const [label, side, expectedSide] of [['long', 0, 1], ['short', 1, 0]]) {
+for (const [label, side, expectedSide] of [['long', 'BUY', 1], ['short', 'SELL', 0]]) {
   test(`RISEx close confirms ${label} is flat twice and always sends reduce-only`, async () => {
-    const rawPosition = {
-      market_id: '1', side, size: '0.001', entry_price: '60000',
-      unrealized_pnl: '0', leverage: '3',
-    };
-    const positionReads = [rawPosition, null, null];
+    const positionRow = rawPosition(side);
+    const positionReads = [positionRow, null, null];
     let placed;
     const { exchange } = makeHarness({
-      positions: [rawPosition],
+      positions: [positionRow],
       positionReadImpl: () => positionReads.shift(),
       placeOrderImpl: async (params) => { placed = params; return { order_id: `close-${label}` }; },
     });
@@ -620,13 +640,10 @@ for (const [label, side, expectedSide] of [['long', 0, 1], ['short', 1, 0]]) {
 }
 
 test('RISEx close halts when REST never confirms a flat position', async () => {
-  const rawPosition = {
-    market_id: '1', side: 0, size: '0.001', entry_price: '60000',
-    unrealized_pnl: '0', leverage: '3',
-  };
+  const positionRow = rawPosition();
   const { exchange } = makeHarness({
-    positions: [rawPosition],
-    positionReadImpl: () => rawPosition,
+    positions: [positionRow],
+    positionReadImpl: () => positionRow,
     placeOrderImpl: async () => ({ order_id: 'close-stuck' }),
   });
   exchange.setRecoverySnapshot({
@@ -639,16 +656,13 @@ test('RISEx close halts when REST never confirms a flat position', async () => {
 });
 
 test('RISEx close halts when the REST position read fails after submission', async () => {
-  const rawPosition = {
-    market_id: '1', side: 0, size: '0.001', entry_price: '60000',
-    unrealized_pnl: '0', leverage: '3',
-  };
+  const positionRow = rawPosition();
   let reads = 0;
   const { exchange } = makeHarness({
-    positions: [rawPosition],
+    positions: [positionRow],
     positionReadImpl: () => {
       reads += 1;
-      if (reads === 1) return rawPosition;
+      if (reads === 1) return positionRow;
       throw new Error('position unavailable');
     },
     placeOrderImpl: async () => ({ order_id: 'close-rest-error' }),

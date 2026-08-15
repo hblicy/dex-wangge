@@ -5,7 +5,12 @@ import { pathToFileURL } from 'node:url';
 import { Wallet, isAddress } from 'ethers';
 import { InfoClient, WebSocketClient } from 'risex-client';
 import { loadEnv } from '../../config.js';
-import { normalizeRisexMarkets } from './normalize.js';
+import {
+  normalizeRestFill,
+  normalizeRestOpenOrder,
+  normalizeRestPosition,
+  normalizeRisexMarkets,
+} from './normalize.js';
 import { RisexPrivateStream } from './private-stream.js';
 
 const REQUIRED_CLIENT_VERSION = '0.1.11';
@@ -131,22 +136,6 @@ async function verifyPublicWs(marketId, deps) {
   }
 }
 
-function summarizePosition(raw, marketId) {
-  if (raw == null) return null;
-  if (Number(raw.market_id) !== marketId) throw new Error(`RISEx market ${marketId} 仓位市场不匹配。`);
-  if (raw.side !== 0 && raw.side !== 1 && raw.side !== '0' && raw.side !== '1') {
-    throw new Error(`RISEx market ${marketId} 仓位方向非法。`);
-  }
-  const absolute = Math.abs(finiteDecimal(raw.size, `market ${marketId} position size`));
-  if (absolute === 0) return null;
-  const sizeBase = (raw.side === 0 || raw.side === '0') ? absolute : -absolute;
-  return {
-    sizeBase,
-    entryPrice: finiteDecimal(raw.entry_price, `market ${marketId} entry price`, { positive: true }),
-    leverage: raw.leverage == null ? null : finiteDecimal(raw.leverage, `market ${marketId} leverage`, { positive: true }),
-  };
-}
-
 function assertPrivateConfig(config) {
   if (!config || !isAddress(config.account)) throw new Error('RISEX_ACCOUNT 不是有效 EVM 地址。');
   if (typeof config.signerKey !== 'string' || !/^0x[0-9a-f]{64}$/i.test(config.signerKey)) {
@@ -209,12 +198,22 @@ export async function verifyRisexPrivate(config, deps = {}) {
         if (!Array.isArray(open) || !Array.isArray(trades)) {
           throw new Error(`RISEx ${market.displayName} 私有 REST 响应格式非法。`);
         }
+        const normalizedOpen = open.map((row) => normalizeRestOpenOrder(row, market));
+        const normalizedTrades = trades.map(normalizeRestFill);
+        const normalizedPosition = normalizeRestPosition(position);
+        if (normalizedPosition && normalizedPosition.marketId !== market.marketId) {
+          throw new Error(`RISEx market ${market.marketId} 仓位市场不匹配。`);
+        }
         return {
           marketId: market.marketId,
           name: market.displayName,
-          openOrders: open.length,
-          trades: trades.length,
-          position: summarizePosition(position, market.marketId),
+          openOrders: normalizedOpen.length,
+          trades: normalizedTrades.length,
+          position: normalizedPosition && normalizedPosition.sizeBase !== 0 ? {
+            sizeBase: normalizedPosition.sizeBase,
+            entryPrice: normalizedPosition.entryPrice,
+            leverage: normalizedPosition.leverage,
+          } : null,
         };
       })),
     ]);

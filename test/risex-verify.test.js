@@ -8,6 +8,8 @@ const SIGNER = '0x0000000000000000000000000000000000000002';
 const SIGNER_KEY = `0x${'11'.repeat(32)}`;
 const API = 'https://api.rise.trade';
 const WS = 'wss://api.rise.trade/ws/';
+const WAD = 10n ** 18n;
+const wad = (value) => (BigInt(value) * WAD).toString();
 
 const rawMarkets = [
   {
@@ -42,17 +44,27 @@ function makeInfo(calls) {
     async getBalance(account) { calls.push(`getBalance:${account}`); return '123.45'; },
     async getOpenOrders(account, marketId) {
       calls.push(`getOpenOrders:${account}:${marketId}`);
-      return marketId === 1 ? [{ order_id: 'hidden-order' }] : [];
+      return marketId === 1 ? [{
+        order_id: 'hidden-order', resting_order_id: 'hidden-resting', market_id: '1',
+        side: 0, price_ticks: 600000, size_steps: 10, reduce_only: false,
+      }] : [];
     },
     async getPosition(marketId, account) {
       calls.push(`getPosition:${marketId}:${account}`);
       return marketId === 1
-        ? { market_id: '1', side: 0, size: '0.01', entry_price: '60000', leverage: '3' }
+        ? {
+          market_id: '1', side: 'BUY', size: (WAD / 100n).toString(),
+          avg_entry_price: wad(60000), unrealized_pnl: wad(1), leverage: wad(3),
+        }
         : null;
     },
     async getAccountTradeHistory(account, marketId) {
       calls.push(`getAccountTradeHistory:${account}:${marketId}`);
-      return marketId === 1 ? [{ fill_id: 'hidden-fill' }] : [];
+      return marketId === 1 ? [{
+        id: 'hidden-fill', order_id: 'hidden-order', market_id: '1', side: 'BUY',
+        size: '0.001', price: '60000', fee: '0', time: '20',
+        blockchain_data: { block_number: '2', log_index: '0' },
+      }] : [];
     },
   };
 }

@@ -40,6 +40,11 @@ function wsSide(value) {
   fail('side', `包含未知值 ${String(value)}。`);
 }
 
+function positionSide(value) {
+  if (value === 'BUY' || value === 'SELL') return wsSide(value);
+  return restSide(value);
+}
+
 function normalizeStatus(value, filledSize = 0) {
   const status = String(value || '').toUpperCase();
   if (status === 'ORDER_STATUS_OPEN' || status === 'OPEN') return filledSize > 0 ? 'PARTIAL' : 'OPEN';
@@ -67,10 +72,14 @@ function cursorFrom(message, item = {}) {
 }
 
 function restCursor(item) {
-  const timestamp = cursorPart(item.timestamp ?? item.time, 'timestamp');
-  const block = item.block_number == null ? 0n : cursorPart(item.block_number, 'block_number');
-  const log = item.log_index == null ? 0n : cursorPart(item.log_index, 'log_index');
-  return { block, log, timestamp };
+  const timestamp = cursorPart(item.created_at ?? item.timestamp ?? item.time, 'timestamp');
+  const blockValue = item.block_number ?? item.blockchain_data?.block_number;
+  const logValue = item.log_index ?? item.blockchain_data?.log_index;
+  return {
+    block: blockValue == null ? 0n : cursorPart(blockValue, 'block_number'),
+    log: logValue == null ? 0n : cursorPart(logValue, 'log_index'),
+    timestamp,
+  };
 }
 
 export function wadToNumber(raw, field) {
@@ -198,20 +207,20 @@ export function normalizeRestOpenOrder(raw, market) {
 }
 
 export function normalizeRestOrderHistory(raw) {
-  const orderId = stringId(raw?.order_id, 'REST 历史订单 ID');
-  const sizeBase = decimal(raw.size, `REST 历史订单 ${orderId} size`, { min: 0, allowZero: false });
-  const filledSize = raw.filled_size == null || raw.filled_size === ''
-    ? 0
-    : decimal(raw.filled_size, `REST 历史订单 ${orderId} filled_size`, { min: 0 });
+  const orderId = stringId(raw?.id, 'REST 历史订单 ID');
+  const sizeBase = wadToNumber(raw.size, `REST 历史订单 ${orderId} size`);
+  const filledSize = wadToNumber(raw.filled_size, `REST 历史订单 ${orderId} filled_size`);
+  const price = wadToNumber(raw.price, `REST 历史订单 ${orderId} price`);
+  const avgPrice = wadToNumber(raw.avg_price, `REST 历史订单 ${orderId} avg_price`);
+  if (!(sizeBase > 0)) fail(`REST 历史订单 ${orderId}`, '总量必须大于零。');
+  if (price < 0 || filledSize < 0 || avgPrice < 0) {
+    fail(`REST 历史订单 ${orderId}`, '包含负数价格或数量。');
+  }
   if (filledSize > sizeBase + 1e-12) fail(`REST 历史订单 ${orderId}`, '累计成交量超过订单总量。');
-  const price = decimal(raw.price, `REST 历史订单 ${orderId} price`, { min: 0 });
-  const avgPrice = raw.avg_price == null || raw.avg_price === ''
-    ? 0
-    : decimal(raw.avg_price, `REST 历史订单 ${orderId} avg_price`, { min: 0 });
   return {
     orderId,
     marketId: safeInteger(raw.market_id, `REST 历史订单 ${orderId} market_id`, { min: 1 }),
-    side: restSide(raw.side),
+    side: wsSide(raw.side),
     sizeBase,
     price,
     filledSize,
@@ -222,13 +231,13 @@ export function normalizeRestOrderHistory(raw) {
 }
 
 export function normalizeRestFill(raw) {
-  const fillId = stringId(raw?.fill_id ?? raw?.id, 'REST fill ID');
+  const fillId = stringId(raw?.id, 'REST fill ID');
   const orderId = stringId(raw.order_id, `REST fill ${fillId} order ID`);
   return {
     fillId,
     orderId,
     marketId: safeInteger(raw.market_id, `REST fill ${fillId} market_id`, { min: 1 }),
-    side: restSide(raw.side),
+    side: wsSide(raw.side),
     sizeBase: decimal(raw.size, `REST fill ${fillId} size`, { min: 0, allowZero: false }),
     price: decimal(raw.price, `REST fill ${fillId} price`, { min: 0, allowZero: false }),
     fee: raw.fee == null || raw.fee === '' ? 0 : decimal(raw.fee, `REST fill ${fillId} fee`),
@@ -239,21 +248,26 @@ export function normalizeRestFill(raw) {
 export function normalizeRestPosition(raw) {
   if (raw == null) return null;
   const marketId = safeInteger(raw.market_id, 'REST position market_id', { min: 1 });
-  const absoluteSize = Math.abs(decimal(raw.size, `REST position ${marketId} size`));
+  const absoluteSize = Math.abs(wadToNumber(raw.size, `REST position ${marketId} size`));
   if (absoluteSize === 0) return { marketId, sizeBase: 0, entryPrice: 0, unrealizedPnl: 0, leverage: null };
-  const side = restSide(raw.side);
-  const entryPrice = decimal(raw.entry_price, `REST position ${marketId} entry_price`, { min: 0, allowZero: false });
+  const side = positionSide(raw.side);
+  const entryPrice = wadToNumber(raw.avg_entry_price, `REST position ${marketId} avg_entry_price`);
+  if (!(entryPrice > 0)) fail(`REST position ${marketId} avg_entry_price`, '必须大于零。');
   let unrealizedPnl;
   if (raw.unrealized_pnl != null && raw.unrealized_pnl !== '') {
-    unrealizedPnl = decimal(raw.unrealized_pnl, `REST position ${marketId} unrealized_pnl`);
-  } else {
-    const markPrice = decimal(raw.mark_price, `REST position ${marketId} mark_price`, { min: 0, allowZero: false });
+    unrealizedPnl = wadToNumber(raw.unrealized_pnl, `REST position ${marketId} unrealized_pnl`);
+  } else if (raw.mark_price != null && raw.mark_price !== '') {
+    const markPrice = wadToNumber(raw.mark_price, `REST position ${marketId} mark_price`);
+    if (!(markPrice > 0)) fail(`REST position ${marketId} mark_price`, '必须大于零。');
     const signedSize = side === 'buy' ? absoluteSize : -absoluteSize;
     unrealizedPnl = signedSize * (markPrice - entryPrice);
+  } else {
+    fail(`REST position ${marketId}`, '缺少 unrealized_pnl 或 mark_price。');
   }
   const leverage = raw.leverage == null || raw.leverage === ''
     ? null
-    : decimal(raw.leverage, `REST position ${marketId} leverage`, { min: 0, allowZero: false });
+    : wadToNumber(raw.leverage, `REST position ${marketId} leverage`);
+  if (leverage != null && !(leverage > 0)) fail(`REST position ${marketId} leverage`, '必须大于零。');
   return {
     marketId,
     sizeBase: side === 'buy' ? absoluteSize : -absoluteSize,
