@@ -405,3 +405,63 @@ npm run risex:verify -- --private
 - 重启能接管已知挂单并恢复停机期间的终态成交。
 - 所有自动测试、只读验证、依赖审计和安全差异复查通过。
 - README 明确独立账户、mainnet风险和用户手动验收流程。
+
+## 18. 2026-08-15 实盘复查修订
+
+本节修订此前设计中对 `risex-client 0.1.11` 只读返回类型的假设。该版本的 TypeScript 类型和测试夹具仍描述旧接口，但客户端运行时不会转换 REST 字段；适配器必须以 RISEx 当前主网接口和官方前端实际消费的数据结构为准，不能继续依赖旧类型声明。
+
+### 18.1 严格区分各只读接口的数据结构
+
+`src/exchange/rs/normalize.js` 为不同来源保留独立解析器，不用宽松的通用兜底掩盖接口变化：
+
+- REST 开放订单继续解析 `order_id`、数字 `side`、`price_ticks`、`size_steps` 和 `resting_order_id`。
+- REST 历史订单及单笔订单解析 `id`、`BUY/SELL`、`created_at`、`block_number`、`log_index`，并把 `price`、`size`、`filled_size`、`avg_price` 从 18 位 WAD 转换为普通数值。
+- REST 账户成交解析 `id`、`order_id`、`BUY/SELL`、普通十进制 `price/size/fee`、`time`，游标从 `blockchain_data.block_number/log_index` 读取。
+- REST 全部仓位解析 `BUY/SELL`、`avg_entry_price` 以及接口定义的 18 位数值；单市场仓位如果方向仍为数字，只允许明确记录的 `0/1` 结构。未知字段组合必须抛错，不能猜测。
+- 私有 Orders/Fills WebSocket 继续使用现有独立解析器，不与 REST 开放订单格式混用。
+
+公共和私有只读验证必须复用同一套生产解析器，避免验证脚本显示成功而适配器实际无法读取仓位。
+
+### 18.2 精确订单确认
+
+单笔下单、撤单及批量撤单后的终态确认改用官方 `GET /v1/orders/by-id/{order_id}`：
+
+- 请求必须带原始字符串订单 ID，禁止转为 `Number`。
+- 正常响应必须通过历史订单解析器并校验返回 ID 与请求 ID 一致。
+- 明确的未找到响应可以返回“尚未确认”；格式错误、网络错误和其他 HTTP 错误直接抛出。
+- 不再扫描最近 100 条订单历史来推断某一订单状态。
+
+### 18.3 批量撤单周期与延迟终态
+
+全局 `_bulkCancel` 只承担写屏障，不再决定成交是否补单。批量撤单开始时捕获该市场所有受影响的已跟踪订单 ID，并把它们加入独立的“禁止补单订单集合”：
+
+1. 批量撤单期间收到终态时，按真实成交记账，但 `suppressRequote=true`。
+2. REST 开放订单归零后，逐个通过单笔订单接口确认受影响订单已经进入 `FILLED` 或 `CANCELLED`。
+3. 状态机应用终态后才允许 `cancelAll()` 成功返回，避免内部记录停留在 `OPEN/PARTIAL`。
+4. 延迟或重复 WebSocket 终态仍按订单 ID 保持禁止补单语义，直到状态机已确认并消费该终态。
+5. 有界等待后仍无法确认任意订单时进入 `HALTED`，保留跟踪，不宣称撤单完成。
+
+这样，停止网格、调整区间和启动前清理都不会因为消息晚于 REST 开放订单查询而重新挂出替代订单。
+
+### 18.4 私有连接和认证超时
+
+`RisexPrivateStream` 的以下边界使用明确的有界超时：
+
+- WebSocket 建连及 `auth_v2` 完成；
+- 首个 Orders snapshot 到达；
+- EIP-712 domain 和服务端 nonce 的 HTTP GET。
+
+HTTP 使用 `AbortController` 主动取消；WebSocket 和 snapshot 等待在超时后拒绝 promise、清理计时器和 socket/waiter，并输出不含密钥的阶段化错误。生产默认值固定在代码中，测试可以通过构造参数注入较短超时。超时不得自动切换 paper 或绕过对账。
+
+### 18.5 回归测试与验收
+
+新增测试必须先证明旧实现失败，再实现修复，并覆盖：
+
+- 当前主网历史订单、账户成交、全部仓位和单市场仓位样例；
+- 验证脚本使用与适配器相同的仓位解析；
+- 单笔订单确认调用精确端点且保留字符串 ID；
+- REST 已显示零挂单、WebSocket 终态延迟到达时不补单；
+- 批量撤单只有在所有受影响订单终态确认后返回；
+- connect、snapshot、domain 和 nonce 超时均明确失败并完成资源清理。
+
+完成验收仍只运行模拟测试和主网公共只读验证，不读取用户私钥，不执行真实下单或撤单。
