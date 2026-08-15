@@ -585,6 +585,10 @@ export class RisexExchange extends EventEmitter {
   start() {
     if (this._timer != null) return;
     const tick = () => {
+      if (this.connectionState !== 'READY') {
+        this._logger.log?.(`[RISEx] 跳过只读刷新：${this.connectionState} ${this.stateReason}`);
+        return undefined;
+      }
       if (this._refreshPromise) return this._refreshPromise;
       this._refreshPromise = this._refreshReadOnly()
         .catch((cause) => {
