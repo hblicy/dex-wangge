@@ -3,7 +3,7 @@ import { Wallet, isAddress } from 'ethers';
 import { WebSocket as UndiciWebSocket } from 'undici';
 import { compareRisexCursor, parseFillEnvelope, parseOrderEnvelope } from './normalize.js';
 
-const MAINNET_CHAIN_ID = 11155931n;
+const MAINNET_CHAIN_ID = 4153n;
 const AUTH_MESSAGE = 'sign in with RISEx';
 const AUTH_TYPES = {
   RegisterV2: [
@@ -175,7 +175,7 @@ export class RisexPrivateStream extends EventEmitter {
 
   _parseDomain(body) {
     const data = body?.data;
-    if (!data || data.name !== 'RISEx Auth' || data.version !== '1') {
+    if (!data || data.name !== 'RISEx' || data.version !== '1') {
       throw new Error('RISEx auth_v2 EIP-712 domain 名称或版本不匹配。');
     }
     let chainId;

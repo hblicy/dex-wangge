@@ -91,11 +91,13 @@ export function normalizeRisexMarkets(rawMarkets) {
   if (!Array.isArray(rawMarkets)) fail('markets', '必须是数组。');
   const selected = new Map();
   for (const raw of rawMarkets) {
-    const symbol = String(raw?.base_asset_symbol || '').toUpperCase();
-    if (!TARGET_SYMBOLS.includes(symbol)) continue;
+    const sourceSymbol = String(raw?.base_asset_symbol || '').trim().toUpperCase();
+    const symbolMatch = /^(BTC|ETH)(?:\/USDC)?$/.exec(sourceSymbol);
+    if (!symbolMatch) continue;
+    const symbol = symbolMatch[1];
     const name = `${symbol}-PERP`;
     if (selected.has(symbol)) fail(name, '市场重复。');
-    if (raw.visible === false) fail(name, '市场不可用。');
+    if (raw.visible === false || raw.config?.unlocked === false) fail(name, '市场不可用。');
     const marketId = safeInteger(raw.market_id, `${name} market_id`, { min: 1 });
     const stepSize = decimal(raw.config?.step_size, `${name} step_size`, { min: 0, allowZero: false });
     const stepPrice = decimal(raw.config?.step_price, `${name} step_price`, { min: 0, allowZero: false });

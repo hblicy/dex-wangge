@@ -406,7 +406,7 @@ git commit -m "功能：实现RISEx订单终态状态机"
 测试必须覆盖：
 
 - GET 顺序为 `/v1/auth/eip712-domain`、`/v1/auth/nonce?account=...`。
-- chain ID 不是 `11155931`、domain 字段缺失或 verifying contract 非地址时拒绝认证。
+- chain ID 不是官方主网当前值 `4153`、domain 名称不是 `RISEx`、字段缺失或 verifying contract 非地址时拒绝认证。
 - 签名 primary type 为 `RegisterV2`，字段类型是 address/string/uint256。
 - 首帧为 `auth_v2`，收到 `{method:'auth_v2',status:'success'}` 后才发送 orders/fills subscribe。
 - orders subscribe 包含 BTC/ETH market IDs 和当前 account maker；fills 由认证会话自动限定账户。

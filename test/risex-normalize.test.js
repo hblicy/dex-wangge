@@ -52,6 +52,37 @@ test('market normalization exposes exactly BTC-PERP and ETH-PERP', () => {
   assert.equal(markets[0].lastPrice, 60001);
 });
 
+test('market normalization accepts the current official USDC pair schema', () => {
+  const markets = normalizeRisexMarkets([
+    {
+      ...btc,
+      display_name: 'BTC/USDC',
+      base_asset_symbol: 'BTC/USDC',
+      visible: undefined,
+      config: { ...btc.config, name: 'BTC/USDC', unlocked: true },
+    },
+    {
+      ...eth,
+      display_name: 'ETH/USDC',
+      base_asset_symbol: 'ETH/USDC',
+      visible: undefined,
+      config: { ...eth.config, name: 'ETH/USDC', unlocked: true },
+    },
+  ]);
+
+  assert.deepEqual(markets.map((market) => market.displayName), ['BTC-PERP', 'ETH-PERP']);
+  assert.throws(() => normalizeRisexMarkets([
+    {
+      ...btc,
+      display_name: 'BTC/USDC',
+      base_asset_symbol: 'BTC/USDC',
+      visible: undefined,
+      config: { ...btc.config, name: 'BTC/USDC', unlocked: false },
+    },
+    eth,
+  ]), /BTC-PERP.*不可用/);
+});
+
 test('market normalization rejects missing, duplicate, unsafe or invalid targets', () => {
   assert.throws(() => normalizeRisexMarkets([btc]), /缺少 ETH-PERP/);
   assert.throws(() => normalizeRisexMarkets([btc, { ...btc, market_id: '9' }, eth]), /BTC-PERP.*重复/);

@@ -51,7 +51,7 @@ function makeHarness(overrides = {}) {
   const fetchImpl = async (url) => {
     requests.push(String(url));
     if (String(url).endsWith('/v1/auth/eip712-domain')) {
-      return fakeResponse({ data: { name: 'RISEx Auth', version: '1', chain_id: 11155931, verifying_contract: '0x0000000000000000000000000000000000000003' } });
+      return fakeResponse({ data: { name: 'RISEx', version: '1', chain_id: 4153, verifying_contract: '0x0000000000000000000000000000000000000003' } });
     }
     nonce += 1;
     return fakeResponse({ data: { nonce: `0x0${nonce}` } });
@@ -140,7 +140,7 @@ test('auth_v2 signs official RegisterV2 and subscribes only after success', asyn
 test('invalid mainnet domain fails before signing', async () => {
   const harness = makeHarness({
     fetchImpl: async (url) => String(url).endsWith('eip712-domain')
-      ? fakeResponse({ data: { name: 'RISEx Auth', version: '1', chain_id: 1, verifying_contract: '0x0000000000000000000000000000000000000003' } })
+      ? fakeResponse({ data: { name: 'RISEx', version: '1', chain_id: 1, verifying_contract: '0x0000000000000000000000000000000000000003' } })
       : fakeResponse({ data: { nonce: '0x01' } }),
   });
   const connecting = harness.stream.connect();
