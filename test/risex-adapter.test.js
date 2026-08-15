@@ -566,6 +566,7 @@ test('RISEx bulk cancel blocks placements and returns only after REST open order
       return openReads <= 2 ? [rawOpen('o-bulk')] : [];
     },
     cancelAllImpl: async () => { await cancelGate; return { success: true }; },
+    orderByIdImpl: () => rawHistory('o-bulk', 'ORDER_STATUS_CANCELLED', '0'),
   });
   setOwnedOpenSnapshot(exchange, 'o-bulk');
   await exchange.init();
@@ -606,6 +607,44 @@ test('RISEx bulk-cancel terminal fills suppress re-quoting', async () => {
   assert.equal(fills[0].suppressRequote, true);
 });
 
+test('RISEx bulk cancel waits for every affected order terminal after open REST is empty', async () => {
+  let openReads = 0;
+  let exactReads = 0;
+  const { exchange } = makeHarness({
+    streamEvents: [wsOpen('o-late')],
+    openOrdersImpl: () => (openReads++ === 0 ? [rawOpen('o-late')] : []),
+    orderByIdImpl: () => (++exactReads < 3
+      ? null
+      : rawHistory('o-late', 'ORDER_STATUS_CANCELLED', '0')),
+  });
+  setOwnedOpenSnapshot(exchange, 'o-late');
+  await exchange.init();
+
+  assert.equal(await exchange.cancelAll(1), true);
+  assert.ok(exactReads >= 3);
+  assert.equal(exchange.orderState.get('o-late').status, 'CANCELLED');
+});
+
+test('RISEx terminal fill confirmed after open REST is empty never re-quotes', async () => {
+  let openReads = 0;
+  const { exchange } = makeHarness({
+    streamEvents: [wsOpen('o-late-fill')],
+    openOrdersImpl: () => (openReads++ === 0 ? [rawOpen('o-late-fill')] : []),
+    orderByIdImpl: () => rawHistory(
+      'o-late-fill', 'ORDER_STATUS_CANCELLED', '0.001', '59999',
+    ),
+  });
+  setOwnedOpenSnapshot(exchange, 'o-late-fill');
+  await exchange.init();
+  const fills = [];
+  exchange.on('fill', (fill) => fills.push(fill));
+
+  assert.equal(await exchange.cancelAll(1), true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0].suppressRequote, true);
+});
+
 test('RISEx bulk cancel halts when bounded REST checks still show open orders', async () => {
   const { exchange } = makeHarness({
     streamEvents: [wsOpen('o-stuck')],
@@ -614,7 +653,7 @@ test('RISEx bulk cancel halts when bounded REST checks still show open orders', 
   setOwnedOpenSnapshot(exchange, 'o-stuck');
   await exchange.init();
 
-  await assert.rejects(exchange.cancelAll(1), /仍有挂单.*o-stuck/);
+  await assert.rejects(exchange.cancelAll(1), /批量撤单未完成.*o-stuck/);
   assert.equal(exchange.connectionState, 'HALTED');
   assert.equal(exchange.orderState.get('o-stuck').status, 'OPEN');
 });
