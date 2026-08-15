@@ -296,8 +296,18 @@ export class RisexPrivateStream extends EventEmitter {
         const fields = ['size', 'price', 'filled_size', 'avg_price']
           .map((name) => `${name}:${row?.[name] === null ? 'null' : typeof row?.[name]}`)
           .join(',');
+        const cursorFields = [
+          ['timestamp', message.timestamp],
+          ['block_timestamp', message.block_timestamp],
+          ['created_at', row?.created_at],
+          ['time', row?.time],
+          ['block_number', row?.block_number ?? message.block_number],
+          ['log_index', row?.log_index ?? message.log_index],
+        ]
+          .map(([name, value]) => `${name}:${value === null ? 'null' : typeof value}`)
+          .join(',');
         this._fatal(new Error(
-          `RISEx Orders 解析失败 type=${String(message.type || '(unknown)')} order=${orderId} fields=${fields}：${error.message}`,
+          `RISEx Orders 解析失败 type=${String(message.type || '(unknown)')} order=${orderId} fields=${fields} cursor=${cursorFields}：${error.message}`,
           { cause: error },
         ));
         return;
