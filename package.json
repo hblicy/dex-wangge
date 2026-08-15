@@ -1,11 +1,12 @@
 {
   "name": "grid-bot-all",
   "version": "1.0.0",
-  "description": "三交易所整合网格交易机器人：Decibel / Extended 支持实盘，RISEx 仅模拟盘。",
+  "description": "三交易所整合网格交易机器人：Decibel、Extended 与 RISEx 支持模拟盘和实盘。",
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node test/grid.test.js && node --test test/security.test.js test/bot.test.js test/exchange-adapters.test.js test/startup.test.js test/persist.test.js"
+    "test": "node test/grid.test.js && node --test test/security.test.js test/bot.test.js test/exchange-adapters.test.js test/startup.test.js test/persist.test.js test/risex-normalize.test.js test/risex-order-state.test.js test/risex-private-stream.test.js test/risex-adapter.test.js test/risex-verify.test.js",
+    "risex:verify": "node src/exchange/rs/verify.js"
   },
   "engines": {
     "node": ">=20"
@@ -14,7 +15,14 @@
     "@aptos-labs/ts-sdk": "^5.2.1",
     "@decibeltrade/sdk": "^0.6.0",
     "chart.js": "4.4.1",
+    "ethers": "6.13.5",
+    "risex-client": "0.1.11",
     "undici": "^6.19.8",
     "zod": "^3.25.62"
+  },
+  "overrides": {
+    "ethers": {
+      "ws": "8.21.0"
+    }
   }
 }

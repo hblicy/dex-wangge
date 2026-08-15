@@ -596,7 +596,7 @@ export class GridBot {
 
     // Recovery-ladder fills are pure reduce-only EXITS of stranded inventory —
     // never re-quote a replacement for them.
-    if (!isRecovery && this.grid) {
+    if (!isRecovery && !f.suppressRequote && this.grid) {
       const repl = replacementFor({ side: f.side, levelIndex }, this.grid.levels, this.config.mode);
       if (repl && !this.outOfRange && this.running) {
         repl.opening = closing; // replacement is the opposite leg
@@ -1038,6 +1038,7 @@ export class GridBot {
   /** Per-exchange health classification surfaced to the dashboard. */
   _health() {
     const ex = this.ex;
+    const adapterHealth = typeof ex.getHealth === 'function' ? ex.getHealth() : null;
     const okAge = (typeof ex.lastOkAt === 'number' && ex.lastOkAt > 0) ? Date.now() - ex.lastOkAt : null;
     const priceStale = !!(ex._pxStale && this.config && typeof ex._pxStale.has === 'function' && ex._pxStale.has(this.config.marketId));
     const recentFail = this._lastFailAt && (Date.now() - this._lastFailAt < 60000);
@@ -1050,7 +1051,9 @@ export class GridBot {
     else if (priceStale) { status = 'warn'; reason = '行情滞后（已用持仓推算价兜底）'; }
     else if (recentFail) { status = 'warn'; reason = `近1分钟下单失败 ${this._placeFails} 次`; }
     return {
-      status, reason,
+      ...(adapterHealth || {}),
+      status: adapterHealth?.status || status,
+      reason: adapterHealth?.reason || reason,
       dataSource: ex.dataSource ?? null,
       lastOkAgeMs: okAge,
       priceStale,

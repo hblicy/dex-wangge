@@ -1,0 +1,407 @@
+# RISEx Mainnet 实盘适配器设计
+
+日期：2026-08-15
+目标分支：`codex/risex-mainnet-adapter`
+
+## 1. 背景与目标
+
+`dex-wangge` 当前只允许 RISEx 模拟盘。旧版 `3xx-wangge-main` 和 `classic-grid` 虽然能够调用 RISEx 实盘接口，但仍存在把“订单从开放列表消失”推断为成交的路径，无法满足真实资金所需的确定性状态确认。
+
+RISEx 当前官方接口提供：
+
+- 带 `status`、`filled_size`、`avg_price` 的私有 Orders WebSocket；
+- 私有 Fills WebSocket；
+- REST 开放订单、订单历史、成交历史、仓位与账户接口；
+- EIP-712 permit 下单和撤单接口。
+
+本功能的目标是在不削弱现有安全边界的前提下，重新实现 RISEx mainnet 适配器，使其遵守与 Decibel、Extended 相同的 `IExchange` 契约，并以 RISEx 官方订单状态和实际成交数量作为唯一事实来源。
+
+官方参考：
+
+- <https://developer.rise.trade/reference/general-information>
+- <https://developer.rise.trade/reference/orders-channel>
+- <https://developer.rise.trade/reference/javascripttypescript>
+- <https://developer.rise.trade/reference/orderservice_placeorder>
+
+## 2. 已确认范围
+
+### 2.1 包含
+
+- 直接接入 RISEx mainnet。
+- 只允许 `BTC-PERP` 和 `ETH-PERP`。
+- `RS_MODE=paper` 继续使用现有模拟适配器。
+- `RS_MODE=live` 使用新的 RISEx 实盘适配器。
+- `risex-client` 只负责 EIP-712 签名和发送写请求。
+- 官方 Orders/Fills WebSocket 和 REST 负责订单、成交、仓位及恢复确认。
+- 支持下单、撤单、批量撤单、杠杆、平仓、重连和重启接管。
+- 使用现有 GridBot 的终态成交语义：部分成交订单在最终 `FILLED` 或 `CANCELLED` 前不补反向单。
+- 增加 mainnet 公共只读验证和用户执行的私有只读验证。
+
+### 2.2 不包含
+
+- RISEx testnet 接入。
+- BTC、ETH 之外的市场。
+- 由开发或自动测试执行真实下单、撤单、平仓。
+- 手写完整 EIP-712 下单协议。
+- 与人工订单或其他机器人共享同一 RISEx 账户。
+- 把 WebSocket/REST 状态不确定性降级成“推测成交”。
+
+## 3. 安全前提
+
+1. RISEx 必须使用独立交易账户，BTC/ETH 不得同时存在人工策略或其他机器人订单。
+2. 实盘凭据只存在 VPS 的 `.env`，不得写入日志、状态文件、测试夹具或 Git。
+3. `risex-client` 精确固定为 `0.1.11`，禁止使用范围版本自动升级。
+4. live 模式禁止配置任意 API/WS 域名，必须使用经过校验的 RISEx mainnet HTTPS/WSS 地址。
+5. 启动时必须验证 EIP-712 domain、mainnet chain ID、signer 注册状态、BTC/ETH 市场元数据和私有 WebSocket 认证。
+6. 任何关键状态未知时停止新增风险，不自动猜测、补单或全市场清理。
+
+## 4. 架构
+
+```text
+GridBot
+  |
+  v
+RisexExchange（IExchange 适配器/编排）
+  |-- risex-client 0.1.11（签名、下单、撤单）
+  |-- RisexPrivateStream（官方 Orders/Fills WebSocket）
+  |-- 官方 REST（挂单、历史、成交、仓位、账户）
+  `-- RisexOrderState（纯订单状态机和去重）
+```
+
+### 4.1 `RisexExchange`
+
+文件：`src/exchange/rs/risex.js`
+
+实现现有 `IExchange` 接口：
+
+- `init()` / `reconnect()`
+- `getMarkets()` / `getCandles()` / `getPrice()`
+- `setLeverage()`
+- `placeLimitOrder()`
+- `cancelOrder()` / `cancelAll()`
+- `fetchOpenOrders()` / `getOpenOrders()` / `adoptOrder()`
+- `getPosition()` / `closePosition()`
+- `start()` / `stop()`
+- `price` / `fill` / `error` 事件
+
+它负责写请求串行化、REST/WS 合并、健康状态、订单恢复和向 GridBot 输出统一事件，不在内部推测网格策略。
+
+### 4.2 `RisexPrivateStream`
+
+文件：`src/exchange/rs/private-stream.js`
+
+职责：
+
+- 获取官方认证 domain 和服务端 nonce；
+- 使用精确固定版本的 `ethers` 对 session signer 执行 EIP-712 `auth_v2` 签名；
+- 使用项目已有的 `undici` WebSocket 直接连接官方端点；
+- 订阅私有 `orders`、`fills`；
+- 对消息做结构校验并保留 block/log/timestamp；
+- 断线后指数退避重连、重新认证、重新订阅；
+- 在恢复完成前缓存消息，不自行触发交易动作；
+- 输出认证、连接、订单和成交事件。
+
+### 4.3 `RisexOrderState`
+
+文件：`src/exchange/rs/order-state.js`
+
+纯逻辑模块，负责：
+
+- 订单状态迁移；
+- 累计 `filled_size` 和实际成交数量校验；
+- Orders/Fills 消息去重；
+- 重复、乱序消息处理；
+- 终态只生成一次标准化成交结果；
+- 数据倒退、超量成交、未知状态时报完整错误。
+
+该模块不得访问网络、环境变量或 GridBot，以便进行完整的状态矩阵测试。
+
+## 5. 依赖与配置
+
+### 5.1 依赖
+
+`package.json` 增加：
+
+```json
+"ethers": "6.13.5",
+"risex-client": "0.1.11"
+```
+
+使用范围限定为：
+
+- 初始化签名客户端；
+- 生成并提交 EIP-712 permit 写请求；
+- 调用已审计的只读客户端方法。
+
+不使用 `classic-grid` 中修改 `globalThis.fetch`、推测成交或 vendor 整包复制的逻辑。
+
+`ethers` 只用于官方 `auth_v2` 的 EIP-712 签名，并作为直接生产依赖固定版本；WebSocket 复用项目现有的 `undici`，不从 `risex-client` 的传递依赖导入包。
+
+### 5.2 环境变量
+
+```dotenv
+RS_MODE=paper
+RS_NETWORK=mainnet
+RISEX_ACCOUNT=
+RISEX_SIGNER_KEY=
+RISEX_API_URL=https://api.rise.trade
+RISEX_WS_URL=wss://api.rise.trade/ws/
+```
+
+规则：
+
+- `RS_MODE=live` 时账户和 signer 必填。
+- `RS_NETWORK` 只接受 `mainnet`。
+- live 模式的 API/WS URL 必须与允许的 mainnet 地址完全匹配。
+- 私钥不返回给前端，也不记录在 `.state.json`。
+
+## 6. 市场限制
+
+初始化时读取官方市场列表，只保留规范化名称为 `BTC-PERP`、`ETH-PERP` 的市场。
+
+每个市场必须同时具备：
+
+- 唯一且安全的整数 `marketId`；
+- 有效 `stepSize`、`stepPrice`、`minOrderSize`；
+- 有效 `maxLeverage`；
+- 正数参考价格。
+
+缺少任意一个目标市场或元数据不合法时，live 初始化失败。其他 RISEx 市场不得出现在仪表盘选择框，也不能通过直接 API 参数启动。
+
+## 7. 启动同步与恢复屏障
+
+live 初始化按以下顺序执行：
+
+1. 校验配置、mainnet endpoint 和依赖版本。
+2. 初始化 `risex-client`，验证 signer 已注册。
+3. 加载并校验 BTC/ETH 市场。
+4. 连接并认证私有 WebSocket，开始缓存 Orders/Fills 消息。
+5. 读取 REST 开放订单、订单历史、成交历史、仓位和账户。
+6. 以 REST 快照建立状态，再按 block/log/timestamp 应用缓存的 WebSocket 更新。
+7. 对比 Orders 快照、REST 开放订单和本地状态。
+8. 一致后进入 `READY`；不一致则进入 `HALTED` 或终止启动。
+
+重启时，GridBot 通过 `adoptOrder()` 恢复 `.state.json` 中的订单。适配器把这些 ID 与官方开放订单及近期终态历史匹配：
+
+- 仍开放：恢复跟踪；
+- 停机期间终态成交：按实际总成交量生成一次成交；
+- 明确取消且无成交：移除，不补单；
+- 无法确认：进入 `HALTED`，不自动清理。
+
+## 8. 订单状态机
+
+允许状态：
+
+```text
+PENDING -> OPEN -> PARTIAL -> FILLED
+             |         |       |
+             +---------+-> CANCELLED
+PENDING/OPEN/PARTIAL -> UNKNOWN（仅错误状态，不继续交易）
+```
+
+### 8.1 终态规则
+
+- `FILLED`：按最终累计成交量和官方平均成交价生成一次 `fill`。
+- `CANCELLED` 且累计成交量大于零：按实际成交部分生成一次 `fill`。
+- `CANCELLED` 且累计成交量为零：不生成 `fill`。
+- `OPEN/PARTIAL`：继续跟踪，不触发反向补单。
+- `UNKNOWN`：暂停该交易所自动动作并报警。
+
+### 8.2 去重规则
+
+- Fills 优先使用官方 fill/trade ID 去重。
+- Orders 使用订单ID、累计成交量、block/log/timestamp 判断新旧。
+- 相同终态重复到达不得重复生成成交。
+- 累计成交量只能单调增加，且不得超过订单原始数量。
+- 订单ID始终使用字符串，禁止经过 JavaScript `Number`。
+
+## 9. 写请求与竞态处理
+
+### 9.1 下单
+
+1. 只允许 `READY` 状态下单。
+2. 生成加密随机 uint64 `client_order_id`。
+3. 所有写请求通过同一串行队列，遵守 nonce 和服务端限流。
+4. 要求下单响应返回非空字符串订单ID。
+5. 建立 `PENDING` 跟踪，再等待 Orders/REST 确认。
+6. 立即成交消息若先于调用方完成跟踪，则缓冲到 `placeLimitOrder()` 返回后的事件周期再派发。
+7. 确认超时后查询 REST；仍未知则进入 `UNKNOWN/HALTED`。
+
+### 9.2 撤单
+
+- 发送撤单请求后保留本地跟踪。
+- 只有 Orders 或 REST 历史确认 `CANCELLED` 才认为撤单成功。
+- 撤单竞态中若订单已成交，则按真实成交处理。
+- 撤单请求失败或状态未知时返回失败并保留跟踪。
+
+### 9.3 批量撤单
+
+- 进入写屏障，拒绝新的 place 请求。
+- 发送批量撤单后反复读取官方开放订单。
+- BTC/ETH 目标市场挂单确认归零才返回成功。
+- 屏障期间发生的成交可以记账，但不得补出反向订单。
+- 超时或仍有订单时抛错，GridBot 保持跟踪状态。
+
+### 9.4 平仓
+
+- 先完成并确认撤单。
+- 使用 reduce-only 平仓能力。
+- 重复读取官方仓位，确认绝对数量归零才返回成功。
+- 无明确归零不得在面板宣称已平仓。
+
+## 10. 健康状态和熔断
+
+### 10.1 状态
+
+- `READY`：私有 WS 已认证且 REST 对账成功，允许写操作。
+- `RECONCILING`：连接或状态暂时不可用，保留现有挂单但禁止新写操作。
+- `HALTED`：数据完整性、未知订单、撤单或仓位确认失败，需要人工处理。
+
+### 10.2 进入 `RECONCILING`
+
+- 私有 WebSocket 断开；
+- 私有数据超过允许的新鲜度；
+- 临时网络错误或限流；
+- REST/WS 正在重新合并。
+
+恢复条件是重新认证、重新订阅并完成完整 REST 对账。
+
+### 10.3 进入 `HALTED`
+
+- 订单状态或字段结构未知；
+- 订单ID为空或精度受损；
+- 累计成交量倒退、超量或无法解析；
+- 撤单/平仓无法确认；
+- 无运行快照却检测到 BTC/ETH 遗留挂单或仓位；
+- WebSocket 与 REST 在有界重试后仍矛盾。
+
+`HALTED` 不自动转为 paper、不自动清空交易所状态，也不继续新增风险。
+
+## 11. 独立账户与所有权
+
+由于现有 GridBot 的市场级撤单和恢复模型会管理所选市场的全部网格订单，RISEx live 必须使用独立账户。
+
+- 账户不得存在人工 BTC/ETH 挂单或其他机器人的订单。
+- 正常重启只接管 `.state.json` 中能够与官方数据匹配的订单。
+- 没有运行快照却发现 BTC/ETH 挂单或仓位时进入 `HALTED`。
+- 程序不自动认领来源不明订单，也不自动撤销它们。
+- 人工处理完成后通过重连或重启重新执行同步屏障。
+
+## 12. 可观测性
+
+日志至少记录：
+
+- WebSocket连接、认证、订阅、断线、重连；
+- REST/WS最后成功时间和延迟；
+- 订单状态迁移、累计成交量、最终成交数量；
+- 写请求类型、订单ID、耗时、重试次数和限流等待；
+- 对账前后挂单数、未知订单数、差异原因；
+- 健康状态迁移及具体原因。
+
+不得记录：
+
+- signer 私钥；
+- 完整认证签名；
+- permit 原始敏感字段；
+- `.env` 内容。
+
+仪表盘健康状态增加 RISEx 私有流状态、最后订单更新时间、REST新鲜度、是否正在对账、未知订单数量和暂停原因。
+
+## 13. 测试设计
+
+### 13.1 订单状态机单元测试
+
+- OPEN → FILLED；
+- OPEN → CANCELLED；
+- OPEN → PARTIAL → FILLED；
+- OPEN → PARTIAL → CANCELLED；
+- 重复终态；
+- Fills重复和乱序；
+- 累计成交量倒退、超量；
+- 未知状态和非法字段。
+
+### 13.2 适配器契约测试
+
+使用 fake REST、fake WebSocket 和 fake 写客户端覆盖：
+
+- mainnet校验、signer校验和市场白名单；
+- 下单返回与立即成交竞态；
+- 字符串订单ID和随机 client ID；
+- nonce/写请求串行；
+- 429、超时、有界重试；
+- WebSocket断线后禁止下单；
+- REST/WS重连合并；
+- 撤单失败保留跟踪；
+- 批量撤单写屏障；
+- 平仓确认；
+- 停机期间成交恢复；
+- 无快照遗留订单/仓位熔断；
+- paper模式不受影响。
+
+### 13.3 回归与安全检查
+
+- 现有完整 `npm test` 必须通过。
+- 新增测试必须进入默认 `npm test`。
+- 检查 `risex-client` 精确版本和锁文件。
+- 运行依赖审计和安全差异复查。
+- 验证日志和错误响应不包含密钥。
+
+## 14. 验证命令
+
+新增：
+
+```bash
+npm run risex:verify
+```
+
+无密钥、无写操作，检查 mainnet endpoint、chain/domain、BTC/ETH市场、行情和公共 WebSocket。
+
+新增：
+
+```bash
+npm run risex:verify -- --private
+```
+
+由用户在 VPS 上执行，读取本地 `.env`，验证 signer 注册、私有 WebSocket、账户、挂单和仓位。该命令不得调用任何写接口。
+
+## 15. 上线验收
+
+自动实现阶段只执行单元测试、模拟集成测试和 mainnet 公共只读验证，不读取用户实盘密钥、不发送真实订单。
+
+用户在独立小资金账户上完成：
+
+1. 确认 BTC/ETH 无遗留挂单和仓位；
+2. 运行私有只读验证；
+3. 使用最小允许数量启动极小网格；
+4. 在 RISEx 官网核对挂单数量、方向、价格和数量；
+5. 验证一次真实成交和反向补单；
+6. 验证撤单、平仓和重启接管；
+7. 任一步状态不一致立即停止并保留日志。
+
+## 16. 预期修改文件
+
+- `package.json`
+- `package-lock.json`
+- `.env.example`
+- `README.md`
+- `src/config.js`
+- `src/exchange/rs/index.js`
+- `src/exchange/rs/risex.js`
+- `src/exchange/rs/private-stream.js`（新增）
+- `src/exchange/rs/order-state.js`（新增）
+- `src/server.js`（仅健康状态/集成需要时）
+- `public/index.html`（仅展示 RISEx live 状态所需的小改动）
+- `test/exchange-adapters.test.js`
+- `test/startup.test.js`
+- RISEx 状态机、私有流和验证命令对应的新测试文件
+
+## 17. 完成标准
+
+- `RS_MODE=live` 只在完整 mainnet安全检查通过后启动。
+- 仪表盘只展示 BTC-PERP、ETH-PERP。
+- 没有任何“订单消失即成交”的路径。
+- 部分成交按最终实际成交量处理，终态只触发一次补单。
+- 断线、未知状态、撤单失败时不会继续扩大风险。
+- 重启能接管已知挂单并恢复停机期间的终态成交。
+- 所有自动测试、只读验证、依赖审计和安全差异复查通过。
+- README 明确独立账户、mainnet风险和用户手动验收流程。
