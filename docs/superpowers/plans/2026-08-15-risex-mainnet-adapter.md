@@ -1157,3 +1157,684 @@ git commit -m "安全：完成RISEx主网适配器复查"
 6. 任一步不一致立即停止，不继续扩大仓位，并提供 RISEx 状态迁移/订单 ID/cursor 日志。
 
 实现者不得在自动验收中替用户执行第 3-5 步，也不得声称“实盘已验证”除非用户回传了对应证据。
+
+## Task 13: 对齐 RISEx 当前主网 REST 数据结构
+
+**Files:**
+- Modify: `src/exchange/rs/normalize.js:31-263`
+- Modify: `src/exchange/rs/verify.js:7,134-147,217`
+- Modify: `test/risex-normalize.test.js:140-174`
+- Modify: `test/risex-verify.test.js:31-67,100-122`
+
+- [ ] **Step 1: 把旧 REST 测试夹具替换为当前主网结构**
+
+在 `test/risex-normalize.test.js` 增加并使用以下精确样例：
+
+```js
+const WAD = 10n ** 18n;
+const wad = (value) => (BigInt(value) * WAD).toString();
+
+test('REST normalizers parse current RISEx order, fill and position schemas', () => {
+  const history = normalizeRestOrderHistory({
+    id: '0xorder1', market_id: '1', side: 'BUY', size: wad(1), price: wad(100),
+    filled_size: (WAD / 4n).toString(), avg_price: wad(99),
+    status: 'ORDER_STATUS_CANCELLED', created_at: '20', block_number: '7', log_index: '2',
+  });
+  assert.deepEqual(
+    { orderId: history.orderId, side: history.side, sizeBase: history.sizeBase,
+      filledSize: history.filledSize, avgPrice: history.avgPrice, cursor: history.cursor },
+    { orderId: '0xorder1', side: 'buy', sizeBase: 1, filledSize: 0.25,
+      avgPrice: 99, cursor: { block: 7n, log: 2n, timestamp: 20n } },
+  );
+
+  const fill = normalizeRestFill({
+    id: 'fill1', order_id: '0xorder1', market_id: '1', side: 'BUY',
+    size: '0.25', price: '99', fee: '0.1', time: '21',
+    blockchain_data: { block_number: '7', log_index: '3' },
+  });
+  assert.deepEqual(fill.cursor, { block: 7n, log: 3n, timestamp: 21n });
+
+  const position = normalizeRestPosition({
+    market_id: '1', side: 'SELL', size: (WAD / 2n).toString(),
+    avg_entry_price: wad(100), unrealized_pnl: wad(2), leverage: wad(3),
+  });
+  assert.deepEqual(position, {
+    marketId: 1, sizeBase: -0.5, entryPrice: 100, unrealizedPnl: 2, leverage: 3,
+  });
+
+  assert.equal(normalizeRestPosition({
+    market_id: '1', side: 0, size: (WAD / 2n).toString(),
+    avg_entry_price: wad(100), unrealized_pnl: wad(2), leverage: wad(3),
+  }).sizeBase, 0.5);
+});
+```
+
+在 `test/risex-verify.test.js` 的 `getPosition()` fixture 同样改为 `avg_entry_price` 和 WAD 值，保留断言 `sizeBase === 0.01`，证明私有验证不再维护第二套旧解析逻辑。
+
+- [ ] **Step 2: 运行测试并确认 RED**
+
+Run:
+
+```bash
+node --test test/risex-normalize.test.js test/risex-verify.test.js
+```
+
+Expected: FAIL，错误分别包含“历史订单 ID”“未知值 BUY/SELL”或 `entry_price`，证明旧解析器无法处理当前结构。
+
+- [ ] **Step 3: 实现严格的当前 REST 解析器**
+
+在 `src/exchange/rs/normalize.js` 保留开放订单的数字方向解析，同时增加当前 API 方向和游标解析：
+
+```js
+function apiSide(value) {
+  if (value === 'BUY') return 'buy';
+  if (value === 'SELL') return 'sell';
+  fail('side', `包含未知值 ${String(value)}。`);
+}
+
+function positionSide(value) {
+  if (value === 'BUY' || value === 'SELL') return apiSide(value);
+  return restSide(value);
+}
+
+function restCursor(item) {
+  const timestamp = cursorPart(item.created_at ?? item.timestamp ?? item.time, 'timestamp');
+  const blockValue = item.block_number ?? item.blockchain_data?.block_number;
+  const logValue = item.log_index ?? item.blockchain_data?.log_index;
+  return {
+    block: blockValue == null ? 0n : cursorPart(blockValue, 'block_number'),
+    log: logValue == null ? 0n : cursorPart(logValue, 'log_index'),
+    timestamp,
+  };
+}
+```
+
+`normalizeRestOrderHistory()` 和 `normalizeRestFill()` 替换为：
+
+```js
+export function normalizeRestOrderHistory(raw) {
+  const orderId = stringId(raw?.id, 'REST 历史订单 ID');
+  const sizeBase = wadToNumber(raw.size, `REST 历史订单 ${orderId} size`);
+  const filledSize = wadToNumber(raw.filled_size, `REST 历史订单 ${orderId} filled_size`);
+  const price = wadToNumber(raw.price, `REST 历史订单 ${orderId} price`);
+  const avgPrice = wadToNumber(raw.avg_price, `REST 历史订单 ${orderId} avg_price`);
+  if (!(sizeBase > 0)) fail(`REST 历史订单 ${orderId}`, '总量必须大于零。');
+  if (price < 0 || filledSize < 0 || avgPrice < 0) {
+    fail(`REST 历史订单 ${orderId}`, '包含负数价格或数量。');
+  }
+  if (filledSize > sizeBase + 1e-12) {
+    fail(`REST 历史订单 ${orderId}`, '累计成交量超过订单总量。');
+  }
+  return {
+    orderId,
+    marketId: safeInteger(raw.market_id, `REST 历史订单 ${orderId} market_id`, { min: 1 }),
+    side: apiSide(raw.side),
+    sizeBase,
+    price,
+    filledSize,
+    avgPrice,
+    status: normalizeStatus(raw.status, filledSize),
+    cursor: restCursor(raw),
+  };
+}
+
+export function normalizeRestFill(raw) {
+  const fillId = stringId(raw?.id, 'REST fill ID');
+  const orderId = stringId(raw.order_id, `REST fill ${fillId} order ID`);
+  return {
+    fillId,
+    orderId,
+    marketId: safeInteger(raw.market_id, `REST fill ${fillId} market_id`, { min: 1 }),
+    side: apiSide(raw.side),
+    sizeBase: decimal(raw.size, `REST fill ${fillId} size`, { min: 0, allowZero: false }),
+    price: decimal(raw.price, `REST fill ${fillId} price`, { min: 0, allowZero: false }),
+    fee: raw.fee == null || raw.fee === '' ? 0 : decimal(raw.fee, `REST fill ${fillId} fee`),
+    cursor: restCursor(raw),
+  };
+}
+```
+
+`normalizeRestPosition()` 使用以下字段和精度：
+
+```js
+export function normalizeRestPosition(raw) {
+  if (raw == null) return null;
+  const marketId = safeInteger(raw.market_id, 'REST position market_id', { min: 1 });
+  const absoluteSize = Math.abs(wadToNumber(raw.size, `REST position ${marketId} size`));
+  if (absoluteSize === 0) {
+    return { marketId, sizeBase: 0, entryPrice: 0, unrealizedPnl: 0, leverage: null };
+  }
+  const side = positionSide(raw.side);
+  const entryPrice = wadToNumber(raw.avg_entry_price, `REST position ${marketId} avg_entry_price`);
+  if (!(entryPrice > 0)) fail(`REST position ${marketId} avg_entry_price`, '必须大于零。');
+  let unrealizedPnl;
+  if (raw.unrealized_pnl != null && raw.unrealized_pnl !== '') {
+    unrealizedPnl = wadToNumber(raw.unrealized_pnl, `REST position ${marketId} unrealized_pnl`);
+  } else if (raw.mark_price != null && raw.mark_price !== '') {
+    const markPrice = wadToNumber(raw.mark_price, `REST position ${marketId} mark_price`);
+    const signedSize = side === 'buy' ? absoluteSize : -absoluteSize;
+    unrealizedPnl = signedSize * (markPrice - entryPrice);
+  } else {
+    fail(`REST position ${marketId}`, '缺少 unrealized_pnl 或 mark_price。');
+  }
+  const leverage = raw.leverage == null || raw.leverage === ''
+    ? null
+    : wadToNumber(raw.leverage, `REST position ${marketId} leverage`);
+  if (leverage != null && !(leverage > 0)) fail(`REST position ${marketId} leverage`, '必须大于零。');
+  return {
+    marketId,
+    sizeBase: side === 'buy' ? absoluteSize : -absoluteSize,
+    entryPrice,
+    unrealizedPnl,
+    leverage,
+  };
+}
+```
+
+不要保留 `order_id || id`、`entry_price || avg_entry_price` 之类的静默字段兜底；不同接口只接受规格第 18.1 节列出的结构。
+
+- [ ] **Step 4: 让私有验证复用生产仓位解析器**
+
+在 `src/exchange/rs/verify.js` 导入 `normalizeRestFill`、`normalizeRestOpenOrder`、`normalizeRestPosition`，删除 `summarizePosition()`。取得三个私有 REST 返回后先执行：
+
+```js
+const normalizedOpen = open.map((row) => normalizeRestOpenOrder(row, market));
+const normalizedTrades = trades.map(normalizeRestFill);
+const normalized = normalizeRestPosition(position);
+```
+
+`test/risex-verify.test.js` 中 BTC fixture 使用以下完整内容，证明验证命令实际解析内容而非只统计数组长度：
+
+```js
+async getOpenOrders(account, marketId) {
+  calls.push(`getOpenOrders:${account}:${marketId}`);
+  return marketId === 1 ? [{
+    order_id: 'hidden-order', resting_order_id: 'hidden-resting', market_id: '1',
+    side: 0, price_ticks: 600000, size_steps: 10, reduce_only: false,
+  }] : [];
+},
+async getAccountTradeHistory(account, marketId) {
+  calls.push(`getAccountTradeHistory:${account}:${marketId}`);
+  return marketId === 1 ? [{
+    id: 'hidden-fill', order_id: 'hidden-order', market_id: '1', side: 'BUY',
+    size: '0.001', price: '60000', fee: '0', time: '20',
+    blockchain_data: { block_number: '2', log_index: '0' },
+  }] : [];
+},
+```
+
+市场摘要改为：
+
+```js
+const normalized = normalizeRestPosition(position);
+if (normalized && normalized.marketId !== market.marketId) {
+  throw new Error(`RISEx market ${market.marketId} 仓位市场不匹配。`);
+}
+return {
+  marketId: market.marketId,
+  name: market.displayName,
+  openOrders: normalizedOpen.length,
+  trades: normalizedTrades.length,
+  position: normalized && normalized.sizeBase !== 0 ? {
+    sizeBase: normalized.sizeBase,
+    entryPrice: normalized.entryPrice,
+    leverage: normalized.leverage,
+  } : null,
+};
+```
+
+- [ ] **Step 5: 运行定向测试并确认 GREEN**
+
+Run:
+
+```bash
+node --test test/risex-normalize.test.js test/risex-verify.test.js
+```
+
+Expected: 所有 normalize/verify 测试通过，当前结构的订单、成交、两种仓位方向均被精确解析。
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add src/exchange/rs/normalize.js src/exchange/rs/verify.js test/risex-normalize.test.js test/risex-verify.test.js
+git commit -m "修复：对齐RISEx当前只读接口结构"
+```
+
+## Task 14: 使用单笔订单接口完成精确终态确认
+
+**Files:**
+- Modify: `src/exchange/rs/mainnet-client.js:1-89`
+- Modify: `src/exchange/rs/risex.js:951-960`
+- Modify: `test/risex-mainnet-client.test.js:15-91`
+- Modify: `test/risex-adapter.test.js:95-178`
+
+- [ ] **Step 1: 写精确查询和字符串 ID 回归测试**
+
+在 `test/risex-mainnet-client.test.js` 给 fake HTTP 增加 `get()`，并增加：
+
+```js
+test('RISEx mainnet fetches one order by the exact string ID', async () => {
+  const { client, calls } = makeClient();
+  const id = '0x1234567890abcdef1234567890abcdef1234567890abcdef';
+  client.info.http.get = async (path) => {
+    calls.push({ path });
+    return { order: { id, market_id: '1' } };
+  };
+  assert.deepEqual(await client.getOrderById(id, 1), { id, market_id: '1' });
+  assert.equal(calls.at(-1).path, `/v1/orders/by-id/${encodeURIComponent(id)}?market_id=1`);
+});
+```
+
+在 `test/risex-adapter.test.js` 的 harness 增加 `orderByIdImpl` 参数和 `client.getOrderById(orderId, marketId)`，再断言 place/cancel 超时确认调用 `read:order:<完整ID>:<marketId>`，而不是 `rest:history:<marketId>`。
+
+- [ ] **Step 2: 运行测试并确认 RED**
+
+Run:
+
+```bash
+node --test test/risex-mainnet-client.test.js test/risex-adapter.test.js
+```
+
+Expected: FAIL，`getOrderById is not a function`，并且适配器仍调用最近 100 条历史。
+
+- [ ] **Step 3: 在主网客户端实现精确 GET**
+
+在 `RisexMainnetClient` 增加：
+
+```js
+async getOrderById(orderId, marketId) {
+  if (typeof orderId !== 'string' || !orderId) {
+    throw new Error('RISEx 单笔订单查询 orderId 必须是非空字符串。');
+  }
+  if (!Number.isSafeInteger(marketId) || marketId <= 0) {
+    throw new Error('RISEx 单笔订单查询 marketId 必须是安全正整数。');
+  }
+  const path = `/v1/orders/by-id/${encodeURIComponent(orderId)}?market_id=${marketId}`;
+  try {
+    const data = await this.info.http.get(path);
+    const order = data?.order ?? data;
+    if (!order || typeof order !== 'object' || Array.isArray(order)) {
+      throw new Error(`RISEx 订单 ${orderId} 单笔查询响应格式非法。`);
+    }
+    return order;
+  } catch (error) {
+    if (error?.status === 404) return null;
+    throw error;
+  }
+}
+```
+
+- [ ] **Step 4: 适配器只用精确接口确认单笔订单**
+
+把 `_confirmOrderFromRest()` 改为：
+
+```js
+async _confirmOrderFromRest(orderId, marketId) {
+  const raw = await this._client.getOrderById(orderId, marketId);
+  this.lastRestAt = this._now();
+  if (raw == null) return false;
+  const confirmed = normalizeRestOrderHistory(raw);
+  if (confirmed.orderId !== orderId || confirmed.marketId !== marketId) {
+    throw new Error(`RISEx 订单 ${orderId} 单笔确认身份不匹配。`);
+  }
+  const result = this.orderState.applyOrder(confirmed);
+  this._handleOrderResult(result, confirmed);
+  this._syncOfficialOrder(orderId);
+  return true;
+}
+```
+
+历史列表仍只用于启动/重连恢复快照，不再用于 place/cancel 的单笔确认。
+
+- [ ] **Step 5: 运行定向测试并提交**
+
+Run:
+
+```bash
+node --test test/risex-mainnet-client.test.js test/risex-adapter.test.js
+```
+
+Expected: 全部通过，精确路径保留完整字符串 ID，404 返回未确认，其他错误原样抛出。
+
+```bash
+git add src/exchange/rs/mainnet-client.js src/exchange/rs/risex.js test/risex-mainnet-client.test.js test/risex-adapter.test.js
+git commit -m "修复：校正RISEx签名并精确确认订单"
+```
+
+## Task 15: 让批量撤单等待终态并永久抑制该周期补单
+
+**Files:**
+- Modify: `src/exchange/rs/risex.js:83-116,400-424,898-904`
+- Modify: `test/risex-adapter.test.js:527-590`
+- Verify: `test/bot.test.js:1-80`
+
+- [ ] **Step 1: 写延迟终态和内部状态回归测试**
+
+在 `test/risex-adapter.test.js` 增加两个测试：
+
+```js
+test('RISEx bulk cancel waits for every affected order terminal after open REST is empty', async () => {
+  let openReads = 0;
+  let exactReads = 0;
+  const { exchange } = makeHarness({
+    streamEvents: [wsOpen('o-late')],
+    openOrdersImpl: () => (openReads++ === 0 ? [rawOpen('o-late')] : []),
+    orderByIdImpl: () => (++exactReads < 3 ? null
+      : rawHistory('o-late', 'ORDER_STATUS_CANCELLED', '0')),
+  });
+  setOwnedOpenSnapshot(exchange, 'o-late');
+  await exchange.init();
+  assert.equal(await exchange.cancelAll(1), true);
+  assert.ok(exactReads >= 3);
+  assert.equal(exchange.orderState.get('o-late').status, 'CANCELLED');
+});
+
+test('RISEx terminal fill confirmed after open REST is empty never re-quotes', async () => {
+  let openReads = 0;
+  const { exchange } = makeHarness({
+    streamEvents: [wsOpen('o-late-fill')],
+    openOrdersImpl: () => (openReads++ === 0 ? [rawOpen('o-late-fill')] : []),
+    orderByIdImpl: () => rawHistory(
+      'o-late-fill', 'ORDER_STATUS_CANCELLED',
+      '1000000000000000', '59999000000000000000000',
+    ),
+  });
+  setOwnedOpenSnapshot(exchange, 'o-late-fill');
+  await exchange.init();
+  const fills = [];
+  exchange.on('fill', (fill) => fills.push(fill));
+  await exchange.cancelAll(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0].suppressRequote, true);
+});
+```
+
+把 `rawHistory()` fixture 明确定义为当前 WAD 结构：
+
+```js
+function rawHistory(orderId, status, filledSize, avgPrice = '0') {
+  return {
+    id: orderId,
+    market_id: '1',
+    side: 'BUY',
+    size: '1000000000000000',
+    price: '60000000000000000000000',
+    filled_size: String(filledSize),
+    avg_price: String(avgPrice),
+    status,
+    created_at: '20',
+    block_number: '2',
+    log_index: '0',
+  };
+}
+```
+
+- [ ] **Step 2: 运行测试并确认 RED**
+
+Run:
+
+```bash
+node --test test/risex-adapter.test.js test/bot.test.js
+```
+
+Expected: 第一项显示 `cancelAll()` 在订单仍为 OPEN 时提前返回；第二项显示 `suppressRequote` 为 false。
+
+- [ ] **Step 3: 分离写屏障和按订单补单抑制**
+
+构造器增加：
+
+```js
+this._suppressRequoteOrderIds = new Set();
+```
+
+批量撤单开始时捕获受影响订单，并在 REST 开放订单归零后逐个确认：
+
+```js
+const affectedOrderIds = this.orderState.getOpen(id).map((order) => order.orderId);
+for (const orderId of affectedOrderIds) this._suppressRequoteOrderIds.add(orderId);
+
+// 每次 REST 轮询后执行；未终态订单用单笔接口确认。
+const unresolved = [];
+for (const orderId of affectedOrderIds) {
+  let record = this.orderState.get(orderId);
+  if (record?.status !== 'FILLED' && record?.status !== 'CANCELLED') {
+    await this._confirmOrderFromRest(orderId, id);
+    record = this.orderState.get(orderId);
+  }
+  if (record?.status !== 'FILLED' && record?.status !== 'CANCELLED') unresolved.push(orderId);
+}
+if (remaining.length === 0 && unresolved.length === 0) return true;
+```
+
+五次有界轮询后，错误同时列出剩余开放订单和未确认终态订单，并调用 `_haltAndThrow()`。不能因为 `remaining.length === 0` 单独返回成功。
+
+- [ ] **Step 4: 终态按订单 ID 消费抑制标记**
+
+把 `_handleOrderResult()` 改为：
+
+```js
+_handleOrderResult(result, context) {
+  if (!result?.terminal) return;
+  const orderId = String(context.orderId);
+  this._officialOpen.get(Number(context.marketId))?.delete(orderId);
+  const suppressRequote = this._suppressRequoteOrderIds.delete(orderId);
+  if (!result.terminalFill) return;
+  this._defer(() => this.emit('fill', { ...result.terminalFill, suppressRequote }));
+}
+```
+
+`_bulkCancel` 继续只控制写队列门禁，不能再参与 `suppressRequote` 的计算。无法确认而 HALTED 的订单保留在集合中，防止晚到终态扩大风险。
+
+- [ ] **Step 5: 运行适配器和 GridBot 回归并提交**
+
+Run:
+
+```bash
+node --test test/risex-adapter.test.js test/bot.test.js
+```
+
+Expected: 批量撤单必须等到状态机终态；成交只记账一次且 `suppressRequote=true`；既有“撤单失败保留跟踪”测试继续通过。
+
+```bash
+git add src/exchange/rs/risex.js test/risex-adapter.test.js test/bot.test.js
+git commit -m "修复：阻止RISEx批量撤单延迟补单"
+```
+
+## Task 16: 为私有连接、快照和认证 GET 增加有界超时
+
+**Files:**
+- Modify: `src/exchange/rs/private-stream.js:17-112,198-204,286-350`
+- Modify: `test/risex-private-stream.test.js:14-190`
+
+- [ ] **Step 1: 写三个资源清理超时测试**
+
+扩展 `makeHarness()`，通过 `setDeadline` 收集边界计时器，并增加：
+
+```js
+test('private stream connect timeout rejects and closes the socket', async () => {
+  const deadlines = [];
+  const harness = makeHarness({
+    connectTimeoutMs: 20,
+    setDeadline: (fn, ms) => { deadlines.push({ fn, ms }); return deadlines.length; },
+    clearDeadline() {},
+  });
+  const connecting = harness.stream.connect();
+  deadlines.find((entry) => entry.ms === 20).fn();
+  await assert.rejects(connecting, /认证 20ms 超时/);
+  assert.equal(FakeSocket.instances[0].readyState, 3);
+});
+
+test('private stream order snapshot timeout removes its waiter', async () => {
+  const deadlines = [];
+  const harness = makeHarness({
+    snapshotTimeoutMs: 30,
+    setDeadline: (fn, ms) => { deadlines.push({ fn, ms }); return deadlines.length; },
+    clearDeadline() {},
+  });
+  await openAndAuthenticate(harness);
+  const waiting = harness.stream.waitForOrderSnapshot();
+  deadlines.find((entry) => entry.ms === 30).fn();
+  await assert.rejects(waiting, /Orders 快照 30ms 超时/);
+  assert.equal(harness.stream._snapshotWaiters.length, 0);
+});
+
+test('private stream auth GET timeout aborts the request', async () => {
+  const deadlines = [];
+  let aborted = false;
+  const harness = makeHarness({
+    requestTimeoutMs: 40,
+    setDeadline: (fn, ms) => { deadlines.push({ fn, ms }); return deadlines.length; },
+    clearDeadline() {},
+    fetchImpl: (_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => {
+        aborted = true;
+        reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+      });
+    }),
+  });
+  const connecting = harness.stream.connect();
+  FakeSocket.instances[0].emit('open');
+  await waitFor(() => deadlines.some((entry) => entry.ms === 40));
+  deadlines.find((entry) => entry.ms === 40).fn();
+  await assert.rejects(connecting, /GET .* 40ms 超时/);
+  assert.equal(aborted, true);
+});
+```
+
+- [ ] **Step 2: 运行测试并确认 RED**
+
+Run:
+
+```bash
+node --test test/risex-private-stream.test.js
+```
+
+Expected: FAIL；当前 connect/snapshot promise 不会被新 deadline 拒绝，fetch 也没有 `signal`。
+
+- [ ] **Step 3: 增加独立 deadline 依赖和超时配置**
+
+构造参数增加：
+
+```js
+connectTimeoutMs = 15_000,
+snapshotTimeoutMs = 15_000,
+requestTimeoutMs = 15_000,
+setDeadline = setTimeout,
+clearDeadline = clearTimeout,
+```
+
+三个 timeout 必须是安全正整数。保存 `_setDeadline/_clearDeadline`，并增加 `_connectDeadline = null`。`connect()` 建立 promise 后启动认证 deadline；`_resolveConnect()`、`_rejectConnect()` 和 `stop()` 必须清理它。
+
+```js
+_startConnectDeadline() {
+  this._clearConnectDeadline();
+  this._connectDeadline = this._setDeadline(() => {
+    this._connectDeadline = null;
+    this._fatal(new Error(`RISEx 私有 WebSocket 认证 ${this._connectTimeoutMs}ms 超时。`));
+  }, this._connectTimeoutMs);
+}
+
+_clearConnectDeadline() {
+  if (this._connectDeadline == null) return;
+  this._clearDeadline(this._connectDeadline);
+  this._connectDeadline = null;
+}
+```
+
+- [ ] **Step 4: 给 snapshot waiter 和 GET 增加可清理超时**
+
+`waitForOrderSnapshot()` 为每个 waiter 保存 deadline；成功、stop、close 和 fatal 都必须清理。`_getJson()` 使用：
+
+```js
+async _getJson(url) {
+  const controller = new AbortController();
+  const pathname = new URL(url).pathname;
+  const deadline = this._setDeadline(() => controller.abort(), this._requestTimeoutMs);
+  try {
+    const response = await this._fetch(url, {
+      method: 'GET', redirect: 'error', signal: controller.signal,
+    });
+    if (!response?.ok) {
+      throw new Error(`RISEx GET ${pathname} 失败：HTTP ${response?.status ?? 'unknown'}。`);
+    }
+    return await response.json();
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new Error(`RISEx GET ${pathname} ${this._requestTimeoutMs}ms 超时。`, { cause: error });
+    }
+    throw error;
+  } finally {
+    this._clearDeadline(deadline);
+  }
+}
+```
+
+- [ ] **Step 5: 运行私有流测试并提交**
+
+Run:
+
+```bash
+node --test test/risex-private-stream.test.js
+```
+
+Expected: 所有认证、缓冲、重试、重连和三个超时测试通过，无悬挂 promise。
+
+```bash
+git add src/exchange/rs/private-stream.js test/risex-private-stream.test.js
+git commit -m "修复：限制RISEx私有连接等待时间"
+```
+
+## Task 17: 完整回归和只读主网验收
+
+**Files:**
+- Review: `src/exchange/rs/*.js`
+- Review: `test/risex-*.test.js`
+- Review: 当前工作区中尚未提交的签名字段修复
+
+- [ ] **Step 1: 运行格式和完整测试**
+
+Run:
+
+```bash
+git diff --check
+npm test
+```
+
+Expected: `git diff --check` 无错误；原 158 项测试及本轮新增测试全部通过，0 failed、0 cancelled。
+
+- [ ] **Step 2: 运行公共主网只读验证**
+
+Run:
+
+```bash
+npm run risex:verify
+```
+
+Expected: chain ID 4153、BTC-PERP、ETH-PERP、两个订单簿和公共 WebSocket 全部通过；命令不读取私钥、不发送写请求。
+
+- [ ] **Step 3: 检查接口和安全边界**
+
+Run:
+
+```bash
+git grep -n "getOrderHistory.*100" -- src/exchange/rs
+git grep -n "permit_params\|permit" -- src/exchange/rs/mainnet-client.js
+git status --short
+git diff --stat
+```
+
+Expected: `getOrderHistory(...100)` 只剩启动/恢复快照用途；订单写接口使用 `permit`，杠杆使用 `permit_params`；没有 `.env`、私钥或无关文件进入差异。
+
+- [ ] **Step 4: 提交本轮剩余实现**
+
+只暂存本轮相关文件和此前已经验证的签名修复：
+
+```bash
+git add AGENTS.md src/exchange/rs/mainnet-client.js src/exchange/rs/normalize.js src/exchange/rs/private-stream.js src/exchange/rs/risex.js src/exchange/rs/verify.js test/risex-mainnet-client.test.js test/risex-normalize.test.js test/risex-private-stream.test.js test/risex-adapter.test.js test/risex-verify.test.js test/bot.test.js
+git commit -m "修复：完成RISEx实盘状态确认复查"
+```
+
+- [ ] **Step 5: 交付限制**
+
+交付时明确报告自动测试和公共只读验证结果，同时说明没有执行私有验证或真实下单。用户仍需在 VPS 运行 `npm run risex:verify -- --private`，再用最小数量完成官网对单、一次成交、停止撤单和平仓验收。
