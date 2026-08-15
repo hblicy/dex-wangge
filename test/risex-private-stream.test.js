@@ -217,3 +217,63 @@ test('disconnect emits state and schedules exponential reconnect unless stopped'
   socket.emit('close', { code: 1000, reason: 'again' });
   assert.equal(harness.scheduled.length, before);
 });
+
+test('private stream connect timeout rejects and closes the socket', async () => {
+  const deadlines = [];
+  const harness = makeHarness({
+    connectTimeoutMs: 20,
+    setDeadline: (fn, ms) => { deadlines.push({ fn, ms }); return deadlines.length; },
+    clearDeadline() {},
+  });
+  const connecting = harness.stream.connect();
+  const deadline = deadlines.find((entry) => entry.ms === 20);
+  assert.ok(deadline, 'connect deadline was not scheduled');
+  deadline.fn();
+
+  await assert.rejects(connecting, /认证 20ms 超时/);
+  assert.equal(FakeSocket.instances[0].readyState, 3);
+});
+
+test('private stream order snapshot timeout removes its waiter', async () => {
+  const deadlines = [];
+  const harness = makeHarness({
+    snapshotTimeoutMs: 30,
+    setDeadline: (fn, ms) => { deadlines.push({ fn, ms }); return deadlines.length; },
+    clearDeadline() {},
+  });
+  await openAndAuthenticate(harness);
+  const waiting = harness.stream.waitForOrderSnapshot();
+  const deadline = deadlines.find((entry) => entry.ms === 30);
+  assert.ok(deadline, 'snapshot deadline was not scheduled');
+  deadline.fn();
+
+  await assert.rejects(waiting, /Orders 快照 30ms 超时/);
+  assert.equal(harness.stream._snapshotWaiters.length, 0);
+});
+
+test('private stream auth GET timeout aborts the request', async () => {
+  const deadlines = [];
+  let aborted = false;
+  const harness = makeHarness({
+    requestTimeoutMs: 40,
+    setDeadline: (fn, ms) => { deadlines.push({ fn, ms }); return deadlines.length; },
+    clearDeadline() {},
+    fetchImpl: (_url, init) => new Promise((_resolve, reject) => {
+      if (!init.signal) {
+        reject(new Error('missing abort signal'));
+        return;
+      }
+      init.signal.addEventListener('abort', () => {
+        aborted = true;
+        reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+      });
+    }),
+  });
+  const connecting = harness.stream.connect();
+  FakeSocket.instances[0].emit('open');
+  await waitFor(() => deadlines.some((entry) => entry.ms === 40));
+  deadlines.find((entry) => entry.ms === 40).fn();
+
+  await assert.rejects(connecting, /GET .* 40ms 超时/);
+  assert.equal(aborted, true);
+});
