@@ -402,12 +402,16 @@ export class RisexExchange extends EventEmitter {
     const id = Number(marketId);
     const emergency = this.connectionState === 'HALTED';
     this._assertWriteBoundary(id, '批量撤单', { allowHaltedCancelAll: true });
+    if (!this._info || !this._client) throw new Error('RISEx 批量撤单被拒绝：客户端未初始化。');
     this._bulkCancel = true;
     try {
       const trackedOrderIds = this.orderState.getOpen(id).map((order) => order.orderId);
       const openBeforeWrite = await this._readOpenOrders(id);
       if (!emergency) {
-        const external = openBeforeWrite.filter((order) => !this.orderState.get(order.orderId));
+        const external = openBeforeWrite.filter((order) => {
+          const record = this.orderState.get(order.orderId);
+          return !record || record.marketId !== id;
+        });
         if (external.length) {
           this._haltAndThrow(`RISEx market ${id} 批量撤单前发现无法归属的订单：${external.map((order) => order.orderId).join(', ')}。`);
         }
@@ -417,6 +421,11 @@ export class RisexExchange extends EventEmitter {
         ...openBeforeWrite.map((order) => order.orderId),
       ])];
       for (const orderId of affectedOrderIds) this._suppressRequoteOrderIds.add(orderId);
+      if (emergency) {
+        this._logger.log?.(
+          `[RISEx] HALTED 紧急撤单 market ${id}，受影响订单：${affectedOrderIds.length}`,
+        );
+      }
 
       const response = await this._serialWrite(
         id,

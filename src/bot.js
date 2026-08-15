@@ -228,7 +228,10 @@ export class GridBot {
         try {
           await this._requireCancelAll(this.config.marketId, '启动状态持久化失败清理');
         } catch (cleanupCause) {
-          throw new Error(`启动状态写入失败，且已接受挂单无法确认撤销：${cleanupCause.message}`, { cause: cleanupCause });
+          throw new AggregateError(
+            [cause, cleanupCause],
+            `启动失败：${cause.message}；且已接受挂单无法确认撤销：${cleanupCause.message}`,
+          );
         }
         this._rollbackResume();
         this.active.clear();

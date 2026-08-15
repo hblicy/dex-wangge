@@ -690,6 +690,73 @@ test('RISEx HALTED emergency boundary still rejects every write except cancelAll
   await assert.rejects(exchange.cancelOrder(1, 'o1'), /HALTED/);
 });
 
+test('RISEx HALTED emergency cancel failure preserves tracked OPEN state', async () => {
+  const { exchange, stream } = makeHarness({
+    openByMarket: new Map([[1, [rawOpen('o-emergency-fail')]]]),
+    streamEvents: [wsOpen('o-emergency-fail')],
+    cancelAllImpl: async () => ({ success: false }),
+  });
+  setOwnedOpenSnapshot(exchange, 'o-emergency-fail');
+  await exchange.init();
+  stream.emit('fatal', new Error('orders schema mismatch'));
+
+  await assert.rejects(exchange.cancelAll(1), /批量撤单请求未成功/);
+  assert.equal(exchange.connectionState, 'HALTED');
+  assert.equal(exchange.orderState.get('o-emergency-fail').status, 'OPEN');
+  assert.equal(exchange.getOpenOrders(1).length, 1);
+});
+
+test('RISEx HALTED emergency cancel never signs when the REST pre-read fails', async () => {
+  let failRead = false;
+  const { exchange, stream, trace } = makeHarness({
+    openOrdersImpl: () => {
+      if (failRead) throw new Error('REST open orders unavailable');
+      return [];
+    },
+  });
+  await exchange.init();
+  failRead = true;
+  stream.emit('fatal', new Error('orders schema mismatch'));
+
+  await assert.rejects(exchange.cancelAll(1), /REST open orders unavailable/);
+  assert.equal(exchange.connectionState, 'HALTED');
+  assert.equal(trace.includes('write:cancelAll'), false);
+});
+
+test('RISEx HALTED emergency cancel accounts delayed fill only after exact terminal confirmation', async () => {
+  let open = true;
+  let exactReads = 0;
+  const logs = [];
+  const { exchange, stream } = makeHarness({
+    openOrdersImpl: (marketId) => (open && marketId === 1 ? [rawOpen('o-emergency-fill')] : []),
+    streamEvents: [wsOpen('o-emergency-fill')],
+    cancelAllImpl: async (_marketId, activeStream) => {
+      activeStream.emit('fill', liveFill('o-emergency-fill', 'f-emergency', 0.00025, 59999, 11));
+      open = false;
+      return { success: true };
+    },
+    orderByIdImpl: () => {
+      exactReads += 1;
+      return rawHistory('o-emergency-fill', 'ORDER_STATUS_CANCELLED', '0.00025', '59999');
+    },
+    logger: { log: (line) => logs.push(String(line)), error() {} },
+  });
+  setOwnedOpenSnapshot(exchange, 'o-emergency-fill');
+  await exchange.init();
+  stream.emit('fatal', new Error('orders schema mismatch'));
+  const fills = [];
+  exchange.on('fill', (fill) => fills.push(fill));
+
+  assert.equal(await exchange.cancelAll(1), true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(exactReads >= 1);
+  assert.equal(exchange.connectionState, 'HALTED');
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0].sizeBase, 0.00025);
+  assert.equal(fills[0].suppressRequote, true);
+  assert.match(logs.join('\n'), /HALTED 紧急撤单.*market 1.*受影响订单.*1/);
+});
+
 for (const [label, side, expectedSide] of [['long', 'BUY', 1], ['short', 'SELL', 0]]) {
   test(`RISEx close confirms ${label} is flat twice and always sends reduce-only`, async () => {
     const positionRow = rawPosition(side);

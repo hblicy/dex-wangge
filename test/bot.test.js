@@ -354,6 +354,25 @@ test('start cancels accepted orders when durable state cannot be written', async
   assert.equal(exchange.listenerCount('price'), 0);
 });
 
+test('start preserves both persistence and cleanup failure causes', async () => {
+  const exchange = new FakeExchange();
+  let cancelCalls = 0;
+  exchange.cancelAll = async () => {
+    cancelCalls += 1;
+    if (cancelCalls === 1) {
+      exchange.orders.clear();
+      return true;
+    }
+    throw new Error('HALTED schema mismatch');
+  };
+  const bot = new GridBot(exchange, { onChange: () => { throw new Error('disk full'); } });
+
+  await assert.rejects(
+    bot.start(config),
+    /启动失败：disk full；且已接受挂单无法确认撤销：.*HALTED schema mismatch/,
+  );
+});
+
 test('bulk-cancel fill is accounted but never re-quoted', async () => {
   const exchange = new FakeExchange();
   const bot = new GridBot(exchange);
