@@ -435,7 +435,7 @@ export class RisexExchange extends EventEmitter {
       throw new Error(`RISEx 对账不可用：${this.connectionState} ${this.haltReason || ''}`.trim());
     }
     const health = this.getHealth();
-    if (health.status !== 'ok') {
+    if (health.status === 'error') {
       throw new Error(`RISEx 开放订单数据不可用：健康检查未通过（${health.reason}）。`);
     }
     return this.getOpenOrders(marketId);
@@ -1017,7 +1017,7 @@ export class RisexExchange extends EventEmitter {
     this._assertAllowedMarket(marketId, action);
     if (newRisk) {
       const health = this.getHealth();
-      if (health.status !== 'ok') {
+      if (health.status === 'error') {
         throw new Error(`RISEx ${action}被拒绝：健康检查未通过（${health.reason}）。`);
       }
     }

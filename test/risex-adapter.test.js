@@ -747,6 +747,26 @@ test('RISEx health exposes stale private/REST data and blocks new risk', async (
   assert.equal(health.status, 'warn');
 });
 
+test('RISEx idle authenticated order stream warns without blocking new risk or reconciliation', async () => {
+  let now = 1_000;
+  let leverageCall;
+  const { exchange } = makeHarness({
+    now: () => now,
+    updateLeverageImpl: async (marketId, leverage) => {
+      leverageCall = [marketId, leverage];
+      return { success: true };
+    },
+  });
+  await exchange.init();
+
+  now += 31_001;
+  exchange.lastRestAt = now;
+  assert.equal(exchange.getHealth().status, 'warn');
+  assert.equal(await exchange.setLeverage(1, 3), true);
+  assert.deepEqual(leverageCall, [1, 3_000_000_000_000_000_000n]);
+  assert.deepEqual(await exchange.fetchOpenOrders(1), []);
+});
+
 test('RISEx init starts read-only refresh before a grid is started', async () => {
   let now = 1_000;
   let tick;
