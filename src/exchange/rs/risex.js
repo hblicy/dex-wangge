@@ -4,13 +4,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import {
-  ExchangeClient,
   InfoClient,
   OrderType,
+  parseWad,
   Side,
   StpMode,
   TimeInForce,
 } from 'risex-client';
+import { RisexMainnetClient } from './mainnet-client.js';
 import { RisexOrderState } from './order-state.js';
 import { RisexPrivateStream } from './private-stream.js';
 import {
@@ -105,7 +106,7 @@ export class RisexExchange extends EventEmitter {
 
     this._packageVersion = deps.packageVersion;
     this._infoFactory = deps.infoFactory || ((clientOpts) => new InfoClient(clientOpts));
-    this._clientFactory = deps.clientFactory || ((clientOpts) => new ExchangeClient(clientOpts));
+    this._clientFactory = deps.clientFactory || ((clientOpts) => new RisexMainnetClient(clientOpts));
     this._streamFactory = deps.streamFactory || ((streamOpts) => new RisexPrivateStream(streamOpts));
     this._now = deps.now || Date.now;
     this._sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -179,6 +180,7 @@ export class RisexExchange extends EventEmitter {
       this.dataSource = 'real';
       this.lastOkAt = this._now();
       this._setState('READY', '私有流认证和 REST/WS 对账完成');
+      this.start();
       return this;
     } catch (cause) {
       this.lastError = cause?.message || String(cause);
@@ -212,6 +214,7 @@ export class RisexExchange extends EventEmitter {
       this._stream.beginBuffering();
       await this._stream.connect();
       await this._synchronizeLiveState(expected, '手动重连');
+      this.start();
       return this;
     } catch (cause) {
       this.lastError = cause?.message || String(cause);
@@ -266,7 +269,7 @@ export class RisexExchange extends EventEmitter {
       throw new Error(`RISEx market ${id} 杠杆必须是 1-${market.maxLeverage} 的整数。`);
     }
     return this._serialWrite(id, '设置杠杆', async () => {
-      const response = await this._client.updateLeverage(id, BigInt(leverage));
+      const response = await this._client.updateLeverage(id, parseWad(String(leverage)));
       if (response == null || response === false || response?.success === false) {
         throw new Error(`RISEx market ${id} 设置杠杆失败。`);
       }
@@ -596,6 +599,7 @@ export class RisexExchange extends EventEmitter {
       return this._refreshPromise;
     };
     this._timer = this._setInterval(tick, 10_000);
+    this._timer?.unref?.();
   }
 
   stop() {
