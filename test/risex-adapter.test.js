@@ -448,7 +448,7 @@ test('RISEx setLeverage uses the write queue and reads back an existing position
   exchange.setRecoverySnapshot({ running: true, config: { displayName: 'BTC-PERP', sizeBase: 0.001 }, active: [] });
   await exchange.init();
   assert.equal(await exchange.setLeverage(1, 3), true);
-  assert.deepEqual(called, [1, 3n]);
+  assert.deepEqual(called, [1, 3_000_000_000_000_000_000n]);
   assert.ok(trace.includes('rest:position:1'));
 });
 
@@ -745,6 +745,23 @@ test('RISEx health exposes stale private/REST data and blocks new risk', async (
   exchange.lastRestAt = now;
   health = exchange.getHealth();
   assert.equal(health.status, 'warn');
+});
+
+test('RISEx init starts read-only refresh before a grid is started', async () => {
+  let now = 1_000;
+  let tick;
+  const { exchange } = makeHarness({
+    now: () => now,
+    setIntervalImpl: (fn) => { tick = fn; return 7; },
+    clearIntervalImpl: () => {},
+  });
+  await exchange.init();
+  assert.equal(typeof tick, 'function');
+
+  now += 31_001;
+  await tick();
+  assert.equal(exchange.getHealth().status, 'warn');
+  assert.equal(exchange.getHealth().lastRestAgeMs, 0);
 });
 
 test('RISEx read-only refresh failures are observable and stop performs no writes', async () => {
