@@ -379,3 +379,24 @@ test('bulk-cancel fill is accounted but never re-quoted', async () => {
   assert.equal(bot.fills[0].size, 0.25);
   bot._stopReconcileTimer();
 });
+
+test('adapter health fields pass through while generic bot counters remain', () => {
+  const exchange = new FakeExchange();
+  exchange.getHealth = () => ({
+    status: 'error',
+    reason: 'RISEx 私有流断开',
+    privateStream: 'disconnected',
+    reconciling: true,
+    unknownOrders: 1,
+    lastOrderAgeMs: 31_000,
+    lastRestAgeMs: 1_000,
+  });
+  const bot = new GridBot(exchange);
+  const health = bot.getState().health;
+  assert.equal(health.status, 'error');
+  assert.equal(health.privateStream, 'disconnected');
+  assert.equal(health.reconciling, true);
+  assert.equal(health.unknownOrders, 1);
+  assert.equal(health.placeFails, 0);
+  assert.equal(Object.hasOwn(health, 'exchangeOpenOrders'), true);
+});

@@ -37,7 +37,12 @@ class FakeStream extends EventEmitter {
   beginBuffering() { this.trace.push('ws:buffer'); }
   async connect() { this.trace.push('ws:connect'); this.authenticated = true; }
   async waitForOrderSnapshot() { this.trace.push('ws:snapshot'); }
-  drainBuffered() { this.trace.push('ws:drain'); return [...this.events]; }
+  drainBuffered() {
+    this.trace.push('ws:drain');
+    const drained = [...this.events];
+    this.events = [];
+    return drained;
+  }
   releaseBuffer() { this.trace.push('ws:release'); }
   stop() { this.authenticated = false; }
 }
@@ -79,11 +84,20 @@ function makeHarness({
   orderHistoryImpl,
   positionReadImpl,
   sleep = async () => {},
+  now = () => 1000,
+  setIntervalImpl,
+  clearIntervalImpl,
+  logger = { log() {}, error() {} },
 } = {}) {
   const trace = [];
   const stream = new FakeStream(streamEvents, trace);
   const info = {
     async getMarkets() { trace.push('rest:markets'); return markets; },
+    async getOrderbook(marketId) {
+      trace.push(`rest:book:${marketId}`);
+      const price = marketId === 1 ? 60000 : 3000;
+      return { bids: [{ price: String(price - 1) }], asks: [{ price: String(price + 1) }] };
+    },
     async getOpenOrders(_account, marketId) {
       trace.push(`rest:open:${marketId}`);
       return openOrdersImpl ? openOrdersImpl(marketId) : (openByMarket.get(marketId) || []);
@@ -130,9 +144,11 @@ function makeHarness({
     infoFactory: () => info,
     clientFactory: () => client,
     streamFactory: () => stream,
-    now: () => 1000,
+    now,
     sleep,
-    logger: { log() {}, error() {} },
+    setInterval: setIntervalImpl,
+    clearInterval: clearIntervalImpl,
+    logger,
   });
   exchange.on('error', () => {});
   return { exchange, info, client, stream, trace };
@@ -586,4 +602,133 @@ test('RISEx close halts when the REST position read fails after submission', asy
 
   await assert.rejects(exchange.closePosition(1), /position unavailable/);
   assert.equal(exchange.connectionState, 'HALTED');
+});
+
+test('RISEx disconnect rejects writes until authenticated REST/WS reconciliation completes', async () => {
+  const { exchange, stream, info } = makeHarness();
+  await exchange.init();
+  stream.authenticated = false;
+  stream.emit('disconnected', { code: 1006 });
+  assert.equal(exchange.connectionState, 'RECONCILING');
+  await assert.rejects(
+    exchange.placeLimitOrder({ marketId: 1, side: 'buy', price: 60000, sizeBase: 0.001 }),
+    /RECONCILING/,
+  );
+  await assert.rejects(exchange.setLeverage(1, 3), /RECONCILING/);
+  await assert.rejects(exchange.cancelAll(1), /RECONCILING/);
+
+  let releaseBalance;
+  info.getBalance = async () => new Promise((resolve) => { releaseBalance = resolve; });
+  stream.authenticated = true;
+  stream.emit('authenticated');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(exchange.connectionState, 'RECONCILING');
+  releaseBalance('1000');
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(exchange.connectionState, 'READY');
+});
+
+test('RISEx reconnect reconciliation halts on REST/WS identity conflicts', async () => {
+  const openByMarket = new Map([[1, [rawOpen('o-conflict')]]]);
+  const { exchange, stream } = makeHarness({ openByMarket, streamEvents: [wsOpen('o-conflict')] });
+  setOwnedOpenSnapshot(exchange, 'o-conflict');
+  await exchange.init();
+  stream.authenticated = false;
+  stream.emit('disconnected', { code: 1006 });
+  stream.events = [{
+    ...wsOpen('o-conflict'),
+    data: { ...wsOpen('o-conflict').data, sizeBase: 0.002, cursor: { block: 20n, log: 0n, timestamp: 20n } },
+  }];
+  stream.authenticated = true;
+  stream.emit('authenticated');
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(exchange.connectionState, 'HALTED');
+  assert.match(exchange.haltReason, /总量发生变化/);
+});
+
+test('RISEx HALTED state does not auto-recover when the socket authenticates', async () => {
+  const { exchange, stream } = makeHarness();
+  await exchange.init();
+  stream.emit('fatal', new Error('private stream corrupt'));
+  assert.equal(exchange.connectionState, 'HALTED');
+  stream.authenticated = true;
+  stream.emit('authenticated');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(exchange.connectionState, 'HALTED');
+});
+
+test('RISEx reconnect rebuilds clients and stream without cancelling orders or positions', async () => {
+  const { exchange, trace } = makeHarness();
+  await exchange.init();
+  await exchange.reconnect();
+  assert.equal(exchange.connectionState, 'READY');
+  assert.equal(trace.filter((item) => item === 'client:init').length, 2);
+  assert.equal(trace.filter((item) => item === 'ws:connect').length, 2);
+  assert.equal(trace.some((item) => item.startsWith('write:cancel')), false);
+  assert.equal(trace.some((item) => item === 'write:place'), false);
+});
+
+test('RISEx health exposes stale private/REST data and blocks new risk', async () => {
+  let now = 1_000;
+  const { exchange } = makeHarness({ now: () => now });
+  await exchange.init();
+  exchange.lastOrderAt = now;
+  now += 31_001;
+  let health = exchange.getHealth();
+  assert.equal(health.status, 'error');
+  assert.ok(health.lastOrderAgeMs > 30_000);
+  assert.ok(health.lastRestAgeMs > 30_000);
+  await assert.rejects(
+    exchange.placeLimitOrder({ marketId: 1, side: 'buy', price: 60000, sizeBase: 0.001 }),
+    /健康|过期|超时/,
+  );
+  exchange.lastRestAt = now;
+  health = exchange.getHealth();
+  assert.equal(health.status, 'warn');
+});
+
+test('RISEx read-only refresh failures are observable and stop performs no writes', async () => {
+  let tick;
+  const { exchange, info, trace } = makeHarness({
+    setIntervalImpl: (fn) => { tick = fn; return 7; },
+    clearIntervalImpl: () => {},
+  });
+  await exchange.init();
+  const errors = [];
+  exchange.on('error', (error) => errors.push(error));
+  info.getBalance = async () => { throw new Error('refresh balance unavailable'); };
+  exchange.start();
+  await tick();
+  assert.match(exchange.lastError, /refresh balance unavailable/);
+  assert.equal(exchange.getHealth().status, 'error');
+  assert.equal(errors.length, 1);
+  exchange.stop();
+  assert.equal(trace.some((item) => item.startsWith('write:')), false);
+});
+
+test('RISEx reconciliation logs are traceable without exposing the signer key', async () => {
+  const logs = [];
+  const logger = {
+    log: (message) => logs.push(String(message)),
+    error: (message) => logs.push(String(message)),
+  };
+  const openByMarket = new Map([[1, [rawOpen('o-log')]]]);
+  const { exchange, stream } = makeHarness({
+    openByMarket,
+    streamEvents: [wsOpen('o-log')],
+    logger,
+  });
+  setOwnedOpenSnapshot(exchange, 'o-log');
+  await exchange.init();
+  stream.events = [wsOpen('o-log')];
+  await exchange.reconnect();
+
+  const text = logs.join('\n');
+  assert.match(text, /状态 .*READY/);
+  assert.match(text, /order o-log.*cursor=/);
+  assert.match(text, /REST open=1.*WS buffered=1/);
+  assert.doesNotMatch(text, new RegExp(SIGNER_KEY.slice(2), 'i'));
+  assert.doesNotMatch(text, /signature/i);
 });
