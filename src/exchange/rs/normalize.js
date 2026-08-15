@@ -21,6 +21,11 @@ function decimal(value, field, { min = -Infinity, allowZero = true } = {}) {
   return result;
 }
 
+function decimalString(value, field, options = {}) {
+  if (typeof value !== 'string') fail(field, '必须是十进制数字字符串。');
+  return decimal(value, field, options);
+}
+
 function safeInteger(value, field, { min = 0 } = {}) {
   if (typeof value === 'string' && !/^\d+$/.test(value)) fail(field, '必须是非负整数字符串。');
   const result = Number(value);
@@ -142,10 +147,10 @@ export function parseOrderEnvelope(message) {
   return message.data.map((raw) => {
     const orderId = stringId(raw?.id, '订单 ID');
     const marketId = safeInteger(raw.market_id, `订单 ${orderId} market_id`, { min: 1 });
-    const sizeBase = wadToNumber(raw.size, `订单 ${orderId} size`);
-    const price = wadToNumber(raw.price, `订单 ${orderId} price`);
-    const filledSize = wadToNumber(raw.filled_size, `订单 ${orderId} filled_size`);
-    const avgPrice = wadToNumber(raw.avg_price, `订单 ${orderId} avg_price`);
+    const sizeBase = decimalString(raw.size, `订单 ${orderId} size`, { min: 0, allowZero: false });
+    const price = decimalString(raw.price, `订单 ${orderId} price`, { min: 0 });
+    const filledSize = decimalString(raw.filled_size, `订单 ${orderId} filled_size`, { min: 0 });
+    const avgPrice = decimalString(raw.avg_price, `订单 ${orderId} avg_price`, { min: 0 });
     if (!(sizeBase > 0)) fail(`订单 ${orderId}`, '总量必须大于零。');
     if (price < 0 || filledSize < 0 || avgPrice < 0) fail(`订单 ${orderId}`, '包含负数价格或数量。');
     if (filledSize > sizeBase + 1e-12) fail(`订单 ${orderId}`, '累计成交量超过订单总量。');
@@ -208,10 +213,10 @@ export function normalizeRestOpenOrder(raw, market) {
 
 export function normalizeRestOrderHistory(raw) {
   const orderId = stringId(raw?.id, 'REST 历史订单 ID');
-  const sizeBase = wadToNumber(raw.size, `REST 历史订单 ${orderId} size`);
-  const filledSize = wadToNumber(raw.filled_size, `REST 历史订单 ${orderId} filled_size`);
-  const price = wadToNumber(raw.price, `REST 历史订单 ${orderId} price`);
-  const avgPrice = wadToNumber(raw.avg_price, `REST 历史订单 ${orderId} avg_price`);
+  const sizeBase = decimalString(raw.size, `REST 历史订单 ${orderId} size`, { min: 0, allowZero: false });
+  const filledSize = decimalString(raw.filled_size, `REST 历史订单 ${orderId} filled_size`, { min: 0 });
+  const price = decimalString(raw.price, `REST 历史订单 ${orderId} price`, { min: 0 });
+  const avgPrice = decimalString(raw.avg_price, `REST 历史订单 ${orderId} avg_price`, { min: 0 });
   if (!(sizeBase > 0)) fail(`REST 历史订单 ${orderId}`, '总量必须大于零。');
   if (price < 0 || filledSize < 0 || avgPrice < 0) {
     fail(`REST 历史订单 ${orderId}`, '包含负数价格或数量。');

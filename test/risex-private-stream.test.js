@@ -159,7 +159,7 @@ test('orders and fills buffer until reconciliation release', async () => {
 
   socket.message({
     method: 'snapshot', channel: 'orders', type: 'snapshot', timestamp: '10',
-    data: [{ id: 'o1', market_id: '1', side: 'BUY', size: '1000000000000000000', price: '100000000000000000000', filled_size: '0', avg_price: '0', status: 'ORDER_STATUS_OPEN', sender: ACCOUNT, block_number: '1', log_index: '0' }],
+    data: [{ id: 'o1', market_id: '1', side: 'BUY', size: '1', price: '100', filled_size: '0', avg_price: '0', status: 'ORDER_STATUS_OPEN', sender: ACCOUNT, block_number: '1', log_index: '0' }],
   });
   socket.message({
     channel: 'fills', type: 'update', block_number: 2, log_index: 0, timestamp: '20',
@@ -184,7 +184,7 @@ test('messages for another account or market are fatal', async () => {
   const fatal = new Promise((resolve) => harness.stream.once('fatal', resolve));
   socket.message({
     channel: 'orders', type: 'update', timestamp: '10',
-    data: [{ id: 'o1', market_id: '9', side: 'BUY', size: '1000000000000000000', price: '100000000000000000000', filled_size: '0', avg_price: '0', status: 'ORDER_STATUS_OPEN', sender: '0x0000000000000000000000000000000000000009', block_number: '1', log_index: '0' }],
+    data: [{ id: 'o1', market_id: '9', side: 'BUY', size: '1', price: '100', filled_size: '0', avg_price: '0', status: 'ORDER_STATUS_OPEN', sender: '0x0000000000000000000000000000000000000009', block_number: '1', log_index: '0' }],
   });
   assert.match((await fatal).message, /账户|market/);
 });
