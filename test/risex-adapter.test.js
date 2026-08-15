@@ -131,6 +131,7 @@ function makeHarness({
   cancelAllImpl,
   openOrdersImpl,
   orderHistoryImpl,
+  orderByIdImpl,
   positionReadImpl,
   sleep = async () => {},
   now = () => 1000,
@@ -186,6 +187,10 @@ function makeHarness({
     async cancelAllOrders(marketId) {
       trace.push('write:cancelAll');
       return cancelAllImpl ? cancelAllImpl(marketId, stream) : { success: true };
+    },
+    async getOrderById(orderId, marketId) {
+      trace.push(`read:order:${orderId}:${marketId}`);
+      return orderByIdImpl ? orderByIdImpl(orderId, marketId) : null;
     },
   };
   const exchange = new RisexExchange(config, {
@@ -449,9 +454,10 @@ test('RISEx partial updates do not emit until the official terminal order', asyn
   assert.equal(emitted[0].sizeBase, 0.00025);
 });
 
-test('RISEx place confirmation timeout queries REST then halts when still unknown', async () => {
-  const { exchange } = makeHarness({
+test('RISEx place confirmation timeout queries the exact order then halts when still unknown', async () => {
+  const { exchange, trace } = makeHarness({
     placeOrderImpl: async () => ({ order_id: 'o-missing' }),
+    orderByIdImpl: async () => null,
     sleep: async () => {},
   });
   await exchange.init();
@@ -460,6 +466,7 @@ test('RISEx place confirmation timeout queries REST then halts when still unknow
     /o-missing.*REST.*无法确认/,
   );
   assert.equal(exchange.connectionState, 'HALTED');
+  assert.ok(trace.includes('read:order:o-missing:1'));
 });
 
 test('RISEx setLeverage uses the write queue and reads back an existing position', async () => {

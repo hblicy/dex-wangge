@@ -949,11 +949,13 @@ export class RisexExchange extends EventEmitter {
   }
 
   async _confirmOrderFromRest(orderId, marketId) {
-    const rows = await this._info.getOrderHistory(this.account, marketId, 100);
-    if (!Array.isArray(rows)) throw new Error(`RISEx market ${marketId} REST 历史订单格式非法。`);
+    const raw = await this._client.getOrderById(orderId, marketId);
     this.lastRestAt = this._now();
-    const confirmed = rows.map(normalizeRestOrderHistory).find((order) => order.orderId === orderId);
-    if (!confirmed) return false;
+    if (raw == null) return false;
+    const confirmed = normalizeRestOrderHistory(raw);
+    if (confirmed.orderId !== orderId || confirmed.marketId !== marketId) {
+      throw new Error(`RISEx 订单 ${orderId} 单笔确认身份不匹配。`);
+    }
     const result = this.orderState.applyOrder(confirmed);
     this._handleOrderResult(result, confirmed);
     this._syncOfficialOrder(orderId);
