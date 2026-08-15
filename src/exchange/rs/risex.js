@@ -265,7 +265,7 @@ export class RisexExchange extends EventEmitter {
     if (!Number.isSafeInteger(leverage) || leverage <= 0 || leverage > market.maxLeverage) {
       throw new Error(`RISEx market ${id} 杠杆必须是 1-${market.maxLeverage} 的整数。`);
     }
-    return this._serialWrite('设置杠杆', async () => {
+    return this._serialWrite(id, '设置杠杆', async () => {
       const response = await this._client.updateLeverage(id, BigInt(leverage));
       if (response == null || response === false || response?.success === false) {
         throw new Error(`RISEx market ${id} 设置杠杆失败。`);
@@ -280,7 +280,7 @@ export class RisexExchange extends EventEmitter {
         this._positions.set(id, confirmed);
       }
       return true;
-    });
+    }, { newRisk: true });
   }
 
   async placeLimitOrder(order) {
@@ -313,7 +313,7 @@ export class RisexExchange extends EventEmitter {
 
     this._pendingPlaceCount += 1;
     try {
-      return await this._serialWrite('限价下单', async () => {
+      return await this._serialWrite(marketId, '限价下单', async () => {
         const response = await this._client.placeOrder({
           market_id: marketId,
           side: order.side === 'buy' ? Side.Long : Side.Short,
@@ -349,7 +349,7 @@ export class RisexExchange extends EventEmitter {
         }
         this._syncOfficialOrder(orderId);
         return { orderId };
-      });
+      }, { newRisk: true });
     } finally {
       this._pendingPlaceCount -= 1;
       if (this._pendingPlaceCount === 0) this._assertNoUnexpectedPrivateOrders();
@@ -373,7 +373,7 @@ export class RisexExchange extends EventEmitter {
     }
     this._restingIds.set(orderId, target.restingOrderId);
 
-    const response = await this._serialWrite('单笔撤单', () => this._client.cancelOrder({
+    const response = await this._serialWrite(id, '单笔撤单', () => this._client.cancelOrder({
       market_id: id,
       order_id: orderId,
       resting_order_id: target.restingOrderId,
@@ -400,7 +400,12 @@ export class RisexExchange extends EventEmitter {
     this._assertWritable(id, '批量撤单');
     this._bulkCancel = true;
     try {
-      const response = await this._serialWrite('批量撤单', () => this._client.cancelAllOrders(id));
+      const response = await this._serialWrite(
+        id,
+        '批量撤单',
+        () => this._client.cancelAllOrders(id),
+        { allowBulkCancel: true },
+      );
       if (response?.success !== true) throw new Error(`RISEx market ${id} 批量撤单请求未成功。`);
 
       let remaining = [];
@@ -523,7 +528,7 @@ export class RisexExchange extends EventEmitter {
       const clientOrderId = BigInt(`0x${randomBytes(8).toString('hex')}`).toString();
       this._pendingPlaceCount += 1;
       try {
-        const response = await this._serialWrite('市价平仓', () => this._client.placeOrder({
+        const response = await this._serialWrite(id, '市价平仓', () => this._client.placeOrder({
           market_id: id,
           side: side === 'buy' ? Side.Long : Side.Short,
           order_type: OrderType.Market,
@@ -535,7 +540,7 @@ export class RisexExchange extends EventEmitter {
           stp_mode: StpMode.ExpireTaker,
           ttl_units: 0,
           client_order_id: clientOrderId,
-        }));
+        }), { allowClosingPosition: true });
         if (typeof response?.order_id !== 'string' || !response.order_id) {
           this._haltAndThrow('RISEx 平仓响应缺少非空字符串订单 ID。');
         }
@@ -992,11 +997,19 @@ export class RisexExchange extends EventEmitter {
   }
 
   _assertWritable(marketId, action, { newRisk = false } = {}) {
+    this._assertWriteBoundary(marketId, action, { newRisk });
+  }
+
+  _assertWriteBoundary(marketId, action, {
+    newRisk = false,
+    allowBulkCancel = false,
+    allowClosingPosition = false,
+  } = {}) {
     if (this.connectionState !== 'READY') {
       throw new Error(`RISEx ${action}被拒绝：${this.connectionState} ${this.haltReason || ''}`.trim());
     }
-    if (this._bulkCancel) throw new Error(`RISEx ${action}被拒绝：正在批量撤单。`);
-    if (this._closingPosition) throw new Error(`RISEx ${action}被拒绝：正在确认平仓。`);
+    if (this._bulkCancel && !allowBulkCancel) throw new Error(`RISEx ${action}被拒绝：正在批量撤单。`);
+    if (this._closingPosition && !allowClosingPosition) throw new Error(`RISEx ${action}被拒绝：正在确认平仓。`);
     this._assertAllowedMarket(marketId, action);
     if (newRisk) {
       const health = this.getHealth();
@@ -1006,11 +1019,12 @@ export class RisexExchange extends EventEmitter {
     }
   }
 
-  _serialWrite(action, operation) {
+  _serialWrite(marketId, action, operation, boundaryOptions = {}) {
     const run = this._writeQueue.then(async () => {
       const startedAt = this._now();
       this._logger.log?.(`[RISEx] 写操作开始：${action}`);
       try {
+        this._assertWriteBoundary(marketId, action, boundaryOptions);
         const result = await operation();
         this._logger.log?.(`[RISEx] 写操作完成：${action}，耗时 ${this._now() - startedAt}ms`);
         return result;

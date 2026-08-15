@@ -343,6 +343,36 @@ test('RISEx serializes concurrent permit writes', async () => {
   assert.equal(maxActive, 1);
 });
 
+test('RISEx rejects a queued placement if the private stream disconnects before execution', async () => {
+  let releaseFirst;
+  let calls = 0;
+  const { exchange, stream } = makeHarness({
+    placeOrderImpl: async (_params, privateStream) => {
+      calls += 1;
+      const orderId = `queued-${calls}`;
+      if (calls === 1) {
+        await new Promise((resolve) => { releaseFirst = resolve; });
+      }
+      privateStream.emit('order', liveOrder(orderId));
+      return { order_id: orderId };
+    },
+  });
+  await exchange.init();
+
+  const first = exchange.placeLimitOrder({ marketId: 1, side: 'buy', price: 60000, sizeBase: 0.001 });
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = exchange.placeLimitOrder({ marketId: 1, side: 'buy', price: 60000, sizeBase: 0.001 });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  stream.authenticated = false;
+  stream.emit('disconnected', { code: 1006 });
+  releaseFirst();
+
+  await first;
+  await assert.rejects(second, /RECONCILING/);
+  assert.equal(calls, 1);
+});
+
 test('RISEx place halts when the SDK response loses the string order ID', async () => {
   const { exchange } = makeHarness({ placeOrderImpl: async () => ({ order_id: 9007199254740992 }) });
   await exchange.init();
