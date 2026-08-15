@@ -290,6 +290,18 @@ export class RisexPrivateStream extends EventEmitter {
         return;
       }
     } catch (error) {
+      if (message?.channel === 'orders') {
+        const row = Array.isArray(message.data) ? message.data[0] : null;
+        const orderId = typeof row?.id === 'string' && row.id ? row.id : '(unknown)';
+        const fields = ['size', 'price', 'filled_size', 'avg_price']
+          .map((name) => `${name}:${row?.[name] === null ? 'null' : typeof row?.[name]}`)
+          .join(',');
+        this._fatal(new Error(
+          `RISEx Orders 解析失败 type=${String(message.type || '(unknown)')} order=${orderId} fields=${fields}：${error.message}`,
+          { cause: error },
+        ));
+        return;
+      }
       this._fatal(error);
     }
   }

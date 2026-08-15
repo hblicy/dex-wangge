@@ -415,7 +415,7 @@ npm run risex:verify -- --private
 `src/exchange/rs/normalize.js` 为不同来源保留独立解析器，不用宽松的通用兜底掩盖接口变化：
 
 - REST 开放订单继续解析 `order_id`、数字 `side`、`price_ticks`、`size_steps` 和 `resting_order_id`。
-- REST 历史订单及单笔订单解析 `id`、`BUY/SELL`、`created_at`、`block_number`、`log_index`，并把 `price`、`size`、`filled_size`、`avg_price` 从 18 位 WAD 转换为普通数值。
+- REST 历史订单及单笔订单解析 `id`、`BUY/SELL`、`created_at`、`block_number`、`log_index`；`price`、`size`、`filled_size`、`avg_price` 必须按当前主网实际返回的人类可读十进制字符串解析，不得按 WAD 缩放。
 - REST 账户成交解析 `id`、`order_id`、`BUY/SELL`、普通十进制 `price/size/fee`、`time`，游标从 `blockchain_data.block_number/log_index` 读取。
 - REST 全部仓位解析 `BUY/SELL`、`avg_entry_price` 以及接口定义的 18 位数值；单市场仓位如果方向仍为数字，只允许明确记录的 `0/1` 结构。未知字段组合必须抛错，不能猜测。
 - 私有 Orders/Fills WebSocket 继续使用现有独立解析器，不与 REST 开放订单格式混用。
@@ -465,3 +465,53 @@ HTTP 使用 `AbortController` 主动取消；WebSocket 和 snapshot 等待在超
 - connect、snapshot、domain 和 nonce 超时均明确失败并完成资源清理。
 
 完成验收仍只运行模拟测试和主网公共只读验证，不读取用户私钥，不执行真实下单或撤单。
+
+## 19. 2026-08-15 主网订单单位与紧急撤单修订
+
+本节记录一次真实主网启动故障：已接受的 BTC 限价单通过 Orders 事件进入适配器时，主网实际返回 `size="0.004447"`、`price="61000"`，但解析器按照仍声称这些字段为 WAD 的文档示例执行缩放前校验，导致事件解析失败、适配器进入 `HALTED`。随后启动回滚调用批量撤单，又因 `HALTED` 写屏障被拒绝，形成需要人工处理的遗留挂单。
+
+主网单笔订单与订单历史的只读回查已确认同一订单使用人类可读十进制字段。本设计以主网实际响应为运行契约，并保留严格的来源级解析，禁止根据字符串长度猜测 WAD 或十进制。
+
+### 19.1 订单数据单位边界
+
+- 私有 Orders WebSocket 的 `size`、`price`、`filled_size`、`avg_price` 按人类可读十进制字符串解析。
+- REST 订单历史和 `GET /v1/orders/by-id/{order_id}` 使用相同的十进制订单字段规则。
+- REST 开放订单仍只解析 `size_steps`、`price_ticks` 和市场步长，不与订单历史结构混用。
+- REST 仓位继续使用其已验证的 WAD 字段规则；本修订不得顺带改变仓位单位。
+- 不增加 WAD/十进制双模式自动识别。整数形式同样按该端点的十进制契约解释，后续由订单状态机的不可变价量校验发现跨来源不一致。
+- 数值字段必须是有限的十进制字符串；缺失字段、数字类型、指数形式、负数量、负价格、超量成交和来源冲突都直接报错。
+
+### 19.2 `HALTED` 紧急批量撤单
+
+`HALTED` 继续阻止所有新增或改变风险的操作。唯一例外是已初始化 RISEx 客户端上的 `cancelAll(marketId)`，用于清理该白名单市场的遗留挂单：
+
+1. 只允许 BTC-PERP 或 ETH-PERP 的已知 market ID。
+2. 写入前先通过 REST 开放订单读取该市场真实挂单，并与本地已跟踪订单 ID 取并集；无法取得该快照时不发送盲目写入，明确要求人工处理。
+3. 仍经过现有串行写队列、签名 permit 和批量撤单写屏障。
+4. 不允许下单、设置杠杆、单笔平仓或任何替代挂单。
+5. REST 开放订单必须归零，且写入前由 REST 或本地跟踪发现的每个订单必须通过单笔订单接口确认 `FILLED` 或 `CANCELLED`，才能返回成功；仅为确认紧急撤单而发现的外部订单不得被接管为网格订单。
+6. 清理期间发生的真实成交照常记账，但必须携带 `suppressRequote=true`，禁止产生替代订单。
+7. 撤单失败或终态无法确认时保留已有本地跟踪并明确报错。
+8. 撤单成功后连接状态仍为 `HALTED`，不得自动恢复 `READY`；必须由用户检查账户后显式重连或重启并重新执行同步屏障。
+
+该例外仅降低现有挂单风险，不把 `HALTED` 变成一般写入模式。
+
+### 19.3 可观测性
+
+- Orders 解析失败必须记录通道、消息类型、订单 ID、失败字段和值的类型；不得记录 signer、签名、permit 或完整认证报文。
+- 紧急撤单日志必须明确标记“HALTED 紧急撤单”，记录 market ID、受影响订单数、每轮剩余开放订单数和未确认终态数。
+- 启动回滚失败必须继续向上抛出原始解析原因和撤单原因，不能把两者折叠成模糊的“启动失败”。
+
+### 19.4 测试与验收
+
+回归测试必须先在旧实现上失败，并覆盖：
+
+- Orders snapshot/update 对 `size="0.004447"`、`price="61000"`、`filled_size="0"`、`avg_price="0"` 的解析；
+- REST 历史订单及精确订单查询使用相同十进制结构；
+- 非字符串、指数形式和非法范围继续失败；
+- `HALTED` 时 `cancelAll` 可以执行，但下单、杠杆和平仓仍被拒绝；
+- 紧急撤单成功后仍为 `HALTED`，失败时保留跟踪；
+- 延迟成交在紧急撤单期间只记账、不补单；
+- 完整 `npm test` 和主网公共只读验证通过。
+
+自动验收不得使用用户私钥或执行新的真实写入。用户在 VPS 更新后，应先确认交易所无遗留委托，再执行私有只读验证，最后仅用最小数量和低杠杆重新试单。

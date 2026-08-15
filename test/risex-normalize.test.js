@@ -26,9 +26,9 @@ const WAD = 10n ** 18n;
 const wad = (value) => (BigInt(value) * WAD).toString();
 
 const rawOrder = {
-  id: '90071992547409931234', market_id: '1', side: 'BUY',
-  size: '1000000000000000000', price: '60000000000000000000000',
-  filled_size: '250000000000000000', avg_price: '59900000000000000000000',
+  id: '0x00000000000125b1000000000124ded20000000000000125', market_id: '1', side: 'BUY',
+  size: '0.004447', price: '61000',
+  filled_size: '0', avg_price: '0',
   status: 'ORDER_STATUS_OPEN', sender: '0xAbC', block_number: '12', log_index: '3',
 };
 
@@ -93,11 +93,14 @@ test('market normalization rejects missing, duplicate, unsafe or invalid targets
   assert.throws(() => normalizeRisexMarkets([{ ...btc, visible: false }, eth]), /BTC-PERP.*不可用/);
 });
 
-test('orders parser preserves string IDs, WAD values and cursor', () => {
+test('orders parser accepts current mainnet decimal values and preserves cursor', () => {
   const [order] = parseOrderEnvelope(orderEnvelope());
-  assert.equal(order.orderId, '90071992547409931234');
-  assert.equal(order.status, 'PARTIAL');
-  assert.equal(order.filledSize, 0.25);
+  assert.equal(order.orderId, rawOrder.id);
+  assert.equal(order.status, 'OPEN');
+  assert.equal(order.sizeBase, 0.004447);
+  assert.equal(order.price, 61000);
+  assert.equal(order.filledSize, 0);
+  assert.equal(order.avgPrice, 0);
   assert.equal(order.sender, '0xabc');
   assert.deepEqual(order.cursor, { block: 12n, log: 3n, timestamp: 99n });
 });
@@ -120,7 +123,9 @@ test('fills parser accepts the official decimal object format', () => {
 test('WS parsers reject unknown status, malformed IDs and impossible values', () => {
   assert.throws(() => parseOrderEnvelope(orderEnvelope({ ...rawOrder, status: 'ORDER_STATUS_NONE' })), /ORDER_STATUS_NONE/);
   assert.throws(() => parseOrderEnvelope(orderEnvelope({ ...rawOrder, id: '' })), /订单 ID/);
-  assert.throws(() => parseOrderEnvelope(orderEnvelope({ ...rawOrder, filled_size: '2000000000000000000' })), /超过订单总量/);
+  assert.throws(() => parseOrderEnvelope(orderEnvelope({ ...rawOrder, size: 0.004447 })), /size.*十进制数字字符串/);
+  assert.throws(() => parseOrderEnvelope(orderEnvelope({ ...rawOrder, price: '6.1e4' })), /price.*十进制数字字符串/);
+  assert.throws(() => parseOrderEnvelope(orderEnvelope({ ...rawOrder, filled_size: '0.005' })), /超过订单总量/);
   assert.throws(() => parseOrderEnvelope({ ...orderEnvelope(), data: rawOrder }), /data.*数组/);
   assert.throws(() => parseFillEnvelope({
     channel: 'fills', type: 'update', block_number: 1, log_index: 1, timestamp: '1',
@@ -147,8 +152,8 @@ test('REST normalizers preserve open-order IDs and explicitly convert ticks and 
 
 test('REST normalizers parse current RISEx order, fill and position schemas', () => {
   const history = normalizeRestOrderHistory({
-    id: '0xorder1', market_id: '1', side: 'BUY', size: wad(1), price: wad(100),
-    filled_size: (WAD / 4n).toString(), avg_price: wad(99),
+    id: '0xorder1', market_id: '1', side: 'BUY', size: '0.004447', price: '61000',
+    filled_size: '0.001', avg_price: '60999.5',
     status: 'ORDER_STATUS_CANCELLED', created_at: '20', block_number: '7', log_index: '2',
   });
   assert.deepEqual({
@@ -161,9 +166,9 @@ test('REST normalizers parse current RISEx order, fill and position schemas', ()
   }, {
     orderId: '0xorder1',
     side: 'buy',
-    sizeBase: 1,
-    filledSize: 0.25,
-    avgPrice: 99,
+    sizeBase: 0.004447,
+    filledSize: 0.001,
+    avgPrice: 60999.5,
     cursor: { block: 7n, log: 2n, timestamp: 20n },
   });
 
@@ -194,7 +199,7 @@ test('REST normalizers reject missing resting IDs, unknown status and incomplete
     order_id: 'o1', market_id: 1, side: 0, price_ticks: 1, size_steps: 1,
   }, market), /resting_order_id/);
   assert.throws(() => normalizeRestOrderHistory({
-    id: 'o1', market_id: '1', side: 'BUY', size: wad(1), price: wad(100),
+    id: 'o1', market_id: '1', side: 'BUY', size: '1', price: '100',
     filled_size: '0', avg_price: '0', status: 'MYSTERY', created_at: '10',
   }), /MYSTERY/);
   assert.throws(() => normalizeRestPosition({
