@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createExchange as createRsExchange } from '../src/exchange/rs/index.js';
-import { initializeExchange, prepareExchangeRecovery } from '../src/startup.js';
+import { PaperExchange as RsPaperExchange } from '../src/exchange/rs/paper.js';
+import { collectMissingLiveCredentials, initializeExchange, prepareExchangeRecovery } from '../src/startup.js';
 import { remapSnapshotMarket, resumeRunningSnapshot } from '../src/recovery.js';
 
 test('RISEx live requires mainnet account and signer credentials', () => {
@@ -27,6 +28,32 @@ test('RISEx live rejects non-mainnet network and non-official endpoints', () => 
 
 test('RISEx paper remains available without live credentials', () => {
   assert.equal(createRsExchange({ mode: 'paper', startBalance: 1000 }).mode, 'paper');
+});
+
+test('RISEx paper probes only current rise.trade endpoints', () => {
+  const exchange = new RsPaperExchange();
+  assert.deepEqual(exchange.candidates, [
+    'https://api.rise.trade',
+    'https://api.testnet.rise.trade',
+  ]);
+});
+
+test('startup credential preflight reports missing RISEx live account and signer', () => {
+  const missing = collectMissingLiveCredentials({
+    de: { mode: 'paper' },
+    ex: { mode: 'paper' },
+    rs: { mode: 'live', account: '', signerKey: '' },
+  });
+
+  assert.deepEqual(missing.map((entry) => entry[1]), ['RISEX_ACCOUNT', 'RISEX_SIGNER_KEY']);
+});
+
+test('startup credential preflight does not require RISEx credentials in paper mode', () => {
+  assert.deepEqual(collectMissingLiveCredentials({
+    de: { mode: 'paper' },
+    ex: { mode: 'paper' },
+    rs: { mode: 'paper', account: '', signerKey: '' },
+  }), []);
 });
 
 test('live exchange initialization failure aborts startup', async () => {

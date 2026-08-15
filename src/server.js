@@ -18,7 +18,7 @@ import { flushState, loadSnapshot, saveSnapshot } from './persist.js';
 import { createAiService } from './ai/service.js';
 import { enforceRequestSecurity, HttpRequestError, readJsonBody } from './security.js';
 import { SseClientPool } from './sse.js';
-import { initializeExchange, prepareExchangeRecovery } from './startup.js';
+import { collectMissingLiveCredentials, initializeExchange, prepareExchangeRecovery } from './startup.js';
 import { remapSnapshotMarket, resumeRunningSnapshot } from './recovery.js';
 import { writeEnvFile } from './envfile.js';
 
@@ -27,16 +27,7 @@ const cfg = getConfig();
 
 // ── 实盘凭据预检查：缺什么直接列出来，不甩堆栈吓人 ─────────────────────────────
 {
-  const missing = [];
-  if (cfg.de.mode === 'live') {
-    if (!cfg.de.apiKey) missing.push(['Decibel ', 'DECIBEL_API_KEY', '在 geomi.dev 免费创建']);
-    if (!cfg.de.privateKey) missing.push(['Decibel ', 'DECIBEL_PRIVATE_KEY', '在 app.decibel.trade/api 创建 API 钱包']);
-  }
-  if (cfg.ex.mode === 'live') {
-    if (!cfg.ex.apiKey) missing.push(['Extended', 'EXTENDED_API_KEY', 'app.extended.exchange → API Management']);
-    if (!cfg.ex.vault) missing.push(['Extended', 'EXTENDED_VAULT', '同上，创建 API Key 时一并显示']);
-    if (!cfg.ex.starkPrivateKey) missing.push(['Extended', 'EXTENDED_STARK_PRIVATE_KEY', '同上，只显示一次务必保存']);
-  }
+  const missing = collectMissingLiveCredentials(cfg);
   if (missing.length) {
     console.error('\n[启动失败] 有交易所被设为 live 实盘模式，但 .env 里还缺以下凭据：\n');
     for (const [ex, key, where] of missing) {
@@ -46,7 +37,7 @@ const cfg = getConfig();
     console.error('\n解决办法（二选一）：');
     console.error('  1. 用记事本打开项目里的 .env，补齐上面列出的字段');
     console.error('     （详细获取教程见 README.md 第七节）');
-    console.error('  2. 暂时不实盘：把 .env 里对应的 DE_MODE / EX_MODE 改回 paper\n');
+    console.error('  2. 暂时不实盘：把 .env 里对应的 DE_MODE / EX_MODE / RS_MODE 改回 paper\n');
     process.exit(1);
   }
 }
@@ -554,7 +545,7 @@ server.listen(cfg.port, cfg.host, () => {
   console.log(`${'─'.repeat(52)}`);
   if (cfg.de.mode === 'paper' || cfg.ex.mode === 'paper' || cfg.rs.mode === 'paper') {
     console.log('  ⚠ 部分交易所为模拟模式，不涉及真实资金。');
-    console.log('    Decibel/Extended 可在 .env 中切换 live；RISEx 当前仅支持 paper。');
+    console.log('    三个交易所均可在 .env 中独立切换 paper/live；RISEx live 仅支持 mainnet BTC/ETH。');
   }
   console.log('');
 });

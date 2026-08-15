@@ -16,10 +16,9 @@ export class PaperExchange extends EventEmitter {
     super();
     this.mode = 'paper';
     this.balance = opts.startBalance ?? 10000;
-    // Candidate REST bases: explicit override -> mainnet -> testnet.
+    // Candidate REST bases: explicit override -> current mainnet -> testnet.
     this.candidates = [...new Set((opts.apiUrl ? [opts.apiUrl] : []).concat([
-      'https://api.risex.trade',       // mainnet (real prices)
-      'https://api.rise.trade',        // alt mainnet host
+      'https://api.rise.trade',        // mainnet (real prices)
       'https://api.testnet.rise.trade',// testnet fallback
     ]))];
     this.apiUrl = this.candidates[0];

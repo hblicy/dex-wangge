@@ -1,6 +1,6 @@
 # 三交易所整合网格交易机器人
 
-一个跑在你自己电脑上的加密货币**永续合约网格交易机器人**，同时支持三家去中心化交易所：**Decibel**（Aptos 链）、**Extended**（Starknet 链）、**RISEx**。三个交易所可以同时各跑一个网格策略，统一在一个浏览器仪表盘里监控和操控；目前只有 Decibel 和 Extended 开放实盘，RISEx 仅开放模拟盘。
+一个跑在你自己电脑上的加密货币**永续合约网格交易机器人**，同时支持三家去中心化交易所：**Decibel**（Aptos 链）、**Extended**（Starknet 链）、**RISEx**。三个交易所可以同时各跑一个网格策略，统一在一个浏览器仪表盘里监控和操控；三所均支持模拟盘和实盘，RISEx 实盘仅开放 mainnet 的 BTC-PERP / ETH-PERP。
 
 > ⚠️ **免责声明**：本程序仅供学习和研究。合约交易带高杠杆风险，可能损失全部本金。实盘前请务必先用模拟模式充分熟悉。使用本程序造成的任何盈亏由使用者自行承担。
 
@@ -34,7 +34,7 @@
 | 功能 | 说明 |
 |---|---|
 | 三交易所并行 | Decibel / Extended / RISEx 各自独立运行一个网格机器人，互不影响 |
-| 双运行模式 | Decibel / Extended 支持 `paper` 和 `live`；RISEx 仅支持 `paper` |
+| 双运行模式 | 三所均支持 `paper` 和 `live`；RISEx live 仅支持 mainnet BTC-PERP / ETH-PERP |
 | 三种网格类型 | 中性（区间震荡双向吃单）、做多（低吸高抛）、做空（高抛低补） |
 | 等差网格 | 在设定区间内均匀布单，每次成交后在相邻一格自动补反向单，赚取格差 |
 | 智能填充参数 | 一键根据近期 K 线趋势分析，自动推荐网格类型、区间上下界、格数 |
@@ -112,7 +112,7 @@ DASHBOARD_TOKEN=这里粘贴刚生成的随机值
 
 `实盘启动.bat` 多两个保护步骤：检查 `.env` 是否存在（实盘必须先配置密钥），以及要求你手动输入 `YES` 确认才会启动。
 
-> 💡 关闭命令行窗口 = 停止程序。已挂在交易所的单不会被自动撤销，下次启动程序会自动接管续跑（见[第十二节](#十二断电--崩溃自动恢复机制)）。
+> 💡 关闭命令行窗口或停止 Node 进程**不会自动撤销交易所挂单**。正常停机应先在仪表盘执行“停止 / 一键撤单”，确认交易所挂单已清空，再结束进程；异常中断后的接管规则见[第十二节](#十二断电--崩溃自动恢复机制)。
 
 ---
 
@@ -267,7 +267,7 @@ tailscale serve status
 
 ## 七、实盘模式：API 密钥获取与配置
 
-> 当前实盘支持范围：**Decibel、Extended**。RISEx 实盘入口已禁用，不能通过配置绕过。
+> 当前三所均支持实盘。RISEx 只允许官方 mainnet，且只开放 BTC-PERP / ETH-PERP。
 
 ### 实盘启动检查清单
 
@@ -280,7 +280,7 @@ tailscale serve status
 ### 7.0 总体步骤
 
 1. 用记事本（或任何文本编辑器）打开项目文件夹里的 `.env` 文件（没有就先复制 `.env.example` 改名为 `.env`；注意文件名就是 `.env`，前面有个点，没有别的后缀）。
-2. 把要实盘的交易所模式改为 `DE_MODE=live`（Decibel）或 `EX_MODE=live`（Extended）。`RS_MODE` 必须保持 `paper`。
+2. 把要实盘的交易所模式改为 `DE_MODE=live`（Decibel）、`EX_MODE=live`（Extended）或 `RS_MODE=live`（RISEx）。
 3. 按下面各小节获取并填入对应凭据。
 4. 保存 `.env`，双击 `实盘启动.bat`，输入 `YES` 确认启动。
 5. 启动日志里看到 `[XX] ✓ 连接成功 [LIVE 模式]` 即成功。
@@ -327,13 +327,32 @@ EXTENDED_STARK_PUBLIC_KEY=     # ④ Stark 公钥
 
 ### 7.3 RISEx
 
-RISEx 当前**仅支持 `RS_MODE=paper`**。此前使用的社区 `risex-client` 无法可靠确认私有订单状态和实际成交数量，不满足真实资金所需的状态确认条件，因此服务会拒绝任何 RISEx live 配置。
+RISEx live 只支持官方 mainnet 的 BTC-PERP / ETH-PERP。请使用独立的小资金 RISEx 账户，不要与人工交易或其他机器人共享；`RISEX_SIGNER_KEY` 必须是该账户已注册的 session signer 私钥。
 
-重新开放实盘至少需要官方稳定的私有订单/成交接口、可靠的撤单与部分成交确认，并完成测试网端到端和故障恢复验证。在这些条件满足前，不要把签名私钥填入本项目。
+```ini
+RS_MODE=live
+RS_NETWORK=mainnet
+RISEX_ACCOUNT=0x你的独立RISEx账户地址
+RISEX_SIGNER_KEY=0x已注册的session signer私钥
+RISEX_API_URL=https://api.rise.trade
+RISEX_WS_URL=wss://api.rise.trade/ws/
+```
+
+官方 endpoint 在 live 模式不可替换。适配器以私有 Orders/Fills WebSocket 与 REST 对账共同确认成交、撤单和持仓；无法确认或发现冲突时进入 `HALTED`，不会猜测订单状态或自动清理未知订单。
+
+首次人工验收按顺序执行：
+
+1. 创建独立 RISEx 小资金账户并注册 session signer，不要复用主钱包或共享账户。
+2. 填写上面的环境变量；Linux/VPS 执行 `chmod 600 .env`。
+3. 执行 `npm ci`、`npm test`，确认全部通过。
+4. 执行 `npm run risex:verify`，确认官方 chain/domain、BTC/ETH 行情和公共 WebSocket 通过。
+5. 由你本人执行 `npm run risex:verify -- --private`，只读确认 signer、余额、挂单、持仓和私有 Orders 快照；输出不会打印私钥、订单 ID 或 fill ID。
+6. 启动服务后只选 BTC-PERP 或 ETH-PERP，用可承受全部损失的最小仓位和低杠杆启动第一个网格。
+7. 在 RISEx 网页逐项核对挂单、成交、撤单和平仓；正常停机先在仪表盘停止并确认挂单清空，再结束 Node 进程。
 
 ### 7.4 测试网练手（可选）
 
-Decibel 和 Extended 可先连测试网走完整下单流程：把对应的 `DE_NETWORK` / `EX_NETWORK` 改为 `testnet`，再使用测试网凭据。RISEx 仍只运行 paper。
+Decibel 和 Extended 可先连测试网走完整下单流程：把对应的 `DE_NETWORK` / `EX_NETWORK` 改为 `testnet`，再使用测试网凭据。RISEx 适配器不支持 testnet，实盘验收必须按 7.3 的小资金人工步骤执行。
 
 ---
 
@@ -444,9 +463,9 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 | `PAPER_BALANCE` | `10000` | 模拟模式初始虚拟余额（USDC） |
 | `GLOBAL_PROXY` | 空 | 全局代理，见第八节 |
 | `DECIBEL_PROXY` / `EXTENDED_PROXY` / `RISEX_PROXY` | 空 | 各所独立代理 |
-| `DE_MODE` / `EX_MODE` | `paper` | Decibel / Extended：`paper` 或 `live` |
-| `RS_MODE` | `paper` | RISEx：只能为 `paper`，`live` 会拒绝启动 |
-| `DE_NETWORK` / `EX_NETWORK` / `RS_NETWORK` | `mainnet` | 主网 / 测试网 |
+| `DE_MODE` / `EX_MODE` / `RS_MODE` | `paper` | 各交易所独立选择 `paper` 或 `live` |
+| `DE_NETWORK` / `EX_NETWORK` | `mainnet` | Decibel / Extended 主网或测试网 |
+| `RS_NETWORK` | `mainnet` | RISEx 固定为 mainnet |
 | `DECIBEL_API_KEY` | 空 | Decibel：geomi.dev 的 API Key |
 | `DECIBEL_PRIVATE_KEY` | 空 | Decibel：API 钱包 Ed25519 私钥 |
 | `DECIBEL_SUBACCOUNT` | 空 | Decibel：Trading Account 地址 |
@@ -456,7 +475,10 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 | `EXTENDED_STARK_PRIVATE_KEY` / `EXTENDED_STARK_PUBLIC_KEY` | 空 | Extended：Stark 密钥对 |
 | `EXTENDED_MAX_FEE` | `0.0005` | Extended 最大手续费率 |
 | `EXTENDED_API_URL` | 官方默认 | 自定义 API 地址 |
-| `RISEX_API_URL` | 官方默认 | RISEx paper 行情 API 地址 |
+| `RISEX_ACCOUNT` | 空 | RISEx live 独立账户的 EVM 地址 |
+| `RISEX_SIGNER_KEY` | 空 | RISEx live 已注册 session signer 的私钥 |
+| `RISEX_API_URL` | `https://api.rise.trade` | RISEx 官方 REST 地址；live 不可替换 |
+| `RISEX_WS_URL` | `wss://api.rise.trade/ws/` | RISEx 官方 WebSocket 地址；live 不可替换 |
 | `AI_PROVIDER` | `openai` | AI 协议：`openai` / `anthropic` / `gemini` |
 | `AI_API_KEY` / `AI_BASE_URL` / `AI_MODEL` / `AI_MODEL_SMALL` | 空 | 见第九节 |
 | `AI_SENTINEL_MINUTES` | `5` | 哨兵巡检间隔（分钟，0=关） |
@@ -471,9 +493,9 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 
 程序每次状态变化都会把快照写入项目目录下的 `.state.json`（自动生成，含配置、挂单、累计统计）。重启后：
 
-1. **上次是运行状态** → 按市场名称重新解析交易对，接管还挂着的单；首次对账成功后才恢复运行。
+1. **上次是运行状态** → 按市场名称重新解析交易对，接管还挂着的单；首次对账成功后才恢复运行。RISEx 必须同时完成私有 Orders 快照与 REST 对账屏障。
 2. **实盘交易所初始化失败** → 整个服务停止启动，不会把离线交易所伪装成可用状态；现有挂单保持不动，需先到交易所网页确认。
-3. **续跑或首次对账失败** → 尝试撤销遗留挂单；若交易所没有明确确认全部撤销，服务停止启动并打印原因。
+3. **续跑或首次对账失败** → 服务停止启动并打印原因；RISEx 会进入 `HALTED`，不会根据订单消失推测成交，也不会自动撤销无法确认归属的订单。
 4. **发现遗留持仓** → 界面弹三选项：只减仓回收 / 按现价重开网格 / 市价平仓。
 
 累计盈亏、成交量等统计也随快照保留，跨重启连续显示。想清零就点"重置统计"。
@@ -562,7 +584,7 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 │   └── exchange/
 │       ├── de/           # Decibel 接入（live + paper）
 │       ├── ex/           # Extended 接入（live + paper + Stark 签名）
-│       └── rs/           # RISEx 接入（仅 paper）
+│       └── rs/           # RISEx 接入（live + paper + 私有 WS / 订单状态机）
 └── test/
     └── grid.test.js      # 网格逻辑单元测试
 ```
@@ -578,8 +600,9 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 5. **小资金起步**：首次实盘用你亏得起的钱。
 6. **仪表盘默认只监听本机**（localhost）。VPS 通过 SSH 隧道或 Tailscale Serve 访问，不要在安全组或防火墙公开 8080，也不要使用 Tailscale Funnel。
 7. **VPS 使用独立服务用户**，并执行 `chmod 600 .env`；程序会拒绝读取权限过宽的密钥文件。
-8. **RISEx 只允许 paper**；不要尝试修改代码绕过实盘禁用。
-9. 本程序没有远程服务器、不上传任何数据，所有状态都在你本机。
+8. **RISEx 使用独立小资金账户**：不得与人工交易或其他机器人共享；私有日志保存在本机终端/进程管理器日志中，排障时不要公开 `.env`、签名或账户敏感信息。
+9. **RISEx 实盘先完成人工七步验收**：程序不会自动发送真实验证订单；任何 `HALTED` 都应先到交易所网页核对挂单和持仓。
+10. 本程序没有远程服务器、不上传任何数据，所有状态都在你本机。
 
 ---
 

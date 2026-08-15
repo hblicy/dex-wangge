@@ -1,7 +1,7 @@
 {
   "name": "grid-bot-all",
   "version": "1.0.0",
-  "description": "三交易所整合网格交易机器人：Decibel / Extended 支持实盘，RISEx 仅模拟盘。",
+  "description": "三交易所整合网格交易机器人：Decibel、Extended 与 RISEx 支持模拟盘和实盘。",
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
