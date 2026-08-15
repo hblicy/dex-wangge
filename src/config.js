@@ -76,18 +76,17 @@ export function getConfig() {
 
   // ── RISEx ─────────────────────────────────────────────────────────────────
   const rsNet = (process.env.RS_NETWORK || 'mainnet').toLowerCase();
-  const rsDefaults =
-    rsNet === 'testnet'
-      ? { api: 'https://api.testnet.rise.trade', ws: 'wss://ws.testnet.rise.trade' }
-      : { api: 'https://api.risex.trade', ws: 'wss://ws.risex.trade' };
+  if (rsNet !== 'mainnet') {
+    throw new Error('RISEx 只支持 mainnet，RS_NETWORK 必须为 mainnet。');
+  }
 
   const rs = {
     mode: (process.env.RS_MODE || 'paper').toLowerCase() === 'live' ? 'live' : 'paper',
     network: rsNet,
-    account: process.env.ACCOUNT_ADDRESS || '',
-    signerKey: process.env.SIGNER_PRIVATE_KEY || '',
-    apiUrl: process.env.RISEX_API_URL || rsDefaults.api,
-    wsUrl: process.env.RISEX_WS_URL || rsDefaults.ws,
+    account: process.env.RISEX_ACCOUNT || '',
+    signerKey: process.env.RISEX_SIGNER_KEY || '',
+    apiUrl: process.env.RISEX_API_URL || 'https://api.rise.trade',
+    wsUrl: process.env.RISEX_WS_URL || 'wss://api.rise.trade/ws/',
     startBalance: Number(process.env.PAPER_BALANCE || 10000),
     proxy: process.env.RISEX_PROXY || globalProxy,
   };

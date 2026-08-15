@@ -1,33 +1,32 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import { createExchange as createRsExchange } from '../src/exchange/rs/index.js';
 import { initializeExchange } from '../src/startup.js';
 import { remapSnapshotMarket, resumeRunningSnapshot } from '../src/recovery.js';
 
-test('RISEx live is rejected before signer key reaches unofficial SDK', () => {
+test('RISEx live requires mainnet account and signer credentials', () => {
   assert.throws(
-    () => createRsExchange({ mode: 'live', account: '0x1', signerKey: 'secret' }),
-    /RISEx 实盘已禁用/,
+    () => createRsExchange({ mode: 'live', network: 'mainnet' }),
+    /RISEX_ACCOUNT.*RISEX_SIGNER_KEY/,
   );
 });
 
-test('RISEx paper remains available', () => {
+test('RISEx live rejects non-mainnet network and non-official endpoints', () => {
+  const base = {
+    mode: 'live',
+    network: 'mainnet',
+    account: '0x0000000000000000000000000000000000000001',
+    signerKey: `0x${'11'.repeat(32)}`,
+    apiUrl: 'https://api.rise.trade',
+    wsUrl: 'wss://api.rise.trade/ws/',
+  };
+  assert.throws(() => createRsExchange({ ...base, network: 'testnet' }), /只支持 mainnet/);
+  assert.throws(() => createRsExchange({ ...base, apiUrl: 'https://proxy.invalid' }), /RISEX_API_URL/);
+  assert.throws(() => createRsExchange({ ...base, wsUrl: 'wss://proxy.invalid/ws/' }), /RISEX_WS_URL/);
+});
+
+test('RISEx paper remains available without live credentials', () => {
   assert.equal(createRsExchange({ mode: 'paper', startBalance: 1000 }).mode, 'paper');
-});
-
-test('direct RISEx live adapter initialization is also blocked before SDK loading', () => {
-  const source = fs.readFileSync(new URL('../src/exchange/rs/risex.js', import.meta.url), 'utf8');
-  assert.match(source, /async init\(\) \{\s*throw new Error\('RISEx 实盘已禁用/);
-  assert.match(source, /async reconnect\(\) \{\s*throw new Error\('RISEx 实盘已禁用/);
-});
-
-test('disabled RISEx live client is not installed as a project dependency', () => {
-  const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-  const packageLock = fs.readFileSync(new URL('../package-lock.json', import.meta.url), 'utf8');
-
-  assert.equal(packageJson.optionalDependencies?.['risex-client'], undefined);
-  assert.doesNotMatch(packageLock, /node_modules\/risex-client/);
 });
 
 test('live exchange initialization failure aborts startup', async () => {
