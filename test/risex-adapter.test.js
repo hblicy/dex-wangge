@@ -687,6 +687,37 @@ test('RISEx disconnect rejects writes until authenticated REST/WS reconciliation
   assert.equal(exchange.connectionState, 'READY');
 });
 
+test('RISEx refresh timer does not poison health while the private stream is reconciling', async () => {
+  let tick;
+  let leverageCall;
+  const errors = [];
+  const { exchange, stream } = makeHarness({
+    setIntervalImpl: (fn) => { tick = fn; return 7; },
+    clearIntervalImpl: () => {},
+    updateLeverageImpl: async (marketId, leverage) => {
+      leverageCall = [marketId, leverage];
+      return { success: true };
+    },
+  });
+  exchange.on('error', (error) => errors.push(error));
+  await exchange.init();
+
+  stream.authenticated = false;
+  stream.emit('disconnected', { code: 1006 });
+  await tick();
+  assert.equal(exchange.connectionState, 'RECONCILING');
+  assert.equal(errors.length, 0);
+
+  stream.authenticated = true;
+  stream.emit('authenticated');
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(exchange.connectionState, 'READY');
+  assert.equal(exchange.getHealth().status, 'ok');
+  assert.equal(await exchange.setLeverage(1, 3), true);
+  assert.deepEqual(leverageCall, [1, 3n]);
+});
+
 test('RISEx reconnect reconciliation halts on REST/WS identity conflicts', async () => {
   const openByMarket = new Map([[1, [rawOpen('o-conflict')]]]);
   const { exchange, stream } = makeHarness({ openByMarket, streamEvents: [wsOpen('o-conflict')] });
