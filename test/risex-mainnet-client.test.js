@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { AbiCoder, keccak256, toUtf8Bytes } from 'ethers';
 import {
   OrderType,
   Side,
@@ -19,6 +20,7 @@ const PERMIT_PARAMS = Object.freeze({
 
 function makeClient() {
   const calls = [];
+  const permitHashes = [];
   const client = Object.create(RisexMainnetClient.prototype);
   client.info = {
     http: {
@@ -28,9 +30,53 @@ function makeClient() {
       },
     },
   };
-  client.createPermit = async () => PERMIT_PARAMS;
-  return { client, calls };
+  client.createPermit = async (hash) => {
+    permitHashes.push(hash);
+    return PERMIT_PARAMS;
+  };
+  return { client, calls, permitHashes };
 }
+
+test('RISEx mainnet leverage permit matches the official V1 action hash', async () => {
+  const { client, permitHashes } = makeClient();
+  await client.updateLeverage(1, 25n);
+
+  const actionTypeHash = keccak256(toUtf8Bytes('RISE_PERPS_UPDATE_LEVERAGE_V1'));
+  const encoded = AbiCoder.defaultAbiCoder().encode(
+    ['bytes32', 'uint16', 'uint8'],
+    [actionTypeHash, 1, 25n],
+  );
+  assert.equal(permitHashes[0], keccak256(encoded));
+});
+
+test('RISEx mainnet permit signs the next official nonce anchor', async () => {
+  let signedMessage;
+  const client = Object.create(RisexMainnetClient.prototype);
+  client.initialized = true;
+  client.account = PERMIT_PARAMS.account;
+  client.target = '0x0000000000000000000000000000000000000003';
+  client.domain = {
+    name: 'RISEx',
+    version: '1',
+    chainId: 4153n,
+    verifyingContract: '0x0000000000000000000000000000000000000004',
+  };
+  client.isErc1271 = false;
+  client.signerWallet = {
+    address: PERMIT_PARAMS.signer,
+    async signTypedData(_domain, _types, message) {
+      signedMessage = message;
+      return `0x${'11'.repeat(64)}1b`;
+    },
+  };
+  client.getNonceState = async () => ({ nonce_anchor: '8', current_bitmap_index: 7 });
+
+  const permit = await client.createPermit(`0x${'22'.repeat(32)}`);
+  assert.equal(signedMessage.nonceAnchor, 9);
+  assert.equal(signedMessage.nonceBitmap, 7);
+  assert.equal(permit.nonce_anchor, 9);
+  assert.equal(permit.nonce_bitmap_index, 7);
+});
 
 test('RISEx mainnet signed writes send permit_params required by the live API', async () => {
   const { client, calls } = makeClient();

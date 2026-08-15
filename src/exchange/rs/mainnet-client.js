@@ -1,12 +1,42 @@
+import { AbiCoder, keccak256, toUtf8Bytes } from 'ethers';
 import {
+  createPermitParams,
   ExchangeClient,
   encodeCancelAll,
   encodeCancelOrder,
-  encodeLeverage,
   encodeOrder,
 } from 'risex-client';
 
+const ABI_CODER = AbiCoder.defaultAbiCoder();
+const UPDATE_LEVERAGE_ACTION_HASH = keccak256(toUtf8Bytes('RISE_PERPS_UPDATE_LEVERAGE_V1'));
+
 export class RisexMainnetClient extends ExchangeClient {
+  async createPermit(hash, nonce) {
+    this.assertInit();
+    const current = nonce ?? await this.getNonceState();
+    const nonceAnchor = Number(current?.nonce_anchor);
+    const nonceBitmapIndex = Number(current?.current_bitmap_index);
+    if (!Number.isSafeInteger(nonceAnchor) || nonceAnchor < 0 || nonceAnchor >= (2 ** 48) - 1) {
+      throw new Error('RISEx 主网 nonce_anchor 非法。');
+    }
+    if (!Number.isInteger(nonceBitmapIndex) || nonceBitmapIndex < 0 || nonceBitmapIndex > 255) {
+      throw new Error('RISEx 主网 current_bitmap_index 非法。');
+    }
+    return createPermitParams(
+      hash,
+      this.signerWallet,
+      this.account,
+      this.target,
+      this.domain,
+      {
+        nonce_anchor: nonceAnchor + 1,
+        current_bitmap_index: nonceBitmapIndex >= 208 ? 0 : nonceBitmapIndex,
+      },
+      undefined,
+      this.isErc1271,
+    );
+  }
+
   async placeOrder(orderParams) {
     const permitParams = await this.createPermit(
       encodeOrder(orderParams, this.isErc1271),
@@ -59,7 +89,11 @@ export class RisexMainnetClient extends ExchangeClient {
   }
 
   async updateLeverage(marketId, leverage, nonce) {
-    const permitParams = await this.createPermit(encodeLeverage(marketId, leverage), nonce);
+    const actionHash = keccak256(ABI_CODER.encode(
+      ['bytes32', 'uint16', 'uint8'],
+      [UPDATE_LEVERAGE_ACTION_HASH, marketId, leverage],
+    ));
+    const permitParams = await this.createPermit(actionHash, nonce);
     return this.info.http.post('/v1/account/leverage', {
       market_id: marketId,
       leverage: String(leverage),
