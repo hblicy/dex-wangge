@@ -189,6 +189,23 @@ test('messages for another account or market are fatal', async () => {
   assert.match((await fatal).message, /账户|market/);
 });
 
+test('Orders parse diagnostics expose schema types without secrets', async () => {
+  const harness = makeHarness();
+  const socket = await openAndAuthenticate(harness);
+  const fatal = new Promise((resolve) => harness.stream.once('fatal', resolve));
+  socket.message({
+    channel: 'orders', type: 'update', timestamp: '10',
+    data: [{ id: 'o-invalid', market_id: '1', side: 'BUY', size: 0.001, price: '61000', filled_size: '0', avg_price: '0', status: 'ORDER_STATUS_OPEN', sender: ACCOUNT, block_number: '1', log_index: '0' }],
+  });
+
+  const error = await fatal;
+  assert.match(error.message, /Orders 解析失败/);
+  assert.match(error.message, /type=update/);
+  assert.match(error.message, /order=o-invalid/);
+  assert.match(error.message, /size:number,price:string/);
+  assert.doesNotMatch(error.message, /signature|permit|signerKey/i);
+});
+
 test('auth failures fetch fresh nonces and stop after three attempts', async () => {
   const harness = makeHarness({ setTimer: (fn) => { queueMicrotask(fn); return 1; } });
   const connecting = harness.stream.connect();
