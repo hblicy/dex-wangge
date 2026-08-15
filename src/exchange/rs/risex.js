@@ -426,6 +426,10 @@ export class RisexExchange extends EventEmitter {
     if (this.connectionState !== 'READY') {
       throw new Error(`RISEx 对账不可用：${this.connectionState} ${this.haltReason || ''}`.trim());
     }
+    const health = this.getHealth();
+    if (health.status !== 'ok') {
+      throw new Error(`RISEx 开放订单数据不可用：健康检查未通过（${health.reason}）。`);
+    }
     return this.getOpenOrders(marketId);
   }
 
@@ -434,6 +438,19 @@ export class RisexExchange extends EventEmitter {
     const current = this.orderState.get(id);
     if (!current) throw new Error(`RISEx 无法接管未知订单 ${id}。`);
     this.orderState.adopt({ ...meta, orderId: id, marketId: Number(meta.marketId) });
+    this._syncOfficialOrder(id);
+    const terminal = this._pendingRecoveryTerminals.get(id);
+    if (!terminal) return;
+    this._pendingRecoveryTerminals.delete(id);
+    const record = this.orderState.get(id);
+    this._defer(() => {
+      if (!terminal.terminalFill) return;
+      this.emit('fill', {
+        ...terminal.terminalFill,
+        levelIndex: record.meta.levelIndex,
+        clientOrderId: record.meta.clientOrderId,
+      });
+    });
   }
 
   getPosition(marketId) {
@@ -1066,7 +1083,8 @@ export class RisexExchange extends EventEmitter {
         throw new Error(`RISEx 订单 ${orderId} 无法确认开放或终态。`);
       }
       const tracked = this.orderState.track({ ...meta, marketId: market.marketId, sizeTolerance: market.stepSize / 2 });
-      for (const fill of (fillsByOrder.get(orderId) || []).sort((a, b) => Number(a.cursor.timestamp - b.cursor.timestamp))) {
+      for (const fill of (fillsByOrder.get(orderId) || [])
+        .sort((left, right) => compareRisexCursor(left.cursor, right.cursor))) {
         this.orderState.applyFill(fill);
       }
       const result = this.orderState.applyOrder(terminal) ?? tracked;

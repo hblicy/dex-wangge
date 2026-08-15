@@ -55,6 +55,32 @@ function rawOpen(orderId = 'o1', marketId = 1) {
   };
 }
 
+function rawHistory(orderId, status, filledSize, avgPrice = '0') {
+  return {
+    order_id: orderId,
+    market_id: '1',
+    side: 0,
+    size: '0.001',
+    price: '60000',
+    filled_size: String(filledSize),
+    avg_price: String(avgPrice),
+    status,
+    timestamp: '20',
+  };
+}
+
+function rawRestFill(orderId, fillId, size = '0.001', price = '59999') {
+  return {
+    fill_id: fillId,
+    order_id: orderId,
+    market_id: '1',
+    side: 0,
+    size,
+    price,
+    timestamp: '19',
+  };
+}
+
 function wsOpen(orderId = 'o1', marketId = 1) {
   return {
     kind: 'order',
@@ -396,11 +422,13 @@ test('RISEx setLeverage uses the write queue and reads back an existing position
   assert.ok(trace.includes('rest:position:1'));
 });
 
-function setOwnedOpenSnapshot(exchange, orderId = 'o1') {
+function setOwnedOpenSnapshot(exchange, orderId = 'o1', overrides = {}) {
   exchange.setRecoverySnapshot({
     running: true,
     config: { displayName: 'BTC-PERP', sizeBase: 0.001 },
-    active: [[orderId, { side: 'buy', price: 60000, sizeBase: 0.001, levelIndex: 2 }]],
+    active: [[orderId, {
+      side: 'buy', price: 60000, sizeBase: 0.001, levelIndex: 2, ...overrides,
+    }]],
   });
 }
 
@@ -731,4 +759,99 @@ test('RISEx reconciliation logs are traceable without exposing the signer key', 
   assert.match(text, /REST open=1.*WS buffered=1/);
   assert.doesNotMatch(text, new RegExp(SIGNER_KEY.slice(2), 'i'));
   assert.doesNotMatch(text, /signature/i);
+});
+
+test('RISEx adopt enriches a snapshot-owned OPEN order and keeps it fetchable', async () => {
+  const openByMarket = new Map([[1, [rawOpen('o-adopt-open')]]]);
+  const { exchange } = makeHarness({ openByMarket, streamEvents: [wsOpen('o-adopt-open')] });
+  setOwnedOpenSnapshot(exchange, 'o-adopt-open');
+  await exchange.init();
+
+  exchange.adoptOrder({
+    orderId: 'o-adopt-open', marketId: 1, side: 'buy', price: 60000,
+    sizeBase: 0.001, levelIndex: 4, clientOrderId: 'client-open',
+  });
+  const [open] = await exchange.fetchOpenOrders(1);
+  assert.equal(open.orderId, 'o-adopt-open');
+  assert.equal(open.levelIndex, 4);
+  assert.equal(open.clientOrderId, 'client-open');
+});
+
+test('RISEx adopt dispatches one downtime FILLED event after listener attachment', async () => {
+  const historyByMarket = new Map([[1, [rawHistory('o-downtime-fill', 'FILLED', '0.001', '59999')]]]);
+  const fillsByMarket = new Map([[1, [rawRestFill('o-downtime-fill', 'f-downtime')]]]);
+  const { exchange } = makeHarness({ historyByMarket, fillsByMarket });
+  setOwnedOpenSnapshot(exchange, 'o-downtime-fill');
+  await exchange.init();
+
+  const active = new Map([['o-downtime-fill', { levelIndex: 2 }]]);
+  const seen = [];
+  exchange.adoptOrder({
+    orderId: 'o-downtime-fill', marketId: 1, side: 'buy', price: 60000,
+    sizeBase: 0.001, levelIndex: 2, clientOrderId: 'client-fill',
+  });
+  exchange.on('fill', (fill) => seen.push({ fill, tracked: active.has(fill.orderId) }));
+  await new Promise((resolve) => setImmediate(resolve));
+  exchange.adoptOrder({
+    orderId: 'o-downtime-fill', marketId: 1, side: 'buy', price: 60000,
+    sizeBase: 0.001, levelIndex: 2, clientOrderId: 'client-fill',
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].tracked, true);
+  assert.equal(seen[0].fill.sizeBase, 0.001);
+  assert.equal(seen[0].fill.price, 59999);
+  assert.equal(seen[0].fill.levelIndex, 2);
+});
+
+test('RISEx adopt dispatches a downtime partial-CANCELLED fill with actual size', async () => {
+  const historyByMarket = new Map([[1, [rawHistory('o-downtime-partial', 'CANCELLED', '0.00025', '59999')]]]);
+  const fillsByMarket = new Map([[1, [rawRestFill('o-downtime-partial', 'f-partial-rest', '0.00025')]]]);
+  const { exchange } = makeHarness({ historyByMarket, fillsByMarket });
+  setOwnedOpenSnapshot(exchange, 'o-downtime-partial', { levelIndex: 3 });
+  await exchange.init();
+  const seen = [];
+
+  exchange.adoptOrder({
+    orderId: 'o-downtime-partial', marketId: 1, side: 'buy', price: 60000,
+    sizeBase: 0.001, levelIndex: 3,
+  });
+  exchange.on('fill', (fill) => seen.push(fill));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].sizeBase, 0.00025);
+  assert.equal(seen[0].levelIndex, 3);
+});
+
+test('RISEx adopt removes downtime zero-fill CANCELLED orders without a fill event', async () => {
+  const historyByMarket = new Map([[1, [rawHistory('o-downtime-cancel', 'CANCELLED', '0')]]]);
+  const { exchange } = makeHarness({ historyByMarket });
+  setOwnedOpenSnapshot(exchange, 'o-downtime-cancel', { levelIndex: 1 });
+  await exchange.init();
+  const seen = [];
+
+  exchange.adoptOrder({
+    orderId: 'o-downtime-cancel', marketId: 1, side: 'buy', price: 60000,
+    sizeBase: 0.001, levelIndex: 1,
+  });
+  exchange.on('fill', (fill) => seen.push(fill));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(seen.length, 0);
+  assert.equal((await exchange.fetchOpenOrders(1)).length, 0);
+});
+
+test('RISEx recovery failures never issue cleanup writes and stale open data is rejected', async () => {
+  const missing = makeHarness();
+  setOwnedOpenSnapshot(missing.exchange, 'o-unknown-downtime');
+  await assert.rejects(missing.exchange.init(), /无法确认开放或终态/);
+  assert.equal(missing.trace.some((item) => item.startsWith('write:')), false);
+
+  let now = 1_000;
+  const openByMarket = new Map([[1, [rawOpen('o-stale-open')]]]);
+  const stale = makeHarness({ openByMarket, streamEvents: [wsOpen('o-stale-open')], now: () => now });
+  setOwnedOpenSnapshot(stale.exchange, 'o-stale-open');
+  await stale.exchange.init();
+  now += 31_001;
+  await assert.rejects(stale.exchange.fetchOpenOrders(1), /过期|健康|30 秒/);
 });

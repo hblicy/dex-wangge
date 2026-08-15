@@ -84,3 +84,25 @@ test('startup passes the persisted snapshot to adapters that enforce ownership',
   assert.equal(received, snapshot);
   assert.doesNotThrow(() => prepareExchangeRecovery({}, snapshot));
 });
+
+test('resume rejects HALTED exchange before calling bot and never cleans up automatically', async () => {
+  let resumed = false;
+  let cancelled = false;
+  const bot = {
+    resume: async () => { resumed = true; },
+    recoverStrayOrders: async () => { cancelled = true; },
+  };
+  const exchange = {
+    dataSource: 'real',
+    getHealth: () => ({ status: 'error', halted: true, reason: '订单状态冲突' }),
+    getMarkets: async () => [{ marketId: 1, displayName: 'BTC-PERP' }],
+  };
+  await assert.rejects(
+    resumeRunningSnapshot(bot, exchange, {
+      running: true, config: { marketId: 99, displayName: 'BTC-PERP' }, active: [],
+    }),
+    /恢复失败.*订单状态冲突/,
+  );
+  assert.equal(resumed, false);
+  assert.equal(cancelled, false);
+});
