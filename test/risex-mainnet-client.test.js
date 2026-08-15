@@ -34,7 +34,7 @@ function makeClient() {
 
 test('RISEx mainnet signed writes send permit_params required by the live API', async () => {
   const { client, calls } = makeClient();
-  await client.updateLeverage(1, 3_000_000_000_000_000_000n);
+  await client.updateLeverage(1, 25n);
   await client.placeOrder({
     market_id: 1,
     side: Side.Long,
@@ -61,5 +61,5 @@ test('RISEx mainnet signed writes send permit_params required by the live API', 
     assert.equal(body.permit_params, PERMIT_PARAMS);
     assert.equal(Object.hasOwn(body, 'permit'), false);
   }
-  assert.equal(calls[0].body.leverage, '3000000000000000000');
+  assert.equal(calls[0].body.leverage, '25');
 });

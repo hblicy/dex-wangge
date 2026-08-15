@@ -448,7 +448,7 @@ test('RISEx setLeverage uses the write queue and reads back an existing position
   exchange.setRecoverySnapshot({ running: true, config: { displayName: 'BTC-PERP', sizeBase: 0.001 }, active: [] });
   await exchange.init();
   assert.equal(await exchange.setLeverage(1, 3), true);
-  assert.deepEqual(called, [1, 3_000_000_000_000_000_000n]);
+  assert.deepEqual(called, [1, 3n]);
   assert.ok(trace.includes('rest:position:1'));
 });
 
@@ -763,7 +763,7 @@ test('RISEx idle authenticated order stream warns without blocking new risk or r
   exchange.lastRestAt = now;
   assert.equal(exchange.getHealth().status, 'warn');
   assert.equal(await exchange.setLeverage(1, 3), true);
-  assert.deepEqual(leverageCall, [1, 3_000_000_000_000_000_000n]);
+  assert.deepEqual(leverageCall, [1, 3n]);
   assert.deepEqual(await exchange.fetchOpenOrders(1), []);
 });
 

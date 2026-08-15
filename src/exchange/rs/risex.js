@@ -6,7 +6,6 @@ import { createRequire } from 'node:module';
 import {
   InfoClient,
   OrderType,
-  parseWad,
   Side,
   StpMode,
   TimeInForce,
@@ -269,7 +268,7 @@ export class RisexExchange extends EventEmitter {
       throw new Error(`RISEx market ${id} 杠杆必须是 1-${market.maxLeverage} 的整数。`);
     }
     return this._serialWrite(id, '设置杠杆', async () => {
-      const response = await this._client.updateLeverage(id, parseWad(String(leverage)));
+      const response = await this._client.updateLeverage(id, BigInt(leverage));
       if (response == null || response === false || response?.success === false) {
         throw new Error(`RISEx market ${id} 设置杠杆失败。`);
       }
