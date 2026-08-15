@@ -11,3 +11,7 @@ export async function initializeExchange(exchange, name, config, logger = consol
     return false;
   }
 }
+
+export function prepareExchangeRecovery(exchange, snapshot) {
+  exchange.setRecoverySnapshot?.(snapshot);
+}

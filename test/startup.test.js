@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createExchange as createRsExchange } from '../src/exchange/rs/index.js';
-import { initializeExchange } from '../src/startup.js';
+import { initializeExchange, prepareExchangeRecovery } from '../src/startup.js';
 import { remapSnapshotMarket, resumeRunningSnapshot } from '../src/recovery.js';
 
 test('RISEx live requires mainnet account and signer credentials', () => {
@@ -74,4 +74,13 @@ test('resume receives remapped id and propagates reconciliation failure', async 
     /reconcile failed/,
   );
   assert.equal(received.config.marketId, 7);
+});
+
+test('startup passes the persisted snapshot to adapters that enforce ownership', () => {
+  let received;
+  const exchange = { setRecoverySnapshot: (snapshot) => { received = snapshot; } };
+  const snapshot = { running: true, active: [['o1', {}]] };
+  prepareExchangeRecovery(exchange, snapshot);
+  assert.equal(received, snapshot);
+  assert.doesNotThrow(() => prepareExchangeRecovery({}, snapshot));
 });

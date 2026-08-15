@@ -1,285 +1,460 @@
-// RisexExchange: LIVE adapter over the community `risex-client` SDK (v0.1.x).
-// Verified against the installed SDK's real API:
-//   InfoClient(opts?:{baseUrl,wsUrl}) . getMarkets/getOrderbook/getPosition/
-//     getOpenOrders/getBalance/getRealizedPnl/getCandles
-//   ExchangeClient({account,signerKey,baseUrl,wsUrl}) . init/placeOrder/
-//     cancelOrder/cancelAllOrders/updateLeverage/closePosition
-//
-// Fills are detected by POLLING open orders (an order we placed that is no
-// longer resting = filled). This avoids the WebSocket private-channel auth
-// dance and is robust for a grid bot. Position / balance / realized PnL and the
-// mark price are polled on the same loop.
-//
-// NOTE: `risex-client` is UNOFFICIAL and ships TESTNET defaults; it has no
-// built-in mainnet REST URL. Real-money mainnet requires a working mainnet
-// REST endpoint via RISEX_API_URL. Always validate on testnet first.
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import path from 'node:path';
+import { createRequire } from 'node:module';
+import { ExchangeClient, InfoClient } from 'risex-client';
+import { RisexOrderState } from './order-state.js';
+import { RisexPrivateStream } from './private-stream.js';
+import {
+  normalizeRestFill,
+  normalizeRestOpenOrder,
+  normalizeRestOrderHistory,
+  normalizeRestPosition,
+  normalizeRisexMarkets,
+} from './normalize.js';
+
+const REQUIRED_CLIENT_VERSION = '0.1.11';
+const MAINNET_API = 'https://api.rise.trade';
+const MAINNET_WS = 'wss://api.rise.trade/ws/';
+const require = createRequire(import.meta.url);
+
+function readInstalledClientVersion() {
+  let current = path.dirname(require.resolve('risex-client'));
+  while (true) {
+    const packageFile = path.join(current, 'package.json');
+    if (fs.existsSync(packageFile)) {
+      const parsed = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
+      if (parsed.name === 'risex-client') return parsed.version;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  throw new Error('无法读取 risex-client package.json。');
+}
+
+function normalizedMarketName(value) {
+  const compact = String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (compact === 'BTCPERP' || compact === 'BTCUSD') return 'BTC-PERP';
+  if (compact === 'ETHPERP' || compact === 'ETHUSD') return 'ETH-PERP';
+  return null;
+}
+
+function strictDecimal(value, field, { positive = false } = {}) {
+  if (typeof value === 'string' && !/^-?(?:\d+(?:\.\d*)?|\.\d+)$/.test(value)) {
+    throw new Error(`RISEx ${field} 不是十进制数字。`);
+  }
+  const result = Number(value);
+  if (!Number.isFinite(result) || (positive && !(result > 0))) {
+    throw new Error(`RISEx ${field} 数值非法。`);
+  }
+  return result;
+}
 
 export class RisexExchange extends EventEmitter {
-  constructor(opts = {}) {
+  constructor(opts = {}, deps = {}) {
     super();
     this.mode = 'live';
-    this.account = opts.account;
+    this.account = String(opts.account || '').toLowerCase();
     this.signerKey = opts.signerKey;
-    this.baseUrl = opts.apiUrl;   // maps to SDK `baseUrl`
+    this.baseUrl = opts.apiUrl;
     this.wsUrl = opts.wsUrl;
-    this.pollMs = opts.pollMs ?? 2500;
-    this._graceMs = this.pollMs * 2; // grace before judging a just-placed order "gone"
-    this.lastOkAt = 0;
-    this.lastError = null;
+    this.network = opts.network;
+    this.dataSource = null;
+    this.connectionState = 'RECONCILING';
+    this.haltReason = null;
     this.markets = new Map();
     this.balance = null;
     this.realizedPnl = null;
+    this.lastOkAt = 0;
+    this.lastRestAt = 0;
+    this.lastOrderAt = 0;
+    this.lastError = null;
+    this.orderState = new RisexOrderState();
+    this._positions = new Map();
+    this._prices = new Map();
+    this._officialOpen = new Map();
+    this._restingIds = new Map();
+    this._pendingRecoveryTerminals = new Map();
+    this._recoverySnapshot = null;
+    this._writeQueue = Promise.resolve();
+    this._bulkCancel = false;
+    this._initializing = false;
+    this._timer = null;
     this._info = null;
     this._client = null;
-    this._tracked = new Map(); // order_id -> {levelIndex, side, price, sizeBase, seen}
-    this._watch = new Set();   // marketIds to poll
-    this._watchTouch = new Map(); // marketId -> last external interest (for idle pruning)
-    this._pos = new Map();     // marketId -> {sizeBase, entryPrice, unrealizedPnl}
-    this._prices = new Map();
-    this._timer = null;
-    this._busy = false;
-    this._txQueue = Promise.resolve(); // serialize on-chain txs (permit nonce is sequential)
+    this._stream = null;
+
+    this._packageVersion = deps.packageVersion;
+    this._infoFactory = deps.infoFactory || ((clientOpts) => new InfoClient(clientOpts));
+    this._clientFactory = deps.clientFactory || ((clientOpts) => new ExchangeClient(clientOpts));
+    this._streamFactory = deps.streamFactory || ((streamOpts) => new RisexPrivateStream(streamOpts));
+    this._now = deps.now || Date.now;
+    this._sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this._defer = deps.defer || queueMicrotask;
+    this._logger = deps.logger || console;
   }
 
-  // RISEx orders are on-chain EIP-712 permits with a SEQUENTIAL nonce. Firing them
-  // concurrently makes two txs grab the same nonce -> `NonceUsed` / reverted.
-  // Run every state-changing SDK call one-at-a-time through this queue.
-  _serial(fn) {
-    const run = this._txQueue.then(fn, fn);
-    this._txQueue = run.then(() => {}, () => {});
-    return run;
+  setRecoverySnapshot(snapshot) {
+    if (!(snapshot?.running && snapshot?.config)) {
+      this._recoverySnapshot = null;
+      return;
+    }
+    if (!Array.isArray(snapshot.active)) throw new Error('RISEx 恢复快照 active 必须是数组。');
+    const fallbackSize = Number(snapshot.config.sizeBase);
+    const active = new Map();
+    for (const entry of snapshot.active) {
+      if (!Array.isArray(entry) || entry.length !== 2) throw new Error('RISEx 恢复快照订单格式非法。');
+      const orderId = String(entry[0]);
+      if (!orderId) throw new Error('RISEx 恢复快照包含空订单 ID。');
+      const info = entry[1] || {};
+      const sizeBase = Number(info.sizeBase ?? fallbackSize);
+      const price = Number(info.price);
+      if ((info.side !== 'buy' && info.side !== 'sell')
+        || !Number.isFinite(sizeBase) || !(sizeBase > 0)
+        || !Number.isFinite(price) || price < 0) {
+        throw new Error(`RISEx 恢复快照订单 ${orderId} 元数据非法。`);
+      }
+      active.set(orderId, {
+        orderId,
+        side: info.side,
+        sizeBase,
+        price,
+        levelIndex: info.levelIndex,
+        clientOrderId: info.clientOrderId,
+        recovery: !!info.recovery,
+        opening: info.opening,
+      });
+    }
+    this._recoverySnapshot = {
+      running: true,
+      displayName: String(snapshot.config.displayName || ''),
+      active,
+    };
   }
 
   async init() {
-    throw new Error('RISEx 实盘已禁用：当前 risex-client 未达到生产可用标准，请改用 RS_MODE=paper。');
+    this._initializing = true;
+    this._setState('RECONCILING', '正在执行 RISEx 启动同步屏障');
+    try {
+      this._assertConfig();
+      this._assertDependencyVersion();
+      this._info = this._infoFactory({ baseUrl: this.baseUrl, wsUrl: this.wsUrl, logLevel: 'error' });
+      this._client = this._clientFactory({
+        account: this.account,
+        signerKey: this.signerKey,
+        baseUrl: this.baseUrl,
+        wsUrl: this.wsUrl,
+        logLevel: 'error',
+      });
+      await this._client.init();
+      if (await this._client.isSignerRegistered() !== true) {
+        throw new Error('RISEx session signer 未注册或已失效。');
+      }
+      await this._loadMarkets();
+      this._stream = this._streamFactory({
+        account: this.account,
+        signerKey: this.signerKey,
+        apiUrl: this.baseUrl,
+        wsUrl: this.wsUrl,
+        marketIds: [...this.markets.keys()],
+        isSignerRegistered: () => this._client.isSignerRegistered(),
+        logger: this._logger,
+      });
+      this._bindStream();
+      this._stream.beginBuffering();
+      await this._stream.connect();
+      await this._stream.waitForOrderSnapshot();
+      const snapshot = await this._readRestSnapshot();
+      this._seedRestSnapshot(snapshot);
+      for (const event of this._stream.drainBuffered()) this._applyPrivateEvent(event);
+      this._validateRecoveryOwnership(snapshot);
+      this._stream.releaseBuffer();
+      this.dataSource = 'real';
+      this.lastOkAt = this._now();
+      this._setState('READY', '私有流认证和 REST/WS 对账完成');
+      return this;
+    } catch (cause) {
+      this.lastError = cause?.message || String(cause);
+      this.dataSource = null;
+      this._setState('HALTED', this.lastError);
+      this._stream?.stop?.();
+      throw cause;
+    } finally {
+      this._initializing = false;
+    }
   }
 
-  /**
-   * Re-establish the exchange connection WITHOUT touching resting orders or the
-   * position: rebuild the SDK clients (fresh EIP-712 domain / HTTP state), drop
-   * a possibly-wedged tx queue, break a stuck poll lock, probe the account, and
-   * restart polling. Order tracking is preserved. Throws if still unreachable.
-   */
   async reconnect() {
-    throw new Error('RISEx 实盘已禁用：当前 risex-client 未达到生产可用标准，请改用 RS_MODE=paper。');
+    throw new Error('RISEx reconnect 尚未完成实现。');
   }
 
-  async getMarkets() { return [...this.markets.values()]; }
+  async getMarkets() {
+    return [...this.markets.values()].map((market) => ({ ...market }));
+  }
 
   async getCandles(marketId, intervalSec = 3600, n = 200) {
-    // 用 V2 接口（旧的 /v1/markets/trading-view-data 在主网返回 NotFound）。
-    // 参数单位均为纳秒；返回 { data:[{ time(ns), open, high, low, close, volume }] }
-    const interval = Math.round(intervalSec * 1e9);
-    const to = Date.now() * 1e6;          // ms -> ns
-    const from = to - interval * n;
-    const base = this.baseUrl || 'https://api.rise.trade';
-    const url = `${base}/v1/markets/id/${marketId}/trading-view-data?interval=${interval}&from=${from}&to=${to}`;
-    try {
-      const res = await fetch(url);
-      if (!res.ok) return [];
-      const j = await res.json();
-      const arr = Array.isArray(j.data) ? j.data : (j.data && j.data.data) || (j.data && j.data.candles) || [];
-      return arr.map((c) => ({
-        time: Number(c.time) / 1e6,        // ns -> ms
-        open: +c.open, high: +c.high, low: +c.low, close: +c.close, volume: +(c.volume || 0),
-      })).filter((c) => Number.isFinite(c.close));
-    } catch { return []; }
-  }
-  async getPrice(marketId, opts = {}) {
-    this._watch.add(Number(marketId));
-    if (opts.touch !== false) this._watchTouch.set(Number(marketId), Date.now()); // external interest
-    try {
-      const book = await this._info.getOrderbook(marketId);
-      const bid = Number(book.bids?.[0]?.[0] ?? book.bids?.[0]?.price);
-      const ask = Number(book.asks?.[0]?.[0] ?? book.asks?.[0]?.price);
-      if (bid && ask) { const mid = (bid + ask) / 2; this._prices.set(Number(marketId), mid); return mid; }
-    } catch { /* fall back to mark */ }
-    return this._prices.get(Number(marketId)) ?? this.markets.get(Number(marketId))?.lastPrice;
-  }
-
-  async setLeverage(marketId, x) {
-    try { return await this._client.updateLeverage(Number(marketId), BigInt(Math.round(x))); }
-    catch (e) { this.emit('error', e); return false; }
-  }
-
-  _steps(marketId, base) { return Math.max(1, Math.round(base / this.markets.get(Number(marketId)).stepSize)); }
-  _ticks(marketId, price) { return Math.round(price / this.markets.get(Number(marketId)).stepPrice); }
-
-  async placeLimitOrder(o) {
-    const mId = Number(o.marketId);
-    const r = await this._serial(() => this._client.placeOrder({
-      market_id: mId,
-      side: o.side === 'buy' ? 0 : 1,
-      order_type: 1,            // Limit
-      price_ticks: this._ticks(mId, o.price),
-      size_steps: this._steps(mId, o.sizeBase),
-      time_in_force: 0,         // GTC
-      // post_only MUST default to false here: RISEx has no order-status endpoint,
-      // so a post-only order silently rejected for crossing simply never appears
-      // in the open-order list — and the poll-based fill detector would then
-      // fabricate a phantom "fill" for it. GTC crossing just fills as taker.
-      post_only: o.postOnly ?? false,
-      reduce_only: !!o.reduceOnly,
-      stp_mode: 0,
-      ttl_units: 0,
-      client_order_id: o.clientOrderId ? String(o.clientOrderId) : undefined,
+    const resolution = intervalSec >= 86400 ? '1D' : String(Math.max(1, Math.round(intervalSec / 60)));
+    const to = Math.floor(this._now() / 1000);
+    const from = to - intervalSec * n;
+    const rows = await this._info.getCandles(Number(marketId), resolution, from, to);
+    if (!Array.isArray(rows)) throw new Error('RISEx candles 响应不是数组。');
+    return rows.map((row) => ({
+      time: strictDecimal(row.time ?? row.timestamp, 'candle time') * 1000,
+      open: strictDecimal(row.open, 'candle open'),
+      high: strictDecimal(row.high, 'candle high'),
+      low: strictDecimal(row.low, 'candle low'),
+      close: strictDecimal(row.close, 'candle close'),
+      volume: strictDecimal(row.volume, 'candle volume'),
     }));
-    const orderId = r.order_id || r.orderId;
-    if (orderId) {
-      this._watch.add(mId);
-      this._tracked.set(String(orderId), { marketId: mId, levelIndex: o.levelIndex, side: o.side, price: o.price, sizeBase: o.sizeBase, seen: false, placedAt: Date.now() });
-    }
-    return { orderId };
   }
 
-  async cancelOrder(marketId, orderId) {
-    this._tracked.delete(String(orderId));
-    return this._serial(() => this._client.cancelOrder({ market_id: Number(marketId), order_id: String(orderId) }));
+  async getPrice(marketId) {
+    const id = Number(marketId);
+    this._assertAllowedMarket(id, '读取价格');
+    const book = await this._info.getOrderbook(id);
+    const bid = strictDecimal(book?.bids?.[0]?.price ?? book?.bids?.[0]?.[0], 'best bid', { positive: true });
+    const ask = strictDecimal(book?.asks?.[0]?.price ?? book?.asks?.[0]?.[0], 'best ask', { positive: true });
+    if (!(ask >= bid)) throw new Error(`RISEx market ${id} orderbook 买卖价倒挂。`);
+    const price = (bid + ask) / 2;
+    this._prices.set(id, price);
+    this.lastRestAt = this._now();
+    this.lastOkAt = this._now();
+    return price;
   }
 
-  async cancelAll(marketId) {
-    // clear tracking first so the poll loop doesn't mistake cancels for fills
-    for (const [id, o] of this._tracked) if (o.marketId === Number(marketId)) this._tracked.delete(id);
-    try { return await this._serial(() => this._client.cancelAllOrders(Number(marketId))); }
-    catch (e) { this.emit('error', e); return false; }
-  }
+  async setLeverage() { throw new Error('RISEx setLeverage 尚未完成实现。'); }
+  async placeLimitOrder() { throw new Error('RISEx placeLimitOrder 尚未完成实现。'); }
+  async cancelOrder() { throw new Error('RISEx cancelOrder 尚未完成实现。'); }
+  async cancelAll() { throw new Error('RISEx cancelAll 尚未完成实现。'); }
 
   getOpenOrders(marketId) {
-    return [...this._tracked.values()].filter((o) => o.marketId === Number(marketId));
+    return [...(this._officialOpen.get(Number(marketId)) || new Map()).values()]
+      .map((order) => ({ ...order }));
   }
 
-  /** REAL resting orders on the exchange for this market (for reconciliation). */
   async fetchOpenOrders(marketId) {
-    const mId = Number(marketId);
-    const open = await this._info.getOpenOrders(this.account, mId);
-    return (Array.isArray(open) ? open : []).map((o) => {
-      const px = Number(o.price ?? (o.price_ticks != null ? o.price_ticks * this.markets.get(mId)?.stepPrice : 0));
-      const side = (typeof o.side === 'number') ? (o.side === 0 ? 'buy' : 'sell')
-        : (/^(0|buy|long)$/i.test(String(o.side)) ? 'buy' : 'sell');
-      return { orderId: String(o.order_id), price: px, side };
-    });
+    if (this.connectionState !== 'READY') {
+      throw new Error(`RISEx 对账不可用：${this.connectionState} ${this.haltReason || ''}`.trim());
+    }
+    return this.getOpenOrders(marketId);
   }
 
-  /** Re-attach a previously-placed order to this adapter's tracking (resume). */
-  adoptOrder({ orderId, marketId, levelIndex, side, price, sizeBase }) {
-    const mId = Number(marketId);
-    this._watch.add(mId);
-    this._tracked.set(String(orderId), {
-      marketId: mId, levelIndex, side, price: Number(price), sizeBase: Number(sizeBase),
-      seen: false, placedAt: Date.now(),
-    });
+  adoptOrder(meta) {
+    const id = String(meta.orderId);
+    const current = this.orderState.get(id);
+    if (!current) throw new Error(`RISEx 无法接管未知订单 ${id}。`);
+    this.orderState.adopt({ ...meta, orderId: id, marketId: Number(meta.marketId) });
   }
 
   getPosition(marketId) {
-    const p = this._pos.get(Number(marketId));
-    return p && p.sizeBase !== 0 ? p : null;
+    const position = this._positions.get(Number(marketId));
+    return position && position.sizeBase !== 0 ? { ...position } : null;
   }
 
-  async closePosition(marketId) { return this._client.closePosition(Number(marketId)); }
+  async closePosition() { throw new Error('RISEx closePosition 尚未完成实现。'); }
+  start() {}
 
-  start() { if (!this._timer) { this._timer = setInterval(() => this._poll(), this.pollMs); this._timer.unref?.(); } }
-  stop() { if (this._timer) { clearInterval(this._timer); this._timer = null; } }
+  stop() {
+    if (this._timer) clearInterval(this._timer);
+    this._timer = null;
+    this._stream?.stop?.();
+  }
 
-  async _poll() {
-    if (this._busy) {
-      // Watchdog: a poll wedged >90s would block polling forever ("数据 Xs 未更新").
-      if (Date.now() - (this._busySince || 0) < 90_000) return;
-      console.log('[RISEx] ⚠ 上一轮轮询卡住超过 90 秒，强制解锁继续轮询。');
+  _assertConfig() {
+    if (this.network !== 'mainnet') throw new Error('RISEx 实盘只支持 mainnet。');
+    if (this.baseUrl !== MAINNET_API) throw new Error(`RISEX_API_URL 必须为 ${MAINNET_API}`);
+    if (this.wsUrl !== MAINNET_WS) throw new Error(`RISEX_WS_URL 必须为 ${MAINNET_WS}`);
+    if (!/^0x[0-9a-f]{40}$/i.test(this.account)) throw new Error('RISEX_ACCOUNT 不是有效 EVM 地址。');
+    if (typeof this.signerKey !== 'string' || !/^0x[0-9a-f]{64}$/i.test(this.signerKey)) {
+      throw new Error('RISEX_SIGNER_KEY 不是有效 32 字节私钥。');
     }
-    this._busy = true; this._busySince = Date.now();
-    try {
-      // prune idle watch entries: no resting orders, no position, and no external
-      // price interest for 10 minutes -> stop polling that market
-      const nowT = Date.now();
-      for (const mId of [...this._watch]) {
-        const hasOrders = [...this._tracked.values()].some((t) => t.marketId === mId);
-        if (!hasOrders && !this._pos.has(mId) && nowT - (this._watchTouch.get(mId) || 0) > 600_000) {
-          this._watch.delete(mId); this._watchTouch.delete(mId);
-        }
-      }
-      for (const mId of this._watch) {
-        // price (awaited so we can record each tracked order's observed range)
-        let px = null;
-        try { px = await this.getPrice(mId, { touch: false }); } catch { /* keep */ }
-        if (px) {
-          this.emit('price', { marketId: mId, price: px });
-          // record the price range each tracked order has lived through — used
-          // below to corroborate "vanished order = fill"
-          for (const t of this._tracked.values()) {
-            if (t.marketId !== mId) continue;
-            t.pxLo = t.pxLo != null ? Math.min(t.pxLo, px) : px;
-            t.pxHi = t.pxHi != null ? Math.max(t.pxHi, px) : px;
-          }
-        }
-        // open orders -> fill detection
-        let open;
-        try { open = await this._info.getOpenOrders(this.account, mId); } catch { open = null; }
-        if (open) {
-          const liveIds = new Set(open.map((o) => String(o.order_id)));
-          for (const o of open) { const t = this._tracked.get(String(o.order_id)); if (t) { t.seen = true; t.goneAttempts = 0; } }
-          const now = Date.now();
-          for (const [id, t] of [...this._tracked]) {
-            if (t.marketId !== mId || liveIds.has(id)) continue;
-            if (!t.seen && now - (t.placedAt || 0) < this._graceMs) continue;
-            // NOTE: the risex-client SDK exposes NO order-status/fill endpoint, so
-            // a fill cannot be POSITIVELY confirmed. To avoid fabricating fills
-            // from a transient data lag (which would spawn runaway same-side
-            // orders), require the order to be ABSENT for several consecutive
-            // polls before concluding it filled. (If a confirmation endpoint
-            // becomes available, switch to filledQty-based confirmation.)
-            t.goneAttempts = (t.goneAttempts || 0) + 1;
-            if (t.goneAttempts < 3) continue;
-            this._tracked.delete(id);
-            // Corroborate with the observed price path: a limit BUY can only fill
-            // if the market came DOWN to its price (sell: up to it). If price
-            // never got within 0.3% of the limit while we watched, the vanished
-            // order can't have filled — it was cancelled (manual cancel on the
-            // website, rejection, ...). Emitting a phantom fill here used to
-            // corrupt stats and spawn a bogus opposite-side replacement.
-            const neverReached = t.side === 'buy'
-              ? (t.pxLo != null && t.pxLo > t.price * 1.003)
-              : (t.pxHi != null && t.pxHi < t.price * 0.997);
-            if (neverReached) {
-              this.emit('error', new Error(`订单 ${id}（${t.side} @ ${t.price}）从盘口消失但价格从未触及该档位，判定为被撤单（不视为成交、不补单）。`));
-              continue;
-            }
-            this.emit('fill', { orderId: id, marketId: mId, side: t.side, price: t.price, sizeBase: t.sizeBase, levelIndex: t.levelIndex });
-          }
-        }
-        // position
-        try {
-          const p = await this._info.getPosition(mId, this.account);
-          if (p && Number(p.size)) {
-            const short = (typeof p.side === 'number') ? p.side === 1 : /^(1|short|sell)$/i.test(String(p.side));
-            const size = Math.abs(Number(p.size)) * (short ? -1 : 1);
-            // RISEx mainnet returns avg_entry_price / mark_price / unrealized_pnl as
-            // BLANK strings; only `quote_amount` (signed quote cost) is populated.
-            // Derive the missing pieces:
-            //   entry ≈ |quote_amount| / |size| ; mark = orderbook mid ; uPnl = size*(mark-entry)
-            const num = (v) => (v != null && v !== '' && Number.isFinite(Number(v))) ? Number(v) : NaN;
-            let entry = num(p.avg_entry_price) || num(p.entry_price) || num(p.average_entry_price);
-            if (!(entry > 0)) {
-              const qa = num(p.quote_amount), sz = Math.abs(Number(p.size));
-              if (Number.isFinite(qa) && sz > 0) entry = Math.abs(qa) / sz;
-            }
-            entry = entry > 0 ? entry : 0;
-            const mark = num(p.mark_price) || this._prices.get(mId) || entry;
-            let uPnl = num(p.unrealized_pnl);
-            if (!Number.isFinite(uPnl)) uPnl = (entry > 0 && mark > 0) ? size * (mark - entry) : 0;
-            const lev = num(p.leverage) || null;
-            this._pos.set(mId, { sizeBase: size, entryPrice: entry, unrealizedPnl: uPnl, leverage: lev });
-          } else { this._pos.delete(mId); }
-        } catch { /* keep last */ }
-      }
-      await this._refreshAccount();
-      this.lastOkAt = Date.now();
-    } catch (e) { this.lastError = e?.message || String(e); this.emit('error', e); }
-    finally { this._busy = false; }
   }
 
-  async _refreshAccount() {
-    try { const b = await this._info.getBalance(this.account); if (b != null) { this.balance = Number(b); this.lastOkAt = Date.now(); } } catch { /* keep */ }
-    try { const r = await this._info.getRealizedPnl(this.account); if (r?.total_realized_pnl != null) this.realizedPnl = Number(r.total_realized_pnl); } catch { /* keep */ }
+  _assertDependencyVersion() {
+    const actual = this._packageVersion ?? readInstalledClientVersion();
+    if (actual !== REQUIRED_CLIENT_VERSION) {
+      throw new Error(`RISEx 要求 risex-client ${REQUIRED_CLIENT_VERSION}，实际为 ${actual}。`);
+    }
+  }
+
+  async _loadMarkets() {
+    const markets = normalizeRisexMarkets(await this._info.getMarkets());
+    this.markets = new Map(markets.map((market) => [market.marketId, market]));
+  }
+
+  _bindStream() {
+    this._stream.on?.('order', (order) => {
+      try { this._applyPrivateEvent({ kind: 'order', data: order }); }
+      catch (error) { this._haltFromAsync(error); }
+    });
+    this._stream.on?.('fill', (fill) => {
+      try { this._applyPrivateEvent({ kind: 'fill', data: fill }); }
+      catch (error) { this._haltFromAsync(error); }
+    });
+    this._stream.on?.('disconnected', () => {
+      if (this.connectionState !== 'HALTED') this._setState('RECONCILING', 'RISEx 私有 WebSocket 已断开');
+    });
+    this._stream.on?.('fatal', (error) => this._haltFromAsync(error));
+  }
+
+  async _readRestSnapshot() {
+    const marketRows = await Promise.all([...this.markets.values()].map(async (market) => {
+      const [openRaw, historyRaw, fillsRaw] = await Promise.all([
+        this._info.getOpenOrders(this.account, market.marketId),
+        this._info.getOrderHistory(this.account, market.marketId, 100),
+        this._info.getAccountTradeHistory(this.account, market.marketId, 100),
+      ]);
+      if (!Array.isArray(openRaw) || !Array.isArray(historyRaw) || !Array.isArray(fillsRaw)) {
+        throw new Error(`RISEx market ${market.marketId} REST 订单快照格式非法。`);
+      }
+      return {
+        market,
+        open: openRaw.map((raw) => normalizeRestOpenOrder(raw, market)),
+        history: historyRaw.map(normalizeRestOrderHistory),
+        fills: fillsRaw.map(normalizeRestFill),
+      };
+    }));
+    const [positionsRaw, balanceRaw] = await Promise.all([
+      this._info.getAllPositions(this.account),
+      this._info.getBalance(this.account),
+    ]);
+    if (!Array.isArray(positionsRaw)) throw new Error('RISEx positions 响应不是数组。');
+    const allowed = new Set(this.markets.keys());
+    const positions = positionsRaw
+      .map(normalizeRestPosition)
+      .filter((position) => position && allowed.has(position.marketId));
+    const balance = strictDecimal(balanceRaw, 'balance');
+    this.lastRestAt = this._now();
+    return { marketRows, positions, balance };
+  }
+
+  _seedRestSnapshot(snapshot) {
+    this._officialOpen = new Map();
+    this._restingIds = new Map();
+    for (const { market, open } of snapshot.marketRows) {
+      const openMap = new Map();
+      for (const order of open) {
+        if (openMap.has(order.orderId)) throw new Error(`RISEx REST 开放订单 ${order.orderId} 重复。`);
+        openMap.set(order.orderId, order);
+        this._restingIds.set(order.orderId, order.restingOrderId);
+        const expected = this._recoverySnapshot?.active.get(order.orderId);
+        this.orderState.track({
+          orderId: order.orderId,
+          marketId: order.marketId,
+          side: order.side,
+          sizeBase: order.sizeBase,
+          price: order.price,
+          levelIndex: expected?.levelIndex,
+          clientOrderId: expected?.clientOrderId,
+          sizeTolerance: market.stepSize / 2,
+        });
+      }
+      this._officialOpen.set(market.marketId, openMap);
+    }
+    this._positions = new Map(snapshot.positions.map((position) => [position.marketId, position]));
+    this.balance = snapshot.balance;
+  }
+
+  _applyPrivateEvent(event) {
+    if (!event || (event.kind !== 'order' && event.kind !== 'fill')) {
+      throw new Error('RISEx 私有流事件类型未知。');
+    }
+    if (!this.markets.has(event.data.marketId)) {
+      throw new Error(`RISEx 私有流收到未允许 market ${event.data.marketId}。`);
+    }
+    if (event.kind === 'fill') {
+      this.orderState.applyFill(event.data);
+      return;
+    }
+    this.lastOrderAt = this._now();
+    const result = this.orderState.applyOrder(event.data);
+    if (result?.pending && !this._initializing) {
+      throw new Error(`RISEx 收到未知订单 ${event.data.orderId} 的状态。`);
+    }
+    if (!result?.terminal) return;
+    this._officialOpen.get(event.data.marketId)?.delete(event.data.orderId);
+    if (result.terminalFill) {
+      const suppressRequote = this._bulkCancel;
+      this._defer(() => this.emit('fill', { ...result.terminalFill, suppressRequote }));
+    }
+  }
+
+  _validateRecoveryOwnership(snapshot) {
+    const open = snapshot.marketRows.flatMap((row) => row.open);
+    const positions = snapshot.positions.filter((position) => position.sizeBase !== 0);
+    if (!this._recoverySnapshot) {
+      if (open.length) throw new Error(`RISEx 没有运行快照却检测到遗留挂单：${open.map((order) => order.orderId).join(', ')}。`);
+      if (positions.length) throw new Error(`RISEx 没有运行快照却检测到遗留仓位：market ${positions.map((position) => position.marketId).join(', ')}。`);
+      if (this.orderState.unknownOrderIds().length) {
+        throw new Error(`RISEx 没有运行快照却收到未知订单：${this.orderState.unknownOrderIds().join(', ')}。`);
+      }
+      return;
+    }
+
+    const displayName = normalizedMarketName(this._recoverySnapshot.displayName);
+    const market = [...this.markets.values()].find((item) => item.displayName === displayName);
+    if (!market) throw new Error(`RISEx 恢复快照市场不受支持：${this._recoverySnapshot.displayName}。`);
+    const expected = this._recoverySnapshot.active;
+    for (const order of open) {
+      if (!expected.has(order.orderId)) throw new Error(`RISEx 检测到快照外订单 ${order.orderId}。`);
+      if (order.marketId !== market.marketId) throw new Error(`RISEx 快照订单 ${order.orderId} 出现在其他市场。`);
+    }
+    for (const position of positions) {
+      if (position.marketId !== market.marketId) {
+        throw new Error(`RISEx 检测到恢复市场之外的遗留仓位 market ${position.marketId}。`);
+      }
+    }
+
+    const history = new Map(snapshot.marketRows.flatMap((row) => row.history).map((order) => [order.orderId, order]));
+    const fillsByOrder = new Map();
+    for (const fill of snapshot.marketRows.flatMap((row) => row.fills)) {
+      const rows = fillsByOrder.get(fill.orderId) || [];
+      rows.push(fill);
+      fillsByOrder.set(fill.orderId, rows);
+    }
+    for (const [orderId, meta] of expected) {
+      const live = this._officialOpen.get(market.marketId)?.get(orderId);
+      if (live) {
+        const record = this.orderState.get(orderId);
+        if (!record || (record.status !== 'OPEN' && record.status !== 'PARTIAL')) {
+          throw new Error(`RISEx 订单 ${orderId} 在 REST 开放但未出现在 Orders WebSocket 快照。`);
+        }
+        this.orderState.adopt({ ...meta, marketId: market.marketId, sizeTolerance: market.stepSize / 2 });
+        continue;
+      }
+      const terminal = history.get(orderId);
+      if (!terminal || (terminal.status !== 'FILLED' && terminal.status !== 'CANCELLED')) {
+        throw new Error(`RISEx 订单 ${orderId} 无法确认开放或终态。`);
+      }
+      const tracked = this.orderState.track({ ...meta, marketId: market.marketId, sizeTolerance: market.stepSize / 2 });
+      for (const fill of (fillsByOrder.get(orderId) || []).sort((a, b) => Number(a.cursor.timestamp - b.cursor.timestamp))) {
+        this.orderState.applyFill(fill);
+      }
+      const result = this.orderState.applyOrder(terminal) ?? tracked;
+      if (!result?.terminal) throw new Error(`RISEx 订单 ${orderId} 终态历史无法合并。`);
+      this._pendingRecoveryTerminals.set(orderId, result);
+    }
+    const unknown = this.orderState.unknownOrderIds();
+    if (unknown.length) throw new Error(`RISEx 私有流存在快照外未知订单：${unknown.join(', ')}。`);
+  }
+
+  _assertAllowedMarket(marketId, action) {
+    if (!this.markets.has(marketId)) throw new Error(`RISEx ${action} 只允许 BTC-PERP/ETH-PERP。`);
+  }
+
+  _setState(next, reason) {
+    if (this.connectionState === 'HALTED' && next !== 'HALTED') return;
+    const previous = this.connectionState;
+    this.connectionState = next;
+    if (next === 'HALTED') this.haltReason = reason;
+    this._logger.log?.(`[RISEx] 状态 ${previous} -> ${next}：${reason}`);
+  }
+
+  _haltFromAsync(error) {
+    const normalized = error instanceof Error ? error : new Error(String(error));
+    this.lastError = normalized.message;
+    this._setState('HALTED', normalized.message);
+    this.emit('error', normalized);
   }
 }

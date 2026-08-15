@@ -18,7 +18,7 @@ import { flushState, loadSnapshot, saveSnapshot } from './persist.js';
 import { createAiService } from './ai/service.js';
 import { enforceRequestSecurity, HttpRequestError, readJsonBody } from './security.js';
 import { SseClientPool } from './sse.js';
-import { initializeExchange } from './startup.js';
+import { initializeExchange, prepareExchangeRecovery } from './startup.js';
 import { remapSnapshotMarket, resumeRunningSnapshot } from './recovery.js';
 import { writeEnvFile } from './envfile.js';
 
@@ -78,6 +78,13 @@ const deExchange = createDeExchange(cfg.de);
 const exExchange = createExExchange(cfg.ex);
 const rsExchange = createRsExchange(cfg.rs);
 
+const snapshots = {
+  de: loadSnapshot('de'),
+  ex: loadSnapshot('ex'),
+  rs: loadSnapshot('rs'),
+};
+prepareExchangeRecovery(rsExchange, snapshots.rs);
+
 const deBot = new GridBot(deExchange, { onChange: (s) => saveSnapshot('de', s) });
 const exBot = new GridBot(exExchange, { onChange: (s) => saveSnapshot('ex', s) });
 const rsBot = new GridBot(rsExchange, { onChange: (s) => saveSnapshot('rs', s) });
@@ -85,9 +92,9 @@ const rsBot = new GridBot(rsExchange, { onChange: (s) => saveSnapshot('rs', s) }
 // Restore cumulative stats / config from the previous run (display continuity).
 // Trading does NOT auto-resume; stray-order cleanup happens after each exchange
 // finishes init (see below).
-deBot.restore(loadSnapshot('de'));
-exBot.restore(loadSnapshot('ex'));
-rsBot.restore(loadSnapshot('rs'));
+deBot.restore(snapshots.de);
+exBot.restore(snapshots.ex);
+rsBot.restore(snapshots.rs);
 
 // Belt-and-suspenders: ensure every exchange always has an 'error' listener so a
 // stray emit can never crash the process (the GridBot also attaches one).
