@@ -132,6 +132,7 @@ function makeHarness({
   openOrdersImpl,
   orderHistoryImpl,
   orderByIdImpl,
+  allPositionsImpl,
   positionReadImpl,
   sleep = async () => {},
   now = () => 1000,
@@ -157,7 +158,10 @@ function makeHarness({
       return orderHistoryImpl ? orderHistoryImpl(marketId) : (historyByMarket.get(marketId) || []);
     },
     async getAccountTradeHistory(_account, marketId) { trace.push(`rest:fills:${marketId}`); return fillsByMarket.get(marketId) || []; },
-    async getAllPositions() { trace.push('rest:positions'); return positions; },
+    async getAllPositions() {
+      trace.push('rest:positions');
+      return allPositionsImpl ? allPositionsImpl() : positions;
+    },
     async getPosition(marketId) {
       trace.push(`rest:position:${marketId}`);
       if (positionReadImpl) return positionReadImpl(marketId);
@@ -469,17 +473,19 @@ test('RISEx place confirmation timeout queries the exact order then halts when s
   assert.ok(trace.includes('read:order:o-missing:1'));
 });
 
-test('RISEx setLeverage uses the write queue and reads back an existing position', async () => {
+test('RISEx setLeverage reads back through the verified all-positions schema', async () => {
   let called;
   const { exchange, trace } = makeHarness({
     positions: [rawPosition('BUY', '0.1', '60000', '1', '3')],
+    positionReadImpl: () => ({ size: '0.1', side: 0, entry_price: '60000', leverage: '3' }),
     updateLeverageImpl: async (marketId, leverage) => { called = [marketId, leverage]; return { success: true }; },
   });
   exchange.setRecoverySnapshot({ running: true, config: { displayName: 'BTC-PERP', sizeBase: 0.001 }, active: [] });
   await exchange.init();
   assert.equal(await exchange.setLeverage(1, 3), true);
   assert.deepEqual(called, [1, 3n]);
-  assert.ok(trace.includes('rest:position:1'));
+  assert.equal(trace.includes('rest:position:1'), false);
+  assert.ok(trace.filter((item) => item === 'rest:positions').length >= 2);
 });
 
 function setOwnedOpenSnapshot(exchange, orderId = 'o1', overrides = {}) {
@@ -758,13 +764,14 @@ test('RISEx HALTED emergency cancel accounts delayed fill only after exact termi
 });
 
 for (const [label, side, expectedSide] of [['long', 'BUY', 1], ['short', 'SELL', 0]]) {
-  test(`RISEx close confirms ${label} is flat twice and always sends reduce-only`, async () => {
+  test(`RISEx close confirms ${label} through all-positions and always sends reduce-only`, async () => {
     const positionRow = rawPosition(side);
-    const positionReads = [positionRow, null, null];
+    let allPositionReads = 0;
     let placed;
-    const { exchange } = makeHarness({
+    const { exchange, trace } = makeHarness({
       positions: [positionRow],
-      positionReadImpl: () => positionReads.shift(),
+      allPositionsImpl: () => (++allPositionReads <= 2 ? [positionRow] : []),
+      positionReadImpl: () => ({ size: '0.001', side: side === 'BUY' ? 0 : 1, entry_price: '60000' }),
       placeOrderImpl: async (params) => { placed = params; return { order_id: `close-${label}` }; },
     });
     exchange.setRecoverySnapshot({
@@ -781,6 +788,8 @@ for (const [label, side, expectedSide] of [['long', 'BUY', 1], ['short', 'SELL',
     assert.equal(placed.reduce_only, true);
     assert.equal(placed.post_only, false);
     assert.equal(placed.stp_mode, 1);
+    assert.equal(trace.includes('rest:position:1'), false);
+    assert.ok(allPositionReads >= 4);
   });
 }
 
@@ -788,7 +797,7 @@ test('RISEx close halts when REST never confirms a flat position', async () => {
   const positionRow = rawPosition();
   const { exchange } = makeHarness({
     positions: [positionRow],
-    positionReadImpl: () => positionRow,
+    allPositionsImpl: () => [positionRow],
     placeOrderImpl: async () => ({ order_id: 'close-stuck' }),
   });
   exchange.setRecoverySnapshot({
@@ -805,9 +814,9 @@ test('RISEx close halts when the REST position read fails after submission', asy
   let reads = 0;
   const { exchange } = makeHarness({
     positions: [positionRow],
-    positionReadImpl: () => {
+    allPositionsImpl: () => {
       reads += 1;
-      if (reads === 1) return positionRow;
+      if (reads <= 2) return [positionRow];
       throw new Error('position unavailable');
     },
     placeOrderImpl: async () => ({ order_id: 'close-rest-error' }),

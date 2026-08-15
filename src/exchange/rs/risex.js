@@ -275,12 +275,10 @@ export class RisexExchange extends EventEmitter {
       }
       const position = this._positions.get(id);
       if (position?.sizeBase) {
-        const confirmed = normalizeRestPosition(await this._info.getPosition(id, this.account));
-        this.lastRestAt = this._now();
+        const confirmed = await this._readPosition(id);
         if (!confirmed || confirmed.sizeBase === 0 || confirmed.leverage !== leverage) {
           throw new Error(`RISEx market ${id} 仓位杠杆回读与目标 ${leverage} 不一致。`);
         }
-        this._positions.set(id, confirmed);
       }
       return true;
     }, { newRisk: true });
@@ -1054,7 +1052,13 @@ export class RisexExchange extends EventEmitter {
 
   async _readPosition(marketId) {
     const id = Number(marketId);
-    const position = normalizeRestPosition(await this._info.getPosition(id, this.account));
+    const rows = await this._info.getAllPositions(this.account);
+    if (!Array.isArray(rows)) throw new Error('RISEx positions 回读响应不是数组。');
+    const matches = rows
+      .map(normalizeRestPosition)
+      .filter((position) => position?.marketId === id);
+    if (matches.length > 1) throw new Error(`RISEx market ${id} 持仓回读重复。`);
+    const position = matches[0] || null;
     this.lastRestAt = this._now();
     if (!position || position.sizeBase === 0) {
       this._positions.delete(id);
