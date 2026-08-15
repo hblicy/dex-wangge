@@ -1,8 +1,16 @@
 import { EventEmitter } from 'node:events';
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
-import { ExchangeClient, InfoClient } from 'risex-client';
+import {
+  ExchangeClient,
+  InfoClient,
+  OrderType,
+  Side,
+  StpMode,
+  TimeInForce,
+} from 'risex-client';
 import { RisexOrderState } from './order-state.js';
 import { RisexPrivateStream } from './private-stream.js';
 import {
@@ -78,6 +86,8 @@ export class RisexExchange extends EventEmitter {
     this._pendingRecoveryTerminals = new Map();
     this._recoverySnapshot = null;
     this._writeQueue = Promise.resolve();
+    this._pendingPlaceCount = 0;
+    this._orderWaiters = new Map();
     this._bulkCancel = false;
     this._initializing = false;
     this._timer = null;
@@ -91,7 +101,7 @@ export class RisexExchange extends EventEmitter {
     this._streamFactory = deps.streamFactory || ((streamOpts) => new RisexPrivateStream(streamOpts));
     this._now = deps.now || Date.now;
     this._sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-    this._defer = deps.defer || queueMicrotask;
+    this._defer = deps.defer || setImmediate;
     this._logger = deps.logger || console;
   }
 
@@ -223,8 +233,103 @@ export class RisexExchange extends EventEmitter {
     return price;
   }
 
-  async setLeverage() { throw new Error('RISEx setLeverage 尚未完成实现。'); }
-  async placeLimitOrder() { throw new Error('RISEx placeLimitOrder 尚未完成实现。'); }
+  async setLeverage(marketId, leverage) {
+    const id = Number(marketId);
+    this._assertWritable(id, '设置杠杆');
+    const market = this.markets.get(id);
+    if (!Number.isSafeInteger(leverage) || leverage <= 0 || leverage > market.maxLeverage) {
+      throw new Error(`RISEx market ${id} 杠杆必须是 1-${market.maxLeverage} 的整数。`);
+    }
+    return this._serialWrite('设置杠杆', async () => {
+      const response = await this._client.updateLeverage(id, BigInt(leverage));
+      if (response == null || response === false || response?.success === false) {
+        throw new Error(`RISEx market ${id} 设置杠杆失败。`);
+      }
+      const position = this._positions.get(id);
+      if (position?.sizeBase) {
+        const confirmed = normalizeRestPosition(await this._info.getPosition(id, this.account));
+        this.lastRestAt = this._now();
+        if (!confirmed || confirmed.sizeBase === 0 || confirmed.leverage !== leverage) {
+          throw new Error(`RISEx market ${id} 仓位杠杆回读与目标 ${leverage} 不一致。`);
+        }
+        this._positions.set(id, confirmed);
+      }
+      return true;
+    });
+  }
+
+  async placeLimitOrder(order) {
+    const marketId = Number(order?.marketId);
+    this._assertWritable(marketId, '下单');
+    if (order.side !== 'buy' && order.side !== 'sell') throw new Error('RISEx 下单 side 必须是 buy/sell。');
+    const requestedPrice = strictDecimal(order.price, '下单价格', { positive: true });
+    const requestedSize = strictDecimal(order.sizeBase, '下单数量', { positive: true });
+    const market = this.markets.get(marketId);
+    const priceTicks = Math.round(requestedPrice / market.stepPrice);
+    const sizeSteps = Math.round(requestedSize / market.stepSize);
+    if (!Number.isSafeInteger(priceTicks) || priceTicks <= 0) throw new Error('RISEx 下单价格无法对齐 price tick。');
+    if (!Number.isSafeInteger(sizeSteps) || sizeSteps <= 0) throw new Error('RISEx 下单数量无法对齐 size step。');
+    const price = priceTicks * market.stepPrice;
+    const sizeBase = sizeSteps * market.stepSize;
+    if (sizeBase + market.stepSize / 2 < market.minOrderSize) {
+      throw new Error(`RISEx ${market.displayName} 下单数量低于最小值 ${market.minOrderSize}。`);
+    }
+    const clientOrderId = BigInt(`0x${randomBytes(8).toString('hex')}`).toString();
+    const meta = {
+      marketId,
+      side: order.side,
+      price,
+      sizeBase,
+      levelIndex: order.levelIndex,
+      clientOrderId,
+      reduceOnly: order.reduceOnly === true,
+      sizeTolerance: market.stepSize / 2,
+    };
+
+    this._pendingPlaceCount += 1;
+    try {
+      return await this._serialWrite('限价下单', async () => {
+        const response = await this._client.placeOrder({
+          market_id: marketId,
+          side: order.side === 'buy' ? Side.Long : Side.Short,
+          order_type: OrderType.Limit,
+          price_ticks: priceTicks,
+          size_steps: sizeSteps,
+          time_in_force: TimeInForce.GoodTillCancelled,
+          post_only: false,
+          reduce_only: meta.reduceOnly,
+          stp_mode: StpMode.ExpireTaker,
+          ttl_units: 0,
+          client_order_id: clientOrderId,
+        });
+        if (typeof response?.order_id !== 'string' || !response.order_id) {
+          this._haltAndThrow('RISEx 下单响应缺少非空字符串订单 ID。');
+        }
+        const orderId = response.order_id;
+        const result = this.orderState.track({ ...meta, orderId });
+        this._handleOrderResult(result, { ...meta, orderId });
+        this._syncOfficialOrder(orderId);
+
+        let record = this.orderState.get(orderId);
+        if (record?.status === 'PENDING') {
+          await this._waitForOrderUpdate(orderId, 10_000);
+          record = this.orderState.get(orderId);
+        }
+        if (record?.status === 'PENDING') {
+          await this._confirmOrderFromRest(orderId, marketId);
+          record = this.orderState.get(orderId);
+        }
+        if (!record || record.status === 'PENDING') {
+          this._haltAndThrow(`RISEx 订单 ${orderId} 经 WebSocket 超时且 REST 无法确认。`);
+        }
+        this._syncOfficialOrder(orderId);
+        return { orderId };
+      });
+    } finally {
+      this._pendingPlaceCount -= 1;
+      if (this._pendingPlaceCount === 0) this._assertNoUnexpectedPrivateOrders();
+    }
+  }
   async cancelOrder() { throw new Error('RISEx cancelOrder 尚未完成实现。'); }
   async cancelAll() { throw new Error('RISEx cancelAll 尚未完成实现。'); }
 
@@ -364,20 +469,122 @@ export class RisexExchange extends EventEmitter {
       throw new Error(`RISEx 私有流收到未允许 market ${event.data.marketId}。`);
     }
     if (event.kind === 'fill') {
-      this.orderState.applyFill(event.data);
+      const result = this.orderState.applyFill(event.data);
+      if (result?.pending && !this._initializing && this._pendingPlaceCount === 0) {
+        throw new Error(`RISEx 收到未知订单 ${event.data.orderId} 的成交。`);
+      }
       return;
     }
     this.lastOrderAt = this._now();
     const result = this.orderState.applyOrder(event.data);
-    if (result?.pending && !this._initializing) {
+    if (result?.pending && !this._initializing && this._pendingPlaceCount === 0) {
       throw new Error(`RISEx 收到未知订单 ${event.data.orderId} 的状态。`);
     }
+    this._handleOrderResult(result, event.data);
+    this._syncOfficialOrder(event.data.orderId);
+    this._notifyOrderWaiters(event.data.orderId);
+  }
+
+  _handleOrderResult(result, context) {
     if (!result?.terminal) return;
-    this._officialOpen.get(event.data.marketId)?.delete(event.data.orderId);
-    if (result.terminalFill) {
-      const suppressRequote = this._bulkCancel;
-      this._defer(() => this.emit('fill', { ...result.terminalFill, suppressRequote }));
+    this._officialOpen.get(Number(context.marketId))?.delete(String(context.orderId));
+    if (!result.terminalFill) return;
+    const suppressRequote = this._bulkCancel;
+    this._defer(() => this.emit('fill', { ...result.terminalFill, suppressRequote }));
+  }
+
+  _syncOfficialOrder(orderId) {
+    const record = this.orderState.get(orderId);
+    if (!record) return;
+    const open = this._officialOpen.get(record.marketId);
+    if (!open) throw new Error(`RISEx market ${record.marketId} 缺少开放订单容器。`);
+    if (record.status === 'OPEN' || record.status === 'PARTIAL') {
+      open.set(record.orderId, {
+        orderId: record.orderId,
+        marketId: record.marketId,
+        side: record.side,
+        price: record.price,
+        sizeBase: record.sizeBase,
+        reduceOnly: record.meta.reduceOnly === true,
+        levelIndex: record.meta.levelIndex,
+        clientOrderId: record.meta.clientOrderId,
+      });
+      return;
     }
+    if (record.status === 'FILLED' || record.status === 'CANCELLED') open.delete(record.orderId);
+  }
+
+  _notifyOrderWaiters(orderId) {
+    const id = String(orderId);
+    const waiters = this._orderWaiters.get(id);
+    if (!waiters) return;
+    this._orderWaiters.delete(id);
+    for (const resolve of waiters) resolve();
+  }
+
+  async _waitForOrderUpdate(orderId, timeoutMs) {
+    const id = String(orderId);
+    let resolveUpdate;
+    const update = new Promise((resolve) => { resolveUpdate = resolve; });
+    const waiters = this._orderWaiters.get(id) || new Set();
+    waiters.add(resolveUpdate);
+    this._orderWaiters.set(id, waiters);
+    try {
+      await Promise.race([update, this._sleep(timeoutMs)]);
+    } finally {
+      const current = this._orderWaiters.get(id);
+      current?.delete(resolveUpdate);
+      if (current?.size === 0) this._orderWaiters.delete(id);
+    }
+  }
+
+  async _confirmOrderFromRest(orderId, marketId) {
+    const rows = await this._info.getOrderHistory(this.account, marketId, 100);
+    if (!Array.isArray(rows)) throw new Error(`RISEx market ${marketId} REST 历史订单格式非法。`);
+    this.lastRestAt = this._now();
+    const confirmed = rows.map(normalizeRestOrderHistory).find((order) => order.orderId === orderId);
+    if (!confirmed) return false;
+    const result = this.orderState.applyOrder(confirmed);
+    this._handleOrderResult(result, confirmed);
+    this._syncOfficialOrder(orderId);
+    return true;
+  }
+
+  _assertWritable(marketId, action) {
+    if (this.connectionState !== 'READY') {
+      throw new Error(`RISEx ${action}被拒绝：${this.connectionState} ${this.haltReason || ''}`.trim());
+    }
+    if (this._bulkCancel) throw new Error(`RISEx ${action}被拒绝：正在批量撤单。`);
+    this._assertAllowedMarket(marketId, action);
+  }
+
+  _serialWrite(action, operation) {
+    const run = this._writeQueue.then(async () => {
+      const startedAt = this._now();
+      this._logger.log?.(`[RISEx] 写操作开始：${action}`);
+      try {
+        const result = await operation();
+        this._logger.log?.(`[RISEx] 写操作完成：${action}，耗时 ${this._now() - startedAt}ms`);
+        return result;
+      } catch (error) {
+        this._logger.error?.(`[RISEx] 写操作失败：${action}：${error?.message || String(error)}`);
+        throw error;
+      }
+    });
+    this._writeQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  _assertNoUnexpectedPrivateOrders() {
+    const unknown = this.orderState.unknownOrderIds();
+    if (unknown.length) this._haltAndThrow(`RISEx 私有流收到无法归属的订单：${unknown.join(', ')}。`);
+  }
+
+  _haltAndThrow(message) {
+    const error = new Error(message);
+    this.lastError = message;
+    this._setState('HALTED', message);
+    throw error;
   }
 
   _validateRecoveryOwnership(snapshot) {
