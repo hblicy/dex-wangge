@@ -14,6 +14,7 @@
 - RISEx mainnet 的订单写接口（place/cancel/cancel-all）使用 `permit`，账户参数接口（目前 leverage）使用 `permit_params`；杠杆动作哈希必须包含 `RISE_PERPS_UPDATE_LEVERAGE_V1` 类型哈希并按 `uint16/uint8` 编码，permit 必须使用链上状态的下一 `nonce_anchor`。`risex-client 0.1.11` 的杠杆字段、杠杆编码和 nonce 行为与当前主网不兼容，写操作必须经过本地 `mainnet-client.js` 兼容层。
 - 禁止自动运行任何 RISEx 真实写入验证；真实账户验收必须由用户明确执行只读私有验证后，再人工使用最小资金操作。
 - 下单、设置杠杆、撤单和平仓等关键动作只有在交易所明确确认成功后，才能推进本地状态。
+- 网格补单只能由交易所明确确认的终态成交驱动；相邻终态订单必须先从活动层腾空，再串行确认反向替代单，完成后才能持久化。禁止按配置挂单总数盲目补单或静默丢弃同层在途补单。
 - RISEx 定时只读刷新只允许在 `READY` 状态执行；`RECONCILING`/`HALTED` 期间应记录跳过，不得把状态机拒绝记作 REST 刷新故障。
 - GitHub 发布统一使用已登录的 GitHub CLI；需要联网的认证、推送和 PR 命令在受限沙箱外执行，避免网络限制导致认证误判。
 - 崩溃恢复以持久化的市场名称为主键；旧 `marketId` 必须在恢复前重新解析，并等待首次挂单对账完成。

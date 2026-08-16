@@ -393,9 +393,99 @@ test('bulk-cancel fill is accounted but never re-quoted', async () => {
     levelIndex: order.levelIndex,
     suppressRequote: true,
   });
-  await new Promise((resolve) => setImmediate(resolve));
+  await bot._fillQueue;
   assert.equal(exchange.nextId, beforePlacements);
   assert.equal(bot.fills[0].size, 0.25);
+  bot._stopReconcileTimer();
+});
+
+test('fill persistence waits for the confirmed replacement order', async () => {
+  const snapshots = [];
+  const exchange = new FakeExchange();
+  const bot = new GridBot(exchange, {
+    onChange: (snapshot) => snapshots.push(snapshot),
+    logger: { log() {} },
+  });
+  await bot.start(config);
+  const [orderId, order] = [...bot.active].find(([, item]) => item.levelIndex === 1);
+  exchange.orders.delete(orderId);
+  const original = exchange.placeLimitOrder.bind(exchange);
+  let releasePlacement;
+  const placementGate = new Promise((resolve) => { releasePlacement = resolve; });
+  exchange.placeLimitOrder = async (next) => {
+    await placementGate;
+    return original(next);
+  };
+
+  exchange.emit('fill', {
+    orderId,
+    marketId: config.marketId,
+    side: order.side,
+    price: order.price,
+    sizeBase: order.sizeBase,
+    levelIndex: order.levelIndex,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(snapshots.at(-1).active.length, 4);
+
+  releasePlacement();
+  await bot._fillQueue;
+  assert.equal(snapshots.at(-1).active.length, 4);
+  bot._stopReconcileTimer();
+});
+
+test('same-level placement waits for the in-flight equivalent order', async () => {
+  const exchange = new FakeExchange();
+  const bot = new GridBot(exchange);
+  bot.config = { ...config };
+  bot.running = true;
+  let releasePlacement;
+  const placementGate = new Promise((resolve) => { releasePlacement = resolve; });
+  const original = exchange.placeLimitOrder.bind(exchange);
+  exchange.placeLimitOrder = async (order) => {
+    await placementGate;
+    return original(order);
+  };
+  const intent = { levelIndex: 2, side: 'sell', price: 100, sizeBase: 1, opening: false };
+
+  const first = bot._place(intent);
+  const second = bot._place(intent);
+  let secondDone = false;
+  second.then(() => { secondDone = true; });
+  await Promise.resolve();
+
+  assert.equal(secondDone, false);
+
+  releasePlacement();
+  assert.equal((await first).status, 'placed');
+  assert.equal((await second).status, 'covered');
+  assert.equal(exchange.orders.size, 1);
+});
+
+test('a burst of adjacent fills vacates every terminal level before replacements', async () => {
+  const exchange = new FakeExchange();
+  const bot = new GridBot(exchange, { logger: { log() {} } });
+  await bot.start(config);
+  const buys = [...bot.active.entries()]
+    .filter(([, order]) => order.side === 'buy')
+    .sort((left, right) => left[1].levelIndex - right[1].levelIndex);
+
+  for (const [orderId, order] of buys) {
+    exchange.orders.delete(orderId);
+    exchange.emit('fill', {
+      orderId,
+      marketId: config.marketId,
+      side: order.side,
+      price: order.price,
+      sizeBase: order.sizeBase,
+      levelIndex: order.levelIndex,
+    });
+  }
+  await bot._fillQueue;
+
+  assert.equal(bot.active.size, 4);
+  assert.deepEqual([...bot.active.values()].map((order) => order.levelIndex).sort(), [1, 2, 3, 4]);
   bot._stopReconcileTimer();
 });
 

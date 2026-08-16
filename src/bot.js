@@ -28,12 +28,28 @@ export class GridBot {
     this._placeFails = 0;          // cumulative order-placement failures
     this._lastFailAt = 0;
     this._exchangeOpenOrders = null; // last reconciled real open-order count
-    this._pendingLevels = new Set(); // levels with a placement in flight (dedup guard)
+    this._pendingLevels = new Map(); // level -> in-flight placement promise (dedup guard)
     this._recoveryOccupied = new Set(); // recovery: real exchange-occupied levels (from reconcile)
     this._reconTimer = null;
     this.recovery = false;          // standalone reduce-only recovery mode
     this._onChange = typeof opts.onChange === 'function' ? opts.onChange : null; // persistence hook
-    this._onFill = (f) => this._handleFill(f);
+    this._logger = opts.logger || console;
+    this._fillQueue = Promise.resolve(); // serialize fill -> replacement -> persistence
+    this._onFill = (f) => {
+      let tracked;
+      if (this.running && this.config && f.marketId === this.config.marketId) {
+        const orderId = String(f.orderId);
+        tracked = this.active.get(orderId);
+        // Vacate every confirmed terminal level as soon as its event arrives.
+        // RISEx can deliver several adjacent fills while the first signed
+        // replacement is still pending; leaving later terminal orders in active
+        // makes an earlier replacement look like a conflicting resting order.
+        this.active.delete(orderId);
+      }
+      this._fillQueue = this._fillQueue
+        .then(() => this._handleFill(f, tracked))
+        .catch((error) => this._handleExError(error));
+    };
     this._onPrice = (p) => this._handlePrice(p);
     // CRITICAL: an EventEmitter that emits 'error' with no listener crashes the
     // whole Node process. Adapters emit 'error' on cancelled/rejected orders, so
@@ -347,7 +363,7 @@ export class GridBot {
     // ---- seed the ladder (every seed order is an OPENING leg) ----
     const seeds = seedOrders({ levels: this.grid.levels, price: this.lastPrice, mode: this.config.mode, spacing: this.grid.spacing });
     for (const s of seeds) {
-      if (await this._place({ ...s, opening: true })) continue;
+      if ((await this._place({ ...s, opening: true })).status === 'placed') continue;
       let cleanupError = null;
       try { await this._requireCancelAll(market.marketId, '初始挂单失败清理'); }
       catch (e) { cleanupError = e; }
@@ -507,41 +523,65 @@ export class GridBot {
   async _place(o) {
     const opening = o.opening !== false;
     const reduceOnly = o.reduceOnly ?? isReduceOnly(o.side, this.config.mode);
+    const lvl = o.levelIndex;
+    const sizeBase = Number(o.sizeBase) > 0 ? Number(o.sizeBase) : this.config.sizeBase; // per-order override (partial fills)
     // Back-off: while paused (after a burst of cancellations / collateral
     // rejections) do not place new OPENING orders. CLOSING / reduce-only /
     // recovery legs need no extra margin and are never blocked — dropping a
     // take-profit leg would strand its inventory without an exit order.
-    if (opening && !o.recovery && this._refillPausedUntil && Date.now() < this._refillPausedUntil) return false;
+    if (opening && !o.recovery && this._refillPausedUntil && Date.now() < this._refillPausedUntil) {
+      return { status: 'blocked', reason: `level ${lvl} 自动补单仍在退避期` };
+    }
     // INVARIANT: at most ONE resting order per grid level. If this level is
-    // already covered (or a placement for it is in flight), skip. Stacking a
+    // already covered (or a placement for it is in flight), wait and verify. Stacking a
     // second order on an occupied level is exactly what made the open-order
     // count creep up over time (replacement-one-rung-away colliding with the
     // order already resting there).
-    const lvl = o.levelIndex;
-    if (this._pendingLevels.has(lvl)) return false;
-    for (const a of this.active.values()) if (a.levelIndex === lvl) return false;
-    this._pendingLevels.add(lvl);
-    const seq = (++this._coidSeq) % 1_000_000;
-    const clientOrderId = Number(`${Date.now() % 1_000_000_0}${String(seq).padStart(6, '0')}`);
-    const sizeBase = Number(o.sizeBase) > 0 ? Number(o.sizeBase) : this.config.sizeBase; // per-order override (partial fills)
-    try {
-      const r = await this.ex.placeLimitOrder({
-        marketId: this.config.marketId, side: o.side, price: o.price,
-        sizeBase, reduceOnly,
-        levelIndex: o.levelIndex, clientOrderId,
-      }).catch((e) => {
+    const pending = this._pendingLevels.get(lvl);
+    if (pending) {
+      const pendingResult = await pending;
+      if (pendingResult.status !== 'placed') return pendingResult;
+    }
+    const occupied = [...this.active.entries()].find(([, active]) => active.levelIndex === lvl);
+    if (occupied) {
+      const [orderId, active] = occupied;
+      const activeSize = Number(active.sizeBase ?? this.config.sizeBase);
+      const equivalent = active.side === o.side
+        && Number(active.price) === Number(o.price)
+        && activeSize === sizeBase
+        && active.opening === opening;
+      if (equivalent) return { status: 'covered', orderId };
+      const reason = `level ${lvl} 已被不等价订单 ${orderId} 占用（现有 ${active.side} @ ${active.price}，待补 ${o.side} @ ${o.price}）`;
+      this._alert(`❌ 网格补单冲突：${reason}。未重复下单，请检查交易所挂单。`);
+      return { status: 'blocked', reason };
+    }
+
+    const placement = (async () => {
+      const seq = (++this._coidSeq) % 1_000_000;
+      const clientOrderId = Number(`${Date.now() % 1_000_000_0}${String(seq).padStart(6, '0')}`);
+      try {
+        const r = await this.ex.placeLimitOrder({
+          marketId: this.config.marketId, side: o.side, price: o.price,
+          sizeBase, reduceOnly,
+          levelIndex: o.levelIndex, clientOrderId,
+        });
+        if (r?.orderId) {
+          this.active.set(String(r.orderId), { levelIndex: lvl, side: o.side, price: o.price, sizeBase, opening, recovery: !!o.recovery, placedAt: Date.now() });
+          return { status: 'placed', orderId: String(r.orderId) };
+        }
+        return { status: 'failed', reason: `level ${lvl} 下单响应缺少订单 ID` };
+      } catch (error) {
         this._placeFails++; this._lastFailAt = Date.now();
-        this._alert('下单失败: ' + e.message);
+        this._alert('下单失败: ' + error.message);
         this._queueRetry({ ...o, opening, reduceOnly, sizeBase }); // closing legs get retried
-        return null;
-      });
-      if (r?.orderId) {
-        this.active.set(String(r.orderId), { levelIndex: lvl, side: o.side, price: o.price, sizeBase, opening, recovery: !!o.recovery, placedAt: Date.now() });
-        return true;
+        return { status: 'failed', reason: error?.message || String(error) };
       }
-      return false;
+    })();
+    this._pendingLevels.set(lvl, placement);
+    try {
+      return await placement;
     } finally {
-      this._pendingLevels.delete(lvl);
+      if (this._pendingLevels.get(lvl) === placement) this._pendingLevels.delete(lvl);
     }
   }
 
@@ -567,14 +607,17 @@ export class GridBot {
     const now = Date.now();
     const due = [];
     this._retryQueue = this._retryQueue.filter((o) => (o._nextAt <= now ? (due.push(o), false) : true));
-    for (const o of due) this._place(o); // _place re-queues on failure with tries+1
+    for (const o of due) {
+      this._place(o).then((result) => {
+        if (result.status === 'placed') this._changed();
+      }).catch((error) => this._handleExError(error)); // _place re-queues on failure with tries+1
+    }
   }
 
-  _handleFill(f) {
+  async _handleFill(f, tracked) {
     if (!this.running || f.marketId !== this.config.marketId) return;
     const id = String(f.orderId);
-    const act = this.active.get(id);
-    this.active.delete(id);
+    const act = tracked;
     const levelIndex = act?.levelIndex ?? f.levelIndex;
     const fillPrice = Number.isFinite(f.price) ? f.price : (act?.price ?? 0);
     const fillSize = Number.isFinite(f.sizeBase) ? f.sizeBase : this.config.sizeBase;
@@ -604,7 +647,9 @@ export class GridBot {
       if (repl && !this.outOfRange && this.running) {
         repl.opening = closing; // replacement is the opposite leg
         if (fillSize > 0) repl.sizeBase = fillSize; // partial fill: mirror the actually-filled qty
-        this._place(repl);
+        const startedAt = Date.now();
+        const result = await this._place(repl);
+        this._logger.log?.(`[网格补单] order=${id} level=${levelIndex} -> level=${repl.levelIndex} result=${result.status} elapsed=${Date.now() - startedAt}ms`);
       }
     }
     this._changed();
@@ -681,14 +726,14 @@ export class GridBot {
         for (let lv = L - sp; lv > price && room(); lv -= sp) {
           const idx = Math.round((lv - lvl0) / sp);
           if (existing.has(idx)) continue;
-          if (await this._place({ levelIndex: idx, side: 'sell', price: lv, reduceOnly: true, recovery: true, opening: false })) placed++;
+          if ((await this._place({ levelIndex: idx, side: 'sell', price: lv, reduceOnly: true, recovery: true, opening: false })).status === 'placed') placed++;
         }
       } else if (!long && price > U) {
         // 突破上边界、手里是空头：在「上边界 ↔ 现价」之间挂 reduce-only 买单
         for (let lv = U + sp; lv < price && room(); lv += sp) {
           const idx = Math.round((lv - lvl0) / sp);
           if (existing.has(idx)) continue;
-          if (await this._place({ levelIndex: idx, side: 'buy', price: lv, reduceOnly: true, recovery: true, opening: false })) placed++;
+          if ((await this._place({ levelIndex: idx, side: 'buy', price: lv, reduceOnly: true, recovery: true, opening: false })).status === 'placed') placed++;
         }
       }
       if (placed) {
@@ -878,7 +923,7 @@ export class GridBot {
         for (let k = 0; k < HARD_MAX && existing.size + placed < need; k++, lv += sp) {
           const idx = Math.round(lv / sp);
           if (existing.has(idx)) continue;
-          if (await this._place({ levelIndex: idx, side: 'sell', price: lv, reduceOnly: true, recovery: true, opening: false })) placed++;
+          if ((await this._place({ levelIndex: idx, side: 'sell', price: lv, reduceOnly: true, recovery: true, opening: false })).status === 'placed') placed++;
         }
       } else {
         let lv = Math.floor(price / sp) * sp; if (lv >= price) lv -= sp;
@@ -886,7 +931,7 @@ export class GridBot {
         for (let k = 0; k < HARD_MAX && existing.size + placed < need; k++, lv -= sp) {
           const idx = Math.round(lv / sp);
           if (existing.has(idx)) continue;
-          if (await this._place({ levelIndex: idx, side: 'buy', price: lv, reduceOnly: true, recovery: true, opening: false })) placed++;
+          if ((await this._place({ levelIndex: idx, side: 'buy', price: lv, reduceOnly: true, recovery: true, opening: false })).status === 'placed') placed++;
         }
       }
       if (placed) this._changed();
