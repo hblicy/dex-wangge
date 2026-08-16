@@ -3,6 +3,7 @@ import { POPDEX_EXPECTED_MARKETS } from './constants.js';
 
 const INTEGER_STRING = /^(?:0|[1-9]\d*)$/;
 const DECIMAL_STRING = /^(?:0|[1-9]\d*)(?:\.\d+)?$/;
+const SIGNED_DECIMAL_STRING = /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/;
 
 export function strictAddress(value, field) {
   if (typeof value !== 'string' || !isAddress(value)) {
@@ -85,5 +86,88 @@ export function normalizeMarket(value) {
     minOrderSize: boundedNumber(expected.minQty, `${value.symbol} minQty`),
     minNotional: boundedNumber(expected.minNotional, `${value.symbol} minNotional`),
     defaultLeverage,
+  };
+}
+
+function strictNonEmptyString(value, field) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`PopDEX ${field} 必须是非空字符串。`);
+  }
+  return value;
+}
+
+function strictTargetSymbol(value, field) {
+  const symbol = strictNonEmptyString(value, field);
+  if (!(symbol in POPDEX_EXPECTED_MARKETS)) {
+    throw new Error(`PopDEX ${field} ${symbol} 不在白名单。`);
+  }
+  return symbol;
+}
+
+function strictOptionalDecimal(value, field) {
+  return value === undefined || value === null
+    ? value
+    : strictDecimalString(value, field);
+}
+
+function strictOptionalSignedDecimal(value, field) {
+  if (value === undefined || value === null) return value;
+  if (typeof value !== 'string' || !SIGNED_DECIMAL_STRING.test(value)) {
+    throw new Error(`PopDEX ${field} 必须是有符号十进制字符串。`);
+  }
+  return value;
+}
+
+export function normalizeOrder(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('PopDEX order 必须是对象。');
+  }
+  const orderId = strictIntegerString(value.orderId, 'order.orderId');
+  const clientOrderId = value.clientOrderId === undefined || value.clientOrderId === null
+    ? value.clientOrderId
+    : strictNonEmptyString(value.clientOrderId, 'order.clientOrderId');
+  return {
+    ...value,
+    orderId,
+    clientOrderId,
+    symbol: strictTargetSymbol(value.symbol, 'order.symbol'),
+    side: strictNonEmptyString(value.side, 'order.side'),
+    status: strictNonEmptyString(value.status, 'order.status'),
+    price: strictOptionalDecimal(value.price, 'order.price'),
+    qty: strictOptionalDecimal(value.qty, 'order.qty'),
+    filledQty: strictOptionalDecimal(value.filledQty, 'order.filledQty'),
+  };
+}
+
+export function normalizeFill(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('PopDEX fill 必须是对象。');
+  }
+  const rawFillId = value.fillId ?? value.tradeId;
+  if (value.fillId !== undefined && value.tradeId !== undefined && value.fillId !== value.tradeId) {
+    throw new Error('PopDEX fill.fillId 与 fill.tradeId 冲突。');
+  }
+  return {
+    ...value,
+    fillId: strictIntegerString(rawFillId, 'fill.fillId'),
+    orderId: strictIntegerString(value.orderId, 'fill.orderId'),
+    symbol: strictTargetSymbol(value.symbol, 'fill.symbol'),
+    side: strictNonEmptyString(value.side, 'fill.side'),
+    execPrice: strictOptionalDecimal(value.execPrice, 'fill.execPrice'),
+    execQty: strictOptionalDecimal(value.execQty, 'fill.execQty'),
+  };
+}
+
+export function normalizePosition(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('PopDEX position 必须是对象。');
+  }
+  return {
+    ...value,
+    symbol: strictTargetSymbol(value.symbol, 'position.symbol'),
+    positionSide: strictNonEmptyString(value.positionSide, 'position.positionSide'),
+    holdQty: strictOptionalDecimal(value.holdQty, 'position.holdQty'),
+    avgOpenPrice: strictOptionalDecimal(value.avgOpenPrice, 'position.avgOpenPrice'),
+    unrealizedPnl: strictOptionalSignedDecimal(value.unrealizedPnl, 'position.unrealizedPnl'),
   };
 }

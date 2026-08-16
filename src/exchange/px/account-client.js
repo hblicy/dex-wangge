@@ -1,0 +1,182 @@
+import { POPDEX_API_BASE, POPDEX_EXPECTED_MARKETS, POPDEX_WEB_BASE } from './constants.js';
+import {
+  normalizeFill,
+  normalizeOrder,
+  normalizePosition,
+  strictAddress,
+  strictIntegerString,
+} from './normalize.js';
+
+const ACCOUNT_HEADERS = Object.freeze({
+  Accept: 'application/json',
+  website: 'mix',
+  terminaltype: '1',
+  language: 'en',
+  locale: 'en',
+  enterPointSource: 'web',
+});
+
+function sanitizedCause(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/[\r\n]+/g, ' ').slice(0, 300);
+}
+
+function targetSymbol(symbol) {
+  if (typeof symbol !== 'string' || !(symbol in POPDEX_EXPECTED_MARKETS)) {
+    throw new Error(`PopDEX symbol ${String(symbol)} 不在白名单。`);
+  }
+  return symbol;
+}
+
+function listFrom(payload, keys, label) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== 'object') {
+    throw new Error(`PopDEX ${label} 必须是数组或包含数组的对象。`);
+  }
+  for (const key of keys) {
+    if (Object.hasOwn(payload, key)) {
+      if (!Array.isArray(payload[key])) {
+        throw new Error(`PopDEX ${label}.${key} 必须是数组。`);
+      }
+      return payload[key];
+    }
+  }
+  throw new Error(`PopDEX ${label} 缺少已验证的数组字段 ${keys.join('/')}。`);
+}
+
+function attachCursor(items, payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return items;
+  const cursor = payload.cursor ?? payload.nextCursor;
+  if (cursor === undefined || cursor === null || cursor === '') return items;
+  const exactCursor = strictIntegerString(cursor, 'cursor');
+  Object.defineProperty(items, 'cursor', {
+    value: exactCursor,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  return items;
+}
+
+export class PopdexAccountClient {
+  constructor({
+    apiBase = POPDEX_API_BASE,
+    webBase = POPDEX_WEB_BASE,
+    fetchImpl = fetch,
+    timeoutMs = 10000,
+  } = {}) {
+    this.apiBase = new URL(apiBase);
+    this.webBase = new URL(webBase);
+    this.fetchImpl = fetchImpl;
+    this.timeoutMs = timeoutMs;
+    if (this.apiBase.protocol !== 'https:' || this.webBase.protocol !== 'https:') {
+      throw new Error('PopDEX 账户端点必须使用 HTTPS。');
+    }
+    if (typeof this.fetchImpl !== 'function') {
+      throw new Error('PopDEX fetchImpl 必须是函数。');
+    }
+    if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs <= 0) {
+      throw new Error('PopDEX timeoutMs 必须是正安全整数。');
+    }
+  }
+
+  async #request(base, pathname, searchParams = {}) {
+    const url = new URL(pathname, base);
+    for (const [key, value] of Object.entries(searchParams)) {
+      if (value !== undefined && value !== null && value !== '') {
+        url.searchParams.set(key, String(value));
+      }
+    }
+    let response;
+    try {
+      response = await this.fetchImpl(url, {
+        headers: ACCOUNT_HEADERS,
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+    } catch (error) {
+      throw new Error(
+        `PopDEX GET ${url.pathname} 网络失败：${sanitizedCause(error)}`,
+        { cause: error },
+      );
+    }
+
+    let body;
+    try {
+      body = await response.json();
+    } catch (error) {
+      throw new Error(
+        `PopDEX GET ${url.pathname} HTTP ${response.status} 返回非 JSON：${sanitizedCause(error)}`,
+        { cause: error },
+      );
+    }
+    if (!response.ok) {
+      throw new Error(
+        `PopDEX GET ${url.pathname} HTTP ${response.status}：${sanitizedCause(body?.msg ?? '请求失败')}`,
+      );
+    }
+    if (body?.code === '11100') {
+      throw new Error(`PopDEX GET ${url.pathname} API 11100：${sanitizedCause(body.msg ?? 'Account does not exist')}`);
+    }
+    if (!body || typeof body !== 'object' || body.code !== '200') {
+      throw new Error(
+        `PopDEX GET ${url.pathname} HTTP ${response.status} API code=${String(body?.code)}：${sanitizedCause(body?.msg ?? '未知错误')}`,
+      );
+    }
+    if (!Object.hasOwn(body, 'data')) {
+      throw new Error(`PopDEX GET ${url.pathname} 成功响应缺少 data。`);
+    }
+    return body.data;
+  }
+
+  async #orders(account, symbol, cursor = null) {
+    const wallet = strictAddress(account, 'account');
+    const target = targetSymbol(symbol);
+    if (cursor !== null) strictIntegerString(cursor, 'cursor');
+    const payload = await this.#request(
+      this.apiBase,
+      `/api/v1/account/${wallet}/orders`,
+      { limit: 100, symbol: target, cursor },
+    );
+    const rows = listFrom(payload, ['data', 'list', 'rows', 'orders'], 'orders');
+    return attachCursor(rows.map(normalizeOrder), payload);
+  }
+
+  async getOpenOrders(account, symbol) {
+    return this.#orders(account, symbol);
+  }
+
+  async getOrderHistory(account, symbol, cursor = null) {
+    return this.#orders(account, symbol, cursor);
+  }
+
+  async getFills(account, symbol, cursor = null) {
+    const wallet = strictAddress(account, 'account');
+    const target = targetSymbol(symbol);
+    if (cursor !== null) strictIntegerString(cursor, 'cursor');
+    const payload = await this.#request(
+      this.apiBase,
+      `/api/v1/account/${wallet}/trade/fills`,
+      { limit: 100, symbol: target, cursor },
+    );
+    const rows = listFrom(payload, ['data', 'list', 'rows', 'fills'], 'fills');
+    return attachCursor(rows.map(normalizeFill), payload);
+  }
+
+  async getOverview(account) {
+    const wallet = strictAddress(account, 'account');
+    const payload = await this.#request(
+      this.webBase,
+      `/web/v1/account/${wallet}/overview`,
+    );
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      throw new Error('PopDEX overview.data 必须是对象。');
+    }
+    return payload;
+  }
+
+  async getPositions(account) {
+    const overview = await this.getOverview(account);
+    const rows = listFrom(overview, ['data', 'list', 'rows', 'positions'], 'positions');
+    return rows.map(normalizePosition);
+  }
+}
