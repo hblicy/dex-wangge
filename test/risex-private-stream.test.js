@@ -295,3 +295,24 @@ test('private stream auth GET timeout aborts the request', async () => {
   await assert.rejects(connecting, /GET .* 40ms 超时/);
   assert.equal(aborted, true);
 });
+
+test('private stream auth GET exposes a sanitized nested network cause', async () => {
+  const socketError = Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' });
+  const harness = makeHarness({
+    fetchImpl: async () => { throw new TypeError('fetch failed', { cause: socketError }); },
+  });
+  const connecting = harness.stream.connect();
+  FakeSocket.instances[0].emit('open');
+
+  await assert.rejects(
+    connecting,
+    (error) => {
+      assert.match(error.message, /GET \/v1\/auth\/eip712-domain 失败/);
+      assert.match(error.message, /UND_ERR_SOCKET/);
+      assert.match(error.message, /other side closed/);
+      assert.doesNotMatch(error.message, new RegExp(ACCOUNT, 'i'));
+      assert.doesNotMatch(error.message, new RegExp(SIGNER_KEY.slice(2), 'i'));
+      return true;
+    },
+  );
+});

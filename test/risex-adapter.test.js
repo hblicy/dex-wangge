@@ -321,6 +321,23 @@ test('RISEx init fails instead of hiding a REST snapshot error', async () => {
   assert.notEqual(exchange.connectionState, 'READY');
 });
 
+test('RISEx REST snapshot errors expose a sanitized nested network cause', async () => {
+  const { exchange, info } = makeHarness();
+  const socketError = Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' });
+  info.getBalance = async () => { throw new TypeError('fetch failed', { cause: socketError }); };
+  await assert.rejects(
+    exchange.init(),
+    (error) => {
+      assert.match(error.message, /REST 快照读取失败/);
+      assert.match(error.message, /UND_ERR_SOCKET/);
+      assert.match(error.message, /other side closed/);
+      assert.doesNotMatch(error.message, new RegExp(ACCOUNT, 'i'));
+      assert.doesNotMatch(error.message, new RegExp(SIGNER_KEY.slice(2), 'i'));
+      return true;
+    },
+  );
+});
+
 function liveOrder(orderId, status = 'OPEN', filledSize = 0, avgPrice = 0, block = 10) {
   return {
     orderId, marketId: 1, side: 'buy', sizeBase: 0.001, price: 60000,
@@ -944,8 +961,12 @@ test('RISEx HALTED state does not auto-recover when the socket authenticates', a
 test('RISEx reconnect rebuilds clients and stream without cancelling orders or positions', async () => {
   const { exchange, trace } = makeHarness();
   await exchange.init();
+  exchange._refreshError = 'fetch failed';
+  assert.equal(exchange.getHealth().status, 'error');
   await exchange.reconnect();
   assert.equal(exchange.connectionState, 'READY');
+  assert.equal(exchange.getHealth().status, 'ok');
+  assert.deepEqual(await exchange.fetchOpenOrders(1), []);
   assert.equal(trace.filter((item) => item === 'client:init').length, 2);
   assert.equal(trace.filter((item) => item === 'ws:connect').length, 2);
   assert.equal(trace.some((item) => item.startsWith('write:cancel')), false);
