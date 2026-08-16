@@ -13,6 +13,7 @@ import {
 import { RisexMainnetClient } from './mainnet-client.js';
 import { RisexOrderState } from './order-state.js';
 import { RisexPrivateStream } from './private-stream.js';
+import { describeError } from './error-details.js';
 import {
   compareRisexCursor,
   normalizeRestFill,
@@ -645,10 +646,11 @@ export class RisexExchange extends EventEmitter {
       this._refreshPromise = this._refreshReadOnly()
         .catch((cause) => {
           const error = cause instanceof Error ? cause : new Error(String(cause));
-          this.lastError = error.message;
-          this._refreshError = error.message;
-          this._logger.error?.(`[RISEx] 只读刷新失败：${error.message}`);
-          this.emit('error', error);
+          const details = describeError(error);
+          this.lastError = details;
+          this._refreshError = details;
+          this._logger.error?.(`[RISEx] 只读刷新失败：${details}`);
+          this.emit('error', new Error(`RISEx 只读刷新失败：${details}`, { cause: error }));
         })
         .finally(() => { this._refreshPromise = null; });
       return this._refreshPromise;
@@ -796,34 +798,38 @@ export class RisexExchange extends EventEmitter {
   }
 
   async _readRestSnapshot() {
-    const marketRows = await Promise.all([...this.markets.values()].map(async (market) => {
-      const [openRaw, historyRaw, fillsRaw] = await Promise.all([
-        this._info.getOpenOrders(this.account, market.marketId),
-        this._info.getOrderHistory(this.account, market.marketId, 100),
-        this._info.getAccountTradeHistory(this.account, market.marketId, 100),
+    try {
+      const marketRows = await Promise.all([...this.markets.values()].map(async (market) => {
+        const [openRaw, historyRaw, fillsRaw] = await Promise.all([
+          this._info.getOpenOrders(this.account, market.marketId),
+          this._info.getOrderHistory(this.account, market.marketId, 100),
+          this._info.getAccountTradeHistory(this.account, market.marketId, 100),
+        ]);
+        if (!Array.isArray(openRaw) || !Array.isArray(historyRaw) || !Array.isArray(fillsRaw)) {
+          throw new Error(`RISEx market ${market.marketId} REST 订单快照格式非法。`);
+        }
+        return {
+          market,
+          open: openRaw.map((raw) => normalizeRestOpenOrder(raw, market)),
+          history: historyRaw.map(normalizeRestOrderHistory),
+          fills: fillsRaw.map(normalizeRestFill),
+        };
+      }));
+      const [positionsRaw, balanceRaw] = await Promise.all([
+        this._info.getAllPositions(this.account),
+        this._info.getBalance(this.account),
       ]);
-      if (!Array.isArray(openRaw) || !Array.isArray(historyRaw) || !Array.isArray(fillsRaw)) {
-        throw new Error(`RISEx market ${market.marketId} REST 订单快照格式非法。`);
-      }
-      return {
-        market,
-        open: openRaw.map((raw) => normalizeRestOpenOrder(raw, market)),
-        history: historyRaw.map(normalizeRestOrderHistory),
-        fills: fillsRaw.map(normalizeRestFill),
-      };
-    }));
-    const [positionsRaw, balanceRaw] = await Promise.all([
-      this._info.getAllPositions(this.account),
-      this._info.getBalance(this.account),
-    ]);
-    if (!Array.isArray(positionsRaw)) throw new Error('RISEx positions 响应不是数组。');
-    const allowed = new Set(this.markets.keys());
-    const positions = positionsRaw
-      .map((raw) => this._normalizePosition(raw))
-      .filter((position) => position && allowed.has(position.marketId));
-    const balance = strictDecimal(balanceRaw, 'balance');
-    this.lastRestAt = this._now();
-    return { marketRows, positions, balance };
+      if (!Array.isArray(positionsRaw)) throw new Error('RISEx positions 响应不是数组。');
+      const allowed = new Set(this.markets.keys());
+      const positions = positionsRaw
+        .map((raw) => this._normalizePosition(raw))
+        .filter((position) => position && allowed.has(position.marketId));
+      const balance = strictDecimal(balanceRaw, 'balance');
+      this.lastRestAt = this._now();
+      return { marketRows, positions, balance };
+    } catch (cause) {
+      throw new Error(`RISEx REST 快照读取失败：${describeError(cause)}。`, { cause });
+    }
   }
 
   _seedRestSnapshot(snapshot, expectedOwnership = null) {
@@ -889,6 +895,7 @@ export class RisexExchange extends EventEmitter {
     this._reconcileExpected = null;
     this.dataSource = 'real';
     this.lastOkAt = this._now();
+    this._refreshError = null;
     const restOpenCount = snapshot.marketRows.reduce((sum, row) => sum + row.open.length, 0);
     this._logger.log?.(
       `[RISEx] ${reason}对账完成：expected=${expected.size} REST open=${restOpenCount} WS buffered=${buffered.length}，耗时 ${this._now() - startedAt}ms`,
