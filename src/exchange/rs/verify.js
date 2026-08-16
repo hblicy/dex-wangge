@@ -200,7 +200,7 @@ export async function verifyRisexPrivate(config, deps = {}) {
         }
         const normalizedOpen = open.map((row) => normalizeRestOpenOrder(row, market));
         const normalizedTrades = trades.map(normalizeRestFill);
-        const normalizedPosition = normalizeRestPosition(position);
+        const normalizedPosition = normalizeRestPosition(position, { markPrice: market.lastPrice });
         if (normalizedPosition && normalizedPosition.marketId !== market.marketId) {
           throw new Error(`RISEx market ${market.marketId} 仓位市场不匹配。`);
         }

@@ -252,20 +252,26 @@ export function normalizeRestFill(raw) {
   };
 }
 
-export function normalizeRestPosition(raw) {
+export function normalizeRestPosition(raw, { markPrice: trustedMarkPrice } = {}) {
   if (raw == null) return null;
   const marketId = safeInteger(raw.market_id, 'REST position market_id', { min: 1 });
   const absoluteSize = Math.abs(wadToNumber(raw.size, `REST position ${marketId} size`));
   if (absoluteSize === 0) return { marketId, sizeBase: 0, entryPrice: 0, unrealizedPnl: 0, leverage: null };
   const side = positionSide(raw.side);
-  const entryPrice = wadToNumber(raw.avg_entry_price, `REST position ${marketId} avg_entry_price`);
-  if (!(entryPrice > 0)) fail(`REST position ${marketId} avg_entry_price`, '必须大于零。');
+  const entryRaw = [raw.avg_entry_price, raw.entry_price]
+    .find((value) => value !== undefined && value !== null && value !== '');
+  const entryPrice = wadToNumber(entryRaw, `REST position ${marketId} avg_entry_price/entry_price`);
+  if (!(entryPrice > 0)) fail(`REST position ${marketId} avg_entry_price/entry_price`, '必须大于零。');
   let unrealizedPnl;
   if (raw.unrealized_pnl != null && raw.unrealized_pnl !== '') {
     unrealizedPnl = wadToNumber(raw.unrealized_pnl, `REST position ${marketId} unrealized_pnl`);
   } else if (raw.mark_price != null && raw.mark_price !== '') {
     const markPrice = wadToNumber(raw.mark_price, `REST position ${marketId} mark_price`);
     if (!(markPrice > 0)) fail(`REST position ${marketId} mark_price`, '必须大于零。');
+    const signedSize = side === 'buy' ? absoluteSize : -absoluteSize;
+    unrealizedPnl = signedSize * (markPrice - entryPrice);
+  } else if (trustedMarkPrice != null && trustedMarkPrice !== '') {
+    const markPrice = decimal(trustedMarkPrice, `REST position ${marketId} trusted mark_price`, { min: 0, allowZero: false });
     const signedSize = side === 'buy' ? absoluteSize : -absoluteSize;
     unrealizedPnl = signedSize * (markPrice - entryPrice);
   } else {

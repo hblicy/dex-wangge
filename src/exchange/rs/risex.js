@@ -83,6 +83,7 @@ export class RisexExchange extends EventEmitter {
     this.orderState = new RisexOrderState();
     this._positions = new Map();
     this._prices = new Map();
+    this._positionValuationFallback = new Set();
     this._officialOpen = new Map();
     this._restingIds = new Map();
     this._pendingRecoveryTerminals = new Map();
@@ -678,7 +679,8 @@ export class RisexExchange extends EventEmitter {
     ]);
     if (!Array.isArray(positionsRaw)) throw new Error('RISEx positions 刷新响应不是数组。');
     const allowed = new Set(this.markets.keys());
-    const positions = positionsRaw.map(normalizeRestPosition)
+    const priceByMarket = new Map(prices.map(({ marketId, price }) => [marketId, price]));
+    const positions = positionsRaw.map((raw) => this._normalizePosition(raw, priceByMarket))
       .filter((position) => position && position.sizeBase !== 0 && allowed.has(position.marketId));
     this._positions = new Map(positions.map((position) => [position.marketId, position]));
     this.balance = strictDecimal(balanceRaw, 'balance');
@@ -731,6 +733,24 @@ export class RisexExchange extends EventEmitter {
   async _loadMarkets() {
     const markets = normalizeRisexMarkets(await this._info.getMarkets());
     this.markets = new Map(markets.map((market) => [market.marketId, market]));
+  }
+
+  _normalizePosition(raw, priceByMarket = this._prices) {
+    const marketId = Number(raw?.market_id);
+    const trustedMarkPrice = priceByMarket.get(marketId) ?? this.markets.get(marketId)?.lastPrice;
+    const position = normalizeRestPosition(raw, { markPrice: trustedMarkPrice });
+    const usedTrustedMark = position?.sizeBase !== 0
+      && (raw?.unrealized_pnl == null || raw.unrealized_pnl === '')
+      && (raw?.mark_price == null || raw.mark_price === '');
+    if (usedTrustedMark && !this._positionValuationFallback.has(marketId)) {
+      this._logger.log?.(
+        `[RISEx] REST position ${marketId} 未提供 unrealized_pnl/mark_price，使用官方市场价格计算浮盈。`,
+      );
+      this._positionValuationFallback.add(marketId);
+    } else if (!usedTrustedMark) {
+      this._positionValuationFallback.delete(marketId);
+    }
+    return position;
   }
 
   _bindStream() {
@@ -799,7 +819,7 @@ export class RisexExchange extends EventEmitter {
     if (!Array.isArray(positionsRaw)) throw new Error('RISEx positions 响应不是数组。');
     const allowed = new Set(this.markets.keys());
     const positions = positionsRaw
-      .map(normalizeRestPosition)
+      .map((raw) => this._normalizePosition(raw))
       .filter((position) => position && allowed.has(position.marketId));
     const balance = strictDecimal(balanceRaw, 'balance');
     this.lastRestAt = this._now();
@@ -1055,7 +1075,7 @@ export class RisexExchange extends EventEmitter {
     const rows = await this._info.getAllPositions(this.account);
     if (!Array.isArray(rows)) throw new Error('RISEx positions 回读响应不是数组。');
     const matches = rows
-      .map(normalizeRestPosition)
+      .map((raw) => this._normalizePosition(raw))
       .filter((position) => position?.marketId === id);
     if (matches.length > 1) throw new Error(`RISEx market ${id} 持仓回读重复。`);
     const position = matches[0] || null;
