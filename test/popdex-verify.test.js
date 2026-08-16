@@ -19,6 +19,10 @@ function fakeDependencies(calls = []) {
   return {
     rpcClient: {
       async verifyChain() { calls.push('rpc:verifyChain'); return 2184n; },
+      async getOpenPositions(account) {
+        calls.push(`rpc:positions:${account}`);
+        return { positions: [], hasMore: false };
+      },
     },
     publicClient: {
       async getMarkets() {
@@ -69,10 +73,6 @@ function fakeDependencies(calls = []) {
         calls.push(`account:overview:${account}`);
         return { balances: [] };
       },
-      async getPositions(account) {
-        calls.push(`account:positions:${account}`);
-        return [];
-      },
     },
   };
 }
@@ -94,7 +94,7 @@ test('public verification checks chain markets tickers candles and official arti
   ]);
 });
 
-test('account verification reads exact orders fills overview and positions without Agent key', async () => {
+test('account verification reads orders fills overview and official on-chain positions without Agent key', async () => {
   const calls = [];
   const result = await verifyPopdexAccount(
     { ...CONFIG, account: ACCOUNT },
@@ -106,7 +106,7 @@ test('account verification reads exact orders fills overview and positions witho
   assert.equal(result.markets[0].openOrders, 1);
   assert.equal(result.markets[0].fills, 1);
   assert.ok(calls.includes(`account:overview:${ACCOUNT}`));
-  assert.ok(calls.includes(`account:positions:${ACCOUNT}`));
+  assert.ok(calls.includes(`rpc:positions:${ACCOUNT}`));
 });
 
 test('verification fails when official artifacts do not expose required protocol evidence', async () => {

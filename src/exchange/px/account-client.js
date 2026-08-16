@@ -2,7 +2,6 @@ import { POPDEX_API_BASE, POPDEX_EXPECTED_MARKETS, POPDEX_WEB_BASE } from './con
 import {
   normalizeFill,
   normalizeOrder,
-  normalizePosition,
   strictAddress,
   strictIntegerString,
 } from './normalize.js';
@@ -182,11 +181,5 @@ export class PopdexAccountClient {
       throw new Error('PopDEX overview.data 必须是对象。');
     }
     return payload;
-  }
-
-  async getPositions(account) {
-    const overview = await this.getOverview(account);
-    const rows = listFrom(overview, ['data', 'list', 'rows', 'positions'], 'positions');
-    return rows.map(normalizePosition);
   }
 }

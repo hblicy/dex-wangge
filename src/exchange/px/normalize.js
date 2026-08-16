@@ -3,7 +3,6 @@ import { POPDEX_EXPECTED_MARKETS } from './constants.js';
 
 const INTEGER_STRING = /^(?:0|[1-9]\d*)$/;
 const DECIMAL_STRING = /^(?:0|[1-9]\d*)(?:\.\d+)?$/;
-const SIGNED_DECIMAL_STRING = /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/;
 
 export function strictAddress(value, field) {
   if (typeof value !== 'string' || !isAddress(value)) {
@@ -110,14 +109,6 @@ function strictOptionalDecimal(value, field) {
     : strictDecimalString(value, field);
 }
 
-function strictOptionalSignedDecimal(value, field) {
-  if (value === undefined || value === null) return value;
-  if (typeof value !== 'string' || !SIGNED_DECIMAL_STRING.test(value)) {
-    throw new Error(`PopDEX ${field} 必须是有符号十进制字符串。`);
-  }
-  return value;
-}
-
 export function normalizeOrder(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('PopDEX order 必须是对象。');
@@ -155,19 +146,5 @@ export function normalizeFill(value) {
     side: strictNonEmptyString(value.side, 'fill.side'),
     execPrice: strictOptionalDecimal(value.execPrice, 'fill.execPrice'),
     execQty: strictOptionalDecimal(value.execQty, 'fill.execQty'),
-  };
-}
-
-export function normalizePosition(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('PopDEX position 必须是对象。');
-  }
-  return {
-    ...value,
-    symbol: strictTargetSymbol(value.symbol, 'position.symbol'),
-    positionSide: strictNonEmptyString(value.positionSide, 'position.positionSide'),
-    holdQty: strictOptionalDecimal(value.holdQty, 'position.holdQty'),
-    avgOpenPrice: strictOptionalDecimal(value.avgOpenPrice, 'position.avgOpenPrice'),
-    unrealizedPnl: strictOptionalSignedDecimal(value.unrealizedPnl, 'position.unrealizedPnl'),
   };
 }

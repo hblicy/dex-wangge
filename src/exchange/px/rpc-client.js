@@ -1,4 +1,10 @@
-import { POPDEX_CHAIN_ID, POPDEX_RPC_URL } from './constants.js';
+import { Interface } from 'ethers';
+import { POPDEX_CHAIN_ID, POPDEX_ORDER_PRECOMPILE, POPDEX_RPC_URL } from './constants.js';
+import { strictAddress } from './normalize.js';
+
+const OPEN_POSITIONS_INTERFACE = new Interface([
+  'function getOpenPositionsByAccount(address account,uint32 offset,uint32 limit) view returns ((tuple(address walletId,uint128 positionId,uint16 symbolId,uint8 side,uint256 holdSize,uint256 avgOpenPrice,uint256 closeSize,uint256 lockedSize,int256 realizedPnl,uint64 createdTime,uint64 updatedTime)[] positions,bool hasMore) page)',
+]);
 
 const READ_ONLY_METHODS = new Set([
   'eth_chainId',
@@ -36,6 +42,29 @@ function errorData(value) {
   } catch {
     return ' data=[无法序列化]';
   }
+}
+
+function uint32(value, field, { allowZero = true } = {}) {
+  if (!Number.isSafeInteger(value) || value < (allowZero ? 0 : 1) || value > 0xffffffff) {
+    throw new Error(`PopDEX ${field} 必须是有效 uint32。`);
+  }
+  return value;
+}
+
+function exactPosition(value) {
+  return {
+    walletId: strictAddress(value.walletId, 'position.walletId'),
+    positionId: value.positionId.toString(),
+    symbolId: value.symbolId.toString(),
+    side: value.side.toString(),
+    holdSizeWad: value.holdSize.toString(),
+    avgOpenPriceWad: value.avgOpenPrice.toString(),
+    closeSizeWad: value.closeSize.toString(),
+    lockedSizeWad: value.lockedSize.toString(),
+    realizedPnlWad: value.realizedPnl.toString(),
+    createdTime: value.createdTime.toString(),
+    updatedTime: value.updatedTime.toString(),
+  };
 }
 
 export class PopdexRpcClient {
@@ -120,6 +149,33 @@ export class PopdexRpcClient {
       throw new Error(`PopDEX RPC chainId 必须是 2184，实际 ${chainId}。`);
     }
     return chainId;
+  }
+
+  async getOpenPositions(account, offset = 0, limit = 100) {
+    const wallet = strictAddress(account, 'account');
+    const exactOffset = uint32(offset, 'position offset');
+    const exactLimit = uint32(limit, 'position limit', { allowZero: false });
+    const data = OPEN_POSITIONS_INTERFACE.encodeFunctionData(
+      'getOpenPositionsByAccount',
+      [wallet, exactOffset, exactLimit],
+    );
+    const raw = await this.call('eth_call', [{ to: POPDEX_ORDER_PRECOMPILE, data }, 'latest']);
+    let decoded;
+    try {
+      [decoded] = OPEN_POSITIONS_INTERFACE.decodeFunctionResult(
+        'getOpenPositionsByAccount',
+        raw,
+      );
+    } catch (error) {
+      throw new Error(
+        `PopDEX RPC getOpenPositionsByAccount 解码失败：${sanitizedCause(error)}`,
+        { cause: error },
+      );
+    }
+    return {
+      positions: decoded.positions.map(exactPosition),
+      hasMore: decoded.hasMore,
+    };
   }
 
   async getTransaction(txHash) {

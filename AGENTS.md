@@ -5,6 +5,7 @@
 ## 当前产品边界
 
 - Decibel、Extended 与 RISEx 支持 `paper` 和 `live`；RISEx live 只允许 mainnet 的 BTC-PERP / ETH-PERP。
+- PopDEX 仍处于只读协议验证阶段，尚未注册为可运行交易所；目标市场仅限 BTCUSDT / ETHUSDT。PopDEX `/overview` 只用于账户概览，持仓事实必须从订单预编译合约 `0x0000000000000000000000000000000000001000` 的只读方法 `getOpenPositionsByAccount` 获取，禁止猜测 overview 内含 `positions`。
 - RISEx 私有 Orders/Fills WebSocket 与 REST 对账共同构成订单、成交和持仓的事实来源。
 - RISEx Orders WebSocket、订单历史和单笔订单接口的价量字段按当前主网人类可读十进制字符串解析；开放订单仍按 ticks/steps，仓位仍按已验证的 WAD 结构，禁止按字符串长度猜单位。
 - RISEx Orders/Fills WebSocket 游标优先使用 `block_timestamp`，其次使用服务端 `timestamp`；顶层时间缺失或为空时才使用订单 `created_at` / 成交 `time`，所有候选缺失或非法必须进入 `HALTED`，禁止填 `0` 或本地时间。

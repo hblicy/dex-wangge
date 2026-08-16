@@ -62,13 +62,6 @@ function makeAccountFetch(seen = []) {
         msg: 'success',
         data: {
           balances: [{ asset: 'USDT', balance: '1000' }],
-          positions: [{
-            symbol: 'BTCUSDT',
-            positionSide: 'LONG',
-            holdQty: '0.0002',
-            avgOpenPrice: '62000',
-            unrealizedPnl: '-0.1956',
-          }],
         },
       });
     }
@@ -97,17 +90,10 @@ test('order and fill IDs remain exact strings', async () => {
   assert.equal(fill.orderId, '90071992547409931234');
 });
 
-test('overview and positions are read from the official web endpoint', async () => {
+test('overview is read without assuming it contains positions', async () => {
   const client = new PopdexAccountClient({ fetchImpl: makeAccountFetch() });
   const overview = await client.getOverview(ACCOUNT);
   assert.equal(overview.balances[0].balance, '1000');
-  assert.deepEqual(await client.getPositions(ACCOUNT), [{
-    symbol: 'BTCUSDT',
-    positionSide: 'LONG',
-    holdQty: '0.0002',
-    avgOpenPrice: '62000',
-    unrealizedPnl: '-0.1956',
-  }]);
 });
 
 test('account response errors and malformed arrays fail instead of becoming empty state', async () => {

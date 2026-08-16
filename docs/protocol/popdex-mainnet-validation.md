@@ -56,8 +56,9 @@ The following requests were sent without `Authorization` or `dy-token`, using on
 | `GET https://api.popdex.xyz/api/v1/account/{wallet}/orders?limit=2&symbol=BTCUSDT` | HTTP 200, `code="200"`, `data=[]` | No cursor was returned for the empty result. |
 | `GET https://api.popdex.xyz/api/v1/account/{wallet}/trade/fills?limit=2&symbol=BTCUSDT` | HTTP 200, `code="200"`, `data=[]` | Top-level `cursor=""`, `limit="2"`, and `total="0"`. |
 | `GET https://app.popdex.xyz/web/v1/account/{wallet}/overview` | HTTP 200, `code="11100"`, `msg="Account does not exist"`, `data=null` | Not applicable. |
+| `eth_call` Order precompile `getOpenPositionsByAccount(account,0,100)` | Official ABI decoded successfully; a synthetic address returned `positions=[]`, `hasMore=false`. | Offset/limit pagination is explicit in the ABI. |
 
-`POPDEX_MAIN_ACCOUNT` was not configured in the validation environment. Therefore non-empty order, fill and position field schemas, real ID fields, and non-empty pagination semantics were not validated. The verifier did not substitute an empty account for the explicit `11100` error.
+The user's subsequent `POPDEX_MAIN_ACCOUNT` run passed both target-market order/fill reads and the real-account overview read before stopping at the verifier's obsolete assumption that `overview` contained a position array. Official artifact `/perp-static/client/js/98039.36abf38e738893c0cb67.chunk.js` instead exposes `getOpenPositionsByAccount(address,uint32,uint32)` on the Order precompile. The verifier now uses that read-only contract method and preserves every returned integer as a string. Non-empty order, fill and position responses and non-empty pagination semantics still require live evidence. The verifier does not substitute an empty account for the explicit `11100` error.
 
 ## Agent authorization
 
@@ -96,6 +97,8 @@ No transaction was signed, simulated as a write, or broadcast during this valida
 
 The Order precompile ABI proves that placement accepts a caller-provided `bytes32 clientOrderId`; cancellation requires both `uint128 orderId` and `bytes32 clientOrderId`; on-chain order getters expose both fields. All verifier parsers preserve IDs and cursors as strings.
 
+The same authoritative ABI exposes `getOpenPositionsByAccount(address account,uint32 offset,uint32 limit)` and returns `PositionInfo[] positions` plus `bool hasMore`. `PositionInfo` contains `walletId`, `positionId`, `symbolId`, `side`, `holdSize`, `avgOpenPrice`, `closeSize`, `lockedSize`, `realizedPnl`, `createdTime`, and `updatedTime`. A Mainnet read-only call against precompile `0x0000000000000000000000000000000000001000` decoded successfully. No REST position array is inferred from `/overview`.
+
 No captured artifact or non-empty account response proved how a placement transaction's `txHash` maps to the official `orderId`, or whether the REST placement response returns that mapping. Treating `txHash` as `orderId`, as the reference repository does, is therefore rejected.
 
 ## Required write probes
@@ -119,7 +122,7 @@ BLOCKED
 | `msg.sender`, main account and Agent relationship | Blocked for order writes; only Agent authorization and position-mode write behavior were proven. |
 | `txHash`, `clientOrderId`, `orderId` mapping | Blocked: no authoritative mapping was observed. |
 | Place, cancel, leverage and reduce-only close terminal states | Blocked: no approved Mainnet write probe was executed. |
-| Complete order, fill and position REST schema and pagination | Blocked: `POPDEX_MAIN_ACCOUNT` was absent and the synthetic address returned empty lists or `11100`. |
+| Complete order, fill and position schema and pagination | Partially validated: the real account's REST envelopes reached the overview stage, and the official on-chain position ABI/read path is validated. Non-empty rows and pagination remain blocked. |
 | Maximum open orders and rate limits | Blocked: no authoritative value was present in the read-only evidence. |
 
-The single next action is to configure the public main-account address as `POPDEX_MAIN_ACCOUNT` and rerun `npm run popdex:verify -- --account-env POPDEX_MAIN_ACCOUNT`. No private key or Agent key is needed for that step. Live adapter, Agent UI, Extended removal and all PopDEX trading writes remain disabled until every blocked gate has authoritative evidence.
+The single next action is to rerun `npm run popdex:verify -- --account-env POPDEX_MAIN_ACCOUNT` with the corrected on-chain position reader. No private key or Agent key is needed for that step. Live adapter, Agent UI, Extended removal and all PopDEX trading writes remain disabled until every blocked gate has authoritative evidence.

@@ -103,6 +103,7 @@ export async function verifyPopdexAccount(config = {}, deps = {}) {
   assertReadOnlyConfig(config);
   const account = strictAddress(config.account, 'account');
   const accountClient = deps.accountClient ?? new PopdexAccountClient(deps.accountOptions);
+  const rpcClient = deps.rpcClient ?? new PopdexRpcClient(deps.rpcOptions);
   const markets = [];
   for (const symbol of TARGET_SYMBOLS) {
     const openOrders = await accountClient.getOpenOrders(account, symbol);
@@ -119,12 +120,16 @@ export async function verifyPopdexAccount(config = {}, deps = {}) {
     });
   }
   const overview = await accountClient.getOverview(account);
-  const positions = await accountClient.getPositions(account);
+  const positionPage = await rpcClient.getOpenPositions(account);
   if (!overview || typeof overview !== 'object' || Array.isArray(overview)) {
     throw new Error('PopDEX overview 必须是对象。');
   }
-  if (!Array.isArray(positions)) {
-    throw new Error('PopDEX positions 必须是数组。');
+  if (!positionPage || !Array.isArray(positionPage.positions)
+      || typeof positionPage.hasMore !== 'boolean') {
+    throw new Error('PopDEX 链上 positions 页格式无效。');
+  }
+  if (positionPage.hasMore) {
+    throw new Error('PopDEX 链上 positions 超过单页上限，验证器拒绝截断。');
   }
 
   return {
@@ -133,7 +138,8 @@ export async function verifyPopdexAccount(config = {}, deps = {}) {
     agentKeyRequired: false,
     markets,
     overviewKeys: Object.keys(overview).sort(),
-    positions: positions.length,
+    positions: positionPage.positions.length,
+    positionSource: 'rpc:getOpenPositionsByAccount',
     writeMethodsCalled: 0,
   };
 }
