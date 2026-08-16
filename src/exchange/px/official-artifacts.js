@@ -4,7 +4,7 @@ const OFFICIAL_ORIGIN = 'https://app.popdex.xyz';
 const MAX_ARTIFACT_BYTES = 20 * 1024 * 1024;
 const MAX_CONTEXT_CHARS = 1200;
 
-const DEFAULT_TOKENS = Object.freeze([
+export const POPDEX_PROTOCOL_TOKENS = Object.freeze([
   'approveAgent',
   'revokeAgent',
   'placeOrder',
@@ -66,7 +66,7 @@ function boundedContext(content, offset, tokenLength) {
 export async function inspectOfficialArtifacts({
   appUrl = 'https://app.popdex.xyz/',
   fetchImpl = fetch,
-  tokens = DEFAULT_TOKENS,
+  tokens = POPDEX_PROTOCOL_TOKENS,
 } = {}) {
   if (typeof fetchImpl !== 'function') {
     throw new Error('PopDEX artifact fetchImpl 必须是函数。');
