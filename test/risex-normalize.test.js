@@ -217,6 +217,26 @@ test('REST normalizers parse current RISEx order, fill and position schemas', ()
   }).sizeBase, 0.5);
 });
 
+test('REST position derives missing optional valuation from a trusted market mark', () => {
+  const position = normalizeRestPosition({
+    market_id: '1', side: 'BUY', size: (WAD / 2n).toString(),
+    avg_entry_price: wad(100), leverage: wad(3),
+  }, { markPrice: 110 });
+
+  assert.deepEqual(position, {
+    marketId: 1, sizeBase: 0.5, entryPrice: 100, unrealizedPnl: 5, leverage: 3,
+  });
+});
+
+test('REST position accepts the SDK entry_price field', () => {
+  const position = normalizeRestPosition({
+    market_id: '1', side: 'SELL', size: (WAD / 2n).toString(),
+    entry_price: wad(100), unrealized_pnl: wad(2), leverage: wad(3),
+  });
+
+  assert.equal(position.entryPrice, 100);
+});
+
 test('REST normalizers reject missing resting IDs, unknown status and incomplete positions', () => {
   const market = { marketId: 1, stepPrice: 0.1, stepSize: 0.001 };
   assert.throws(() => normalizeRestOpenOrder({
@@ -229,6 +249,9 @@ test('REST normalizers reject missing resting IDs, unknown status and incomplete
   assert.throws(() => normalizeRestPosition({
     market_id: '1', side: 'BUY', size: wad(1), avg_entry_price: '',
   }), /avg_entry_price/);
+  assert.throws(() => normalizeRestPosition({
+    market_id: '1', side: 'BUY', size: wad(1), avg_entry_price: wad(100),
+  }), /缺少 unrealized_pnl 或 mark_price/);
 });
 
 test('cursor comparison uses block then log then timestamp', () => {

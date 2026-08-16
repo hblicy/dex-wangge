@@ -104,6 +104,12 @@ function rawPosition(side = 'BUY', size = '0.001', entryPrice = '60000', pnl = '
   };
 }
 
+function rawPositionWithoutValuation(side = 'BUY', size = '0.001', entryPrice = '60000', leverage = '3') {
+  const position = rawPosition(side, size, entryPrice, '0', leverage);
+  delete position.unrealized_pnl;
+  return position;
+}
+
 function wsOpen(orderId = 'o1', marketId = 1) {
   return {
     kind: 'order',
@@ -257,6 +263,25 @@ test('RISEx init halts when an idle account has a target-market position', async
   });
   await assert.rejects(exchange.init(), /没有运行快照.*遗留仓位/);
   assert.equal(exchange.connectionState, 'HALTED');
+});
+
+test('RISEx recovery values a position when REST omits optional valuation fields', async () => {
+  const logs = [];
+  const { exchange } = makeHarness({
+    positions: [rawPositionWithoutValuation('BUY', '0.1', '60000', '3')],
+    logger: { log: (message) => logs.push(String(message)), error() {} },
+  });
+  exchange.setRecoverySnapshot({
+    running: true,
+    config: { displayName: 'BTC-PERP', sizeBase: 0.001 },
+    active: [],
+  });
+
+  await exchange.init();
+
+  assert.equal(exchange.connectionState, 'READY');
+  assert.ok(Math.abs(exchange.getPosition(1).unrealizedPnl - 0.1) < 1e-9);
+  assert.equal(logs.filter((message) => /position 1.*市场价格计算浮盈/.test(message)).length, 1);
 });
 
 test('RISEx init adopts only snapshot-owned open orders', async () => {
@@ -981,6 +1006,23 @@ test('RISEx init starts read-only refresh before a grid is started', async () =>
   await tick();
   assert.equal(exchange.getHealth().status, 'warn');
   assert.equal(exchange.getHealth().lastRestAgeMs, 0);
+});
+
+test('RISEx read-only refresh uses the same-cycle orderbook for missing position valuation', async () => {
+  let tick;
+  const positions = [];
+  const { exchange } = makeHarness({
+    positions,
+    setIntervalImpl: (fn) => { tick = fn; return 7; },
+    clearIntervalImpl: () => {},
+  });
+  await exchange.init();
+  positions.push(rawPositionWithoutValuation('BUY', '0.1', '59000', '3'));
+
+  await tick();
+
+  assert.equal(exchange.connectionState, 'READY');
+  assert.equal(exchange.getPosition(1).unrealizedPnl, 100);
 });
 
 test('RISEx read-only refresh failures are observable and stop performs no writes', async () => {

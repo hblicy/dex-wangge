@@ -9,6 +9,7 @@
 - RISEx Orders WebSocket、订单历史和单笔订单接口的价量字段按当前主网人类可读十进制字符串解析；开放订单仍按 ticks/steps，仓位仍按已验证的 WAD 结构，禁止按字符串长度猜单位。
 - RISEx Orders/Fills WebSocket 游标优先使用 `block_timestamp`，其次使用服务端 `timestamp`；顶层时间缺失或为空时才使用订单 `created_at` / 成交 `time`，所有候选缺失或非法必须进入 `HALTED`，禁止填 `0` 或本地时间。
 - RISEx 持仓缓存、杠杆回读和平仓确认统一使用 `/v1/positions` 全持仓接口；禁止把 `/v1/account/position` 的单市场返回交给全持仓 WAD 解析器。
+- RISEx `/v1/positions` 的 `mark_price` / `unrealized_pnl` 是可选估值字段；缺失时必须使用同轮官方盘口价（启动对账可使用刚读取的官方市场价）计算浮盈并记录一次来源切换，禁止因此中断订单管理，也禁止填 `0`。仓位大小、方向和开仓均价仍须严格解析。
 - 禁止根据订单消失推测成交或在正常状态自动撤销未知订单；唯一例外是用户已批准的 RISEx `HALTED` 紧急 `cancelAll`，它必须经过 REST 前置快照和逐单终态确认。成功后仍保持 `HALTED`，其他写操作继续禁止。
 - RISEx mainnet 的订单写接口（place/cancel/cancel-all）使用 `permit`，账户参数接口（目前 leverage）使用 `permit_params`；杠杆动作哈希必须包含 `RISE_PERPS_UPDATE_LEVERAGE_V1` 类型哈希并按 `uint16/uint8` 编码，permit 必须使用链上状态的下一 `nonce_anchor`。`risex-client 0.1.11` 的杠杆字段、杠杆编码和 nonce 行为与当前主网不兼容，写操作必须经过本地 `mainnet-client.js` 兼容层。
 - 禁止自动运行任何 RISEx 真实写入验证；真实账户验收必须由用户明确执行只读私有验证后，再人工使用最小资金操作。
