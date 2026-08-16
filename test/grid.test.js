@@ -48,6 +48,13 @@ test('seedOrders neutral: buys below, sells above, skip band near price', () => 
   assert.ok(orders.some((o) => o.price === 160));
 });
 
+test('seedOrders neutral: 50 grids never exceed a 50-order market limit', () => {
+  const g = buildGrid({ lower: 61000, upper: 65000, gridCount: 50 });
+  const orders = seedOrders({ levels: g.levels, price: 63023.75, mode: 'neutral', spacing: g.spacing });
+  assert.equal(orders.length, 50);
+  assert.ok(!orders.some((o) => o.price === 63000));
+});
+
 test('seedOrders long: only buys, none reduce-only', () => {
   const g = buildGrid({ lower: 100, upper: 200, gridCount: 10 });
   const orders = seedOrders({ levels: g.levels, price: 150, mode: 'long', spacing: g.spacing });

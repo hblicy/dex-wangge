@@ -28,14 +28,22 @@ export function isReduceOnly(side, mode) {
  * long:    buys below price only (accumulate long, take profit as price rises).
  * short:   sells above price only (build short, take profit as price falls).
  * Levels within `skipBand` (fraction of spacing) of price are skipped so we
- * don't immediately cross the market.
+ * don't immediately cross the market. A neutral grid also always skips the
+ * closest level: `gridCount` cells have `gridCount + 1` boundaries, while the
+ * configured order count and exchange limit are both `gridCount`.
  * @returns {{levelIndex:number, price:number, side:'buy'|'sell', reduceOnly:boolean}[]}
  */
 export function seedOrders({ levels, price, mode, skipBand = 0.25, spacing }) {
   const band = (spacing ?? gridSpacing(levels)) * skipBand;
+  const neutralSkipIndex = mode === 'neutral'
+    ? levels.reduce((closest, lvl, i) => (
+      Math.abs(lvl - price) < Math.abs(levels[closest] - price) ? i : closest
+    ), 0)
+    : -1;
   const orders = [];
   for (let i = 0; i < levels.length; i++) {
     const lvl = levels[i];
+    if (i === neutralSkipIndex) continue;
     if (Math.abs(lvl - price) < band) continue;
     if (lvl < price) {
       if (mode === 'neutral' || mode === 'long') {
