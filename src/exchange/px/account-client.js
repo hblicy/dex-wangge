@@ -44,11 +44,18 @@ function listFrom(payload, keys, label) {
   throw new Error(`PopDEX ${label} 缺少已验证的数组字段 ${keys.join('/')}。`);
 }
 
-function attachCursor(items, payload) {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return items;
-  const cursor = payload.cursor ?? payload.nextCursor;
-  if (cursor === undefined || cursor === null || cursor === '') return items;
-  const exactCursor = strictIntegerString(cursor, 'cursor');
+function attachCursor(items, ...sources) {
+  const cursors = sources.flatMap((source) => {
+    if (!source || typeof source !== 'object' || Array.isArray(source)) return [];
+    return [source.cursor, source.nextCursor]
+      .filter((value) => value !== undefined && value !== null && value !== '');
+  });
+  const unique = [...new Set(cursors)];
+  if (unique.length === 0) return items;
+  if (unique.length !== 1) {
+    throw new Error('PopDEX cursor 与 nextCursor 冲突。');
+  }
+  const exactCursor = strictIntegerString(unique[0], 'cursor');
   Object.defineProperty(items, 'cursor', {
     value: exactCursor,
     enumerable: false,
@@ -125,20 +132,21 @@ export class PopdexAccountClient {
     if (!Object.hasOwn(body, 'data')) {
       throw new Error(`PopDEX GET ${url.pathname} 成功响应缺少 data。`);
     }
-    return body.data;
+    return body;
   }
 
   async #orders(account, symbol, cursor = null) {
     const wallet = strictAddress(account, 'account');
     const target = targetSymbol(symbol);
     if (cursor !== null) strictIntegerString(cursor, 'cursor');
-    const payload = await this.#request(
+    const envelope = await this.#request(
       this.apiBase,
       `/api/v1/account/${wallet}/orders`,
       { limit: 100, symbol: target, cursor },
     );
+    const payload = envelope.data;
     const rows = listFrom(payload, ['data', 'list', 'rows', 'orders'], 'orders');
-    return attachCursor(rows.map(normalizeOrder), payload);
+    return attachCursor(rows.map(normalizeOrder), envelope, payload);
   }
 
   async getOpenOrders(account, symbol) {
@@ -153,21 +161,23 @@ export class PopdexAccountClient {
     const wallet = strictAddress(account, 'account');
     const target = targetSymbol(symbol);
     if (cursor !== null) strictIntegerString(cursor, 'cursor');
-    const payload = await this.#request(
+    const envelope = await this.#request(
       this.apiBase,
       `/api/v1/account/${wallet}/trade/fills`,
       { limit: 100, symbol: target, cursor },
     );
+    const payload = envelope.data;
     const rows = listFrom(payload, ['data', 'list', 'rows', 'fills'], 'fills');
-    return attachCursor(rows.map(normalizeFill), payload);
+    return attachCursor(rows.map(normalizeFill), envelope, payload);
   }
 
   async getOverview(account) {
     const wallet = strictAddress(account, 'account');
-    const payload = await this.#request(
+    const envelope = await this.#request(
       this.webBase,
       `/web/v1/account/${wallet}/overview`,
     );
+    const payload = envelope.data;
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
       throw new Error('PopDEX overview.data 必须是对象。');
     }

@@ -11,7 +11,7 @@ const HTML = `<!doctype html><html><body>
 const CHUNKS = new Map([
   ['/runtime.js', 'globalThis.__webpack_runtime__ = true;'],
   ['/trade.js', 'function placeOrder(){} function cancelOrder(){} const clientOrderId="grid";'],
-  ['/web3.js', 'function approveAgent(){} function revokeAgent(){} function updateLeverage(){} function closePosition(){}'],
+  ['/web3.js', 'function approveAgent(){} function revokeAgent(){} function updateLeverage(){} function placeReverseOrder(){}'],
 ]);
 
 function textResponse(text, status = 200, contentType = 'text/javascript') {

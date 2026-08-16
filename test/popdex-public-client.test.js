@@ -50,8 +50,8 @@ async function fakePublicFetch(input) {
       code: '200',
       msg: 'success',
       data: [
-        { time: '1786800000000', open: '62900', high: '63000', low: '62800', close: '62950' },
-        { time: '1786803600000', open: '62950', high: '63100', low: '62920', close: '63050' },
+        ['1786800000000', '62900', '63000', '62800', '62950', '1.2', '75480'],
+        ['1786803600000', '62950', '63100', '62920', '63050', '0.8', '50440'],
       ],
     });
   }
@@ -87,7 +87,7 @@ test('ticker requires positive bid ask last index and mark prices', async () => 
   });
 });
 
-test('candles preserve millisecond timestamps and require complete positive OHLC data', async () => {
+test('candles parse the exact seven-string Mainnet array schema', async () => {
   const client = new PopdexPublicClient({ fetchImpl: fakePublicFetch });
   assert.deepEqual(await client.getCandles('BTCUSDT', '1H', 2), [
     { time: '1786800000000', open: 62900, high: 63000, low: 62800, close: 62950 },

@@ -127,14 +127,17 @@ export class PopdexPublicClient {
       limit: String(limit),
     });
     return rows.map((row, index) => {
-      if (!row || typeof row !== 'object' || Array.isArray(row)) {
-        throw new Error(`PopDEX ${target} candle[${index}] 必须是对象。`);
+      if (!Array.isArray(row) || row.length !== 7) {
+        throw new Error(`PopDEX ${target} candle[${index}] 必须是 7 项字符串数组。`);
       }
-      const time = strictIntegerString(row.time, `${target} candle[${index}].time`);
-      const open = positiveNumber(row.open, `${target} candle[${index}].open`);
-      const high = positiveNumber(row.high, `${target} candle[${index}].high`);
-      const low = positiveNumber(row.low, `${target} candle[${index}].low`);
-      const close = positiveNumber(row.close, `${target} candle[${index}].close`);
+      const [rawTime, rawOpen, rawHigh, rawLow, rawClose, rawVolume, rawNotional] = row;
+      const time = strictIntegerString(rawTime, `${target} candle[${index}].time`);
+      const open = positiveNumber(rawOpen, `${target} candle[${index}].open`);
+      const high = positiveNumber(rawHigh, `${target} candle[${index}].high`);
+      const low = positiveNumber(rawLow, `${target} candle[${index}].low`);
+      const close = positiveNumber(rawClose, `${target} candle[${index}].close`);
+      strictDecimalString(rawVolume, `${target} candle[${index}].volume`);
+      strictDecimalString(rawNotional, `${target} candle[${index}].notional`);
       if (high < Math.max(open, close) || low > Math.min(open, close) || high < low) {
         throw new Error(`PopDEX ${target} candle[${index}] OHLC 关系无效。`);
       }

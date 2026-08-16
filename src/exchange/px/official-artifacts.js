@@ -4,16 +4,29 @@ const OFFICIAL_ORIGIN = 'https://app.popdex.xyz';
 const MAX_ARTIFACT_BYTES = 20 * 1024 * 1024;
 const MAX_CONTEXT_CHARS = 1200;
 
-export const POPDEX_PROTOCOL_TOKENS = Object.freeze([
+export const POPDEX_REQUIRED_PROTOCOL_TOKENS = Object.freeze([
   'approveAgent',
   'revokeAgent',
   'placeOrder',
   'cancelOrder',
   'updateLeverage',
-  'closePosition',
+  'placeReverseOrder',
   'clientOrderId',
   '0x0000000000000000000000000000000000001000',
   '0x0000000000000000000000000000000000001008',
+]);
+
+export const POPDEX_PROTOCOL_TOKENS = Object.freeze([
+  ...POPDEX_REQUIRED_PROTOCOL_TOKENS,
+  'replaceAgent',
+  'getAgent',
+  'AgentApproved',
+  'eth_sendRawTransaction',
+  'sendRawTransaction',
+  'signTransaction',
+  'writeContract',
+  'readContract',
+  'getTransactionReceipt',
 ]);
 
 function sanitizedCause(error) {

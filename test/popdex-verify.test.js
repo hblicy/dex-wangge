@@ -10,7 +10,7 @@ const ACCOUNT = '0x1111111111111111111111111111111111111111';
 const CONFIG = { candleInterval: '1H', candleLimit: 2 };
 const REQUIRED_TOKENS = [
   'approveAgent', 'revokeAgent', 'placeOrder', 'cancelOrder',
-  'updateLeverage', 'closePosition', 'clientOrderId',
+  'updateLeverage', 'placeReverseOrder', 'clientOrderId',
   '0x0000000000000000000000000000000000001000',
   '0x0000000000000000000000000000000000001008',
 ];
@@ -164,5 +164,33 @@ test('main rejects every trading or private-key flag before constructing clients
     } finally {
       process.exitCode = previousExitCode;
     }
+  }
+});
+
+test('artifacts-json prints collected evidence before reporting a missing protocol token', async () => {
+  const output = [];
+  const deps = fakeDependencies();
+  deps.inspectArtifacts = async () => ({
+    fetchedAt: '2026-08-16T00:00:00.000Z',
+    appUrl: 'https://app.popdex.xyz/',
+    scripts: [{ path: '/app.js', sha256: 'b'.repeat(64), bytes: 50 }],
+    matches: REQUIRED_TOKENS
+      .filter((token) => token !== 'placeReverseOrder')
+      .map((token) => ({ path: '/app.js', token, offset: 0, context: token })),
+  });
+  const previousExitCode = process.exitCode;
+  try {
+    process.exitCode = undefined;
+    await main(['--artifacts-json'], {
+      ...deps,
+      log: (line) => output.push(String(line)),
+      error: (line) => output.push(String(line)),
+    });
+    assert.equal(process.exitCode, 1);
+    const rendered = output.join('\n');
+    assert.match(rendered, /"scripts"/);
+    assert.match(rendered, /placeReverseOrder.*未找到/);
+  } finally {
+    process.exitCode = previousExitCode;
   }
 });

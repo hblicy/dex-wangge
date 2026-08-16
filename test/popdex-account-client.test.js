@@ -22,6 +22,7 @@ function makeAccountFetch(seen = []) {
       return jsonResponse({
         code: '200',
         msg: 'success',
+        cursor: '90071992547409935555',
         data: {
           orders: [{
             orderId: '90071992547409931234',
@@ -33,7 +34,6 @@ function makeAccountFetch(seen = []) {
             qty: '0.0002',
             filledQty: '0',
           }],
-          cursor: '90071992547409935555',
         },
       });
     }

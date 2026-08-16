@@ -4,7 +4,7 @@ import { PopdexAccountClient } from './account-client.js';
 import { POPDEX_EXPECTED_MARKETS } from './constants.js';
 import {
   inspectOfficialArtifacts,
-  POPDEX_PROTOCOL_TOKENS,
+  POPDEX_REQUIRED_PROTOCOL_TOKENS,
 } from './official-artifacts.js';
 import { strictAddress } from './normalize.js';
 import { PopdexPublicClient } from './public-client.js';
@@ -57,11 +57,9 @@ function verifyArtifactEvidence(artifacts) {
   if (!artifacts || !Array.isArray(artifacts.scripts) || !Array.isArray(artifacts.matches)) {
     throw new Error('PopDEX 官方前端扫描结果格式无效。');
   }
-  for (const token of POPDEX_PROTOCOL_TOKENS) {
-    if (!artifacts.matches.some((entry) => entry?.token === token)) {
-      throw new Error(`PopDEX 官方前端协议证据 ${token} 未找到。`);
-    }
-  }
+  return POPDEX_REQUIRED_PROTOCOL_TOKENS.filter(
+    (token) => !artifacts.matches.some((entry) => entry?.token === token),
+  );
 }
 
 export async function verifyPopdexPublic(config = {}, deps = {}) {
@@ -85,7 +83,10 @@ export async function verifyPopdexPublic(config = {}, deps = {}) {
     marketReads.push({ ...market, ticker, candleCount: candles.length });
   }
   const artifacts = await artifactInspector(deps.artifactOptions);
-  verifyArtifactEvidence(artifacts);
+  const missingArtifactTokens = verifyArtifactEvidence(artifacts);
+  if (missingArtifactTokens.length > 0 && config.allowMissingArtifactTokens !== true) {
+    throw new Error(`PopDEX 官方前端协议证据 ${missingArtifactTokens[0]} 未找到。`);
+  }
 
   return {
     mode: 'public',
@@ -93,6 +94,7 @@ export async function verifyPopdexPublic(config = {}, deps = {}) {
     chainId: chainId.toString(),
     markets: marketReads,
     artifacts,
+    missingArtifactTokens,
     writeMethodsCalled: 0,
   };
 }
@@ -202,7 +204,10 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   let account = '';
   try {
     const args = parseArgs(argv);
-    const publicResult = await verifyPopdexPublic({}, deps);
+    const publicResult = await verifyPopdexPublic(
+      { allowMissingArtifactTokens: args.artifactsJson },
+      deps,
+    );
     for (const line of renderPublic(publicResult)) (deps.log ?? console.log)(line);
     let accountResult = null;
     if (args.accountEnv) {
@@ -213,6 +218,11 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     }
     if (args.artifactsJson) {
       (deps.log ?? console.log)(JSON.stringify(publicResult.artifacts, null, 2));
+      if (publicResult.missingArtifactTokens.length > 0) {
+        throw new Error(
+          `PopDEX 官方前端协议证据 ${publicResult.missingArtifactTokens[0]} 未找到。`,
+        );
+      }
     }
     process.exitCode = 0;
     return { public: publicResult, account: accountResult };
