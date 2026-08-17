@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { EventEmitter } from 'node:events';
+import { webcrypto } from 'node:crypto';
 import fs from 'node:fs';
+import vm from 'node:vm';
 import * as security from '../src/security.js';
 import { SseClientPool } from '../src/sse.js';
 import { assertEnvFileSecure, writeEnvFile } from '../src/envfile.js';
@@ -220,8 +222,15 @@ test('Ethers 浏览器包固定为本地依赖和单一 vendor 路由', () => {
   const server = readProject('src/server.js');
   assert.equal(pkg.dependencies.ethers, '6.13.5');
   assert.match(server, /p === '\/vendor\/ethers\.js'/);
-  assert.match(server, /path\.join\(ROOT, 'node_modules', 'ethers', 'dist', 'ethers\.min\.js'\)/);
+  assert.match(server, /path\.join\(ROOT, 'node_modules', 'ethers', 'dist', 'ethers\.umd\.min\.js'\)/);
   assert.doesNotMatch(server, /startsWith\(['"]\/node_modules/);
+
+  const context = { crypto: webcrypto, setTimeout, clearTimeout };
+  context.globalThis = context;
+  context.window = context;
+  context.self = context;
+  vm.runInNewContext(readProject('node_modules/ethers/dist/ethers.umd.min.js'), context);
+  assert.equal(typeof context.ethers?.Wallet?.createRandom, 'function');
 });
 
 test('服务端入口统一调用安全边界、严格请求体和有界 SSE', () => {

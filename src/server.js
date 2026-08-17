@@ -124,7 +124,7 @@ const MIME = {
   '.woff2': 'font/woff2',
 };
 const CHART_JS_FILE = path.join(ROOT, 'node_modules', 'chart.js', 'dist', 'chart.umd.js');
-const ETHERS_JS_FILE = path.join(ROOT, 'node_modules', 'ethers', 'dist', 'ethers.min.js');
+const ETHERS_JS_FILE = path.join(ROOT, 'node_modules', 'ethers', 'dist', 'ethers.umd.min.js');
 
 function send(res, code, obj) {
   const body = JSON.stringify(obj, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
