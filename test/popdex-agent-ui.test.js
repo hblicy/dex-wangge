@@ -45,3 +45,14 @@ test('Agent UI refuses to guess unknown PopDEX network metadata', () => {
   assert.match(ui, /PopDEX 官方页面/);
   assert.doesNotMatch(ui, /wallet_addEthereumChain|nativeCurrency|rpcUrls|blockExplorerUrls/);
 });
+
+test('README and AGENTS describe authorization as isolated and not yet a trading runtime', () => {
+  const readme = readProject('README.md');
+  const agents = readProject('AGENTS.md');
+  for (const document of [readme, agents]) {
+    assert.match(document, /PopDEX.*Agent/si);
+    assert.match(document, /主钱包私钥.*(?:不会|禁止|不要|绝不)/);
+    assert.match(document, /(?:尚未|不开放).*PopDEX.*(?:下单|实盘|交易运行)/s);
+  }
+  assert.match(readme, /生成.*授权.*保存.*撤销/s);
+});
