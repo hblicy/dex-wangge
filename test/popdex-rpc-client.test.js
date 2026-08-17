@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { Interface } from 'ethers';
+import { Interface, parseUnits, ZeroAddress } from 'ethers';
 import {
   agentNameBytes32,
   POPDEX_ACCOUNT_INTERFACE,
@@ -14,6 +14,47 @@ const ACCOUNT_PRECOMPILE = '0x0000000000000000000000000000000000001008';
 const OPEN_POSITIONS_ABI = [
   'function getOpenPositionsByAccount(address account,uint32 offset,uint32 limit) view returns ((tuple(address walletId,uint128 positionId,uint16 symbolId,uint8 side,uint256 holdSize,uint256 avgOpenPrice,uint256 closeSize,uint256 lockedSize,int256 realizedPnl,uint64 createdTime,uint64 updatedTime)[] positions,bool hasMore) page)',
 ];
+const ORDER_PAGE_ABI = [
+  'function getActiveOrdersByAccount(address account,uint32 offset,uint32 limit) view returns ((tuple(address walletId,uint8 category,uint8 source,uint128 orderId,bytes32 clientOrderId,uint16 symbolId,uint8 side,bool isReduceOnly,uint8 orderType,uint8 timeInForce,uint8 stpMode,address stpKey,uint8 status,uint256 price,tuple(uint256 qty,uint256 filledQty,uint256 remainingQty,uint256 cancelledQty,uint256 quoteQty,uint256 filledQuoteQty,uint256 remainingQuoteQty,uint256 cancelledQuoteQty) quantities,uint256 averagePrice,uint64 nonce,uint64 createdAt,uint64 updatedAt,uint256 makerFeeRate,uint256 takerFeeRate)[] orders,bool hasMore) page)',
+  'function getCompletedOrdersByAccount(address account,uint32 offset,uint32 limit) view returns ((tuple(address walletId,uint8 category,uint8 source,uint128 orderId,bytes32 clientOrderId,uint16 symbolId,uint8 side,bool isReduceOnly,uint8 orderType,uint8 timeInForce,uint8 stpMode,address stpKey,uint8 status,uint256 price,tuple(uint256 qty,uint256 filledQty,uint256 remainingQty,uint256 cancelledQty,uint256 quoteQty,uint256 filledQuoteQty,uint256 remainingQuoteQty,uint256 cancelledQuoteQty) quantities,uint256 averagePrice,uint64 nonce,uint64 createdAt,uint64 updatedAt,uint256 makerFeeRate,uint256 takerFeeRate)[] orders,bool hasMore) page)',
+];
+
+function chainOrder(overrides = {}) {
+  const qty = parseUnits('0.0002', 18);
+  return {
+    walletId: ACCOUNT,
+    category: 2,
+    source: 0,
+    orderId: 90071992547409931234n,
+    clientOrderId: `0x${'12'.repeat(32)}`,
+    symbolId: 20000,
+    side: 0,
+    isReduceOnly: false,
+    orderType: 0,
+    timeInForce: 1,
+    stpMode: 0,
+    stpKey: ZeroAddress,
+    status: 1,
+    price: parseUnits('60000', 18),
+    quantities: {
+      qty,
+      filledQty: 0n,
+      remainingQty: qty,
+      cancelledQty: 0n,
+      quoteQty: 0n,
+      filledQuoteQty: 0n,
+      remainingQuoteQty: 0n,
+      cancelledQuoteQty: 0n,
+    },
+    averagePrice: 0n,
+    nonce: 1786946400000n,
+    createdAt: 1786946400000n,
+    updatedAt: 1786946400000n,
+    makerFeeRate: 0n,
+    takerFeeRate: 0n,
+    ...overrides,
+  };
+}
 
 function rpcResponse(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -142,6 +183,167 @@ test('RPC client reads official open-position precompile without losing uint val
     }],
     hasMore: false,
   });
+});
+
+test('RPC client reads official active orders without losing uint values', async () => {
+  const iface = new Interface(ORDER_PAGE_ABI);
+  const order = chainOrder();
+  const client = new PopdexRpcClient({
+    fetchImpl: async (_input, options) => {
+      const request = JSON.parse(options.body);
+      assert.equal(request.method, 'eth_call');
+      assert.equal(request.params[0].to, ORDER_PRECOMPILE);
+      assert.deepEqual(
+        iface.decodeFunctionData('getActiveOrdersByAccount', request.params[0].data).map(String),
+        [ACCOUNT, '0', '100'],
+      );
+      return rpcResponse({
+        jsonrpc: '2.0',
+        id: request.id,
+        result: iface.encodeFunctionResult('getActiveOrdersByAccount', [{
+          orders: [order],
+          hasMore: false,
+        }]),
+      });
+    },
+  });
+
+  assert.deepEqual(await client.getActiveOrders(ACCOUNT), {
+    orders: [{
+      walletId: ACCOUNT,
+      category: '2',
+      source: '0',
+      orderId: '90071992547409931234',
+      clientOrderId: `0x${'12'.repeat(32)}`,
+      symbolId: '20000',
+      side: '0',
+      isReduceOnly: false,
+      orderType: '0',
+      timeInForce: '1',
+      stpMode: '0',
+      stpKey: ZeroAddress,
+      status: '1',
+      priceWad: parseUnits('60000', 18).toString(),
+      qtyWad: parseUnits('0.0002', 18).toString(),
+      filledQtyWad: '0',
+      remainingQtyWad: parseUnits('0.0002', 18).toString(),
+      cancelledQtyWad: '0',
+      quoteQtyWad: '0',
+      filledQuoteQtyWad: '0',
+      remainingQuoteQtyWad: '0',
+      cancelledQuoteQtyWad: '0',
+      averagePriceWad: '0',
+      nonce: '1786946400000',
+      createdAt: '1786946400000',
+      updatedAt: '1786946400000',
+      makerFeeRateWad: '0',
+      takerFeeRateWad: '0',
+    }],
+    hasMore: false,
+  });
+});
+
+test('RPC client finds one completed order by clientOrderId across bounded pages', async () => {
+  const iface = new Interface(ORDER_PAGE_ABI);
+  const wanted = `0x${'34'.repeat(32)}`;
+  const offsets = [];
+  const client = new PopdexRpcClient({
+    fetchImpl: async (_input, options) => {
+      const request = JSON.parse(options.body);
+      const decoded = iface.decodeFunctionData(
+        'getCompletedOrdersByAccount',
+        request.params[0].data,
+      );
+      offsets.push(Number(decoded.offset));
+      const secondPage = decoded.offset === 100n;
+      return rpcResponse({
+        jsonrpc: '2.0',
+        id: request.id,
+        result: iface.encodeFunctionResult('getCompletedOrdersByAccount', [{
+          orders: secondPage
+            ? [chainOrder({ clientOrderId: wanted, status: 4 })]
+            : [chainOrder({ clientOrderId: `0x${'56'.repeat(32)}` })],
+          hasMore: !secondPage,
+        }]),
+      });
+    },
+  });
+
+  const result = await client.findUniqueOrderByClientId(ACCOUNT, wanted, {
+    completed: true,
+    maxPages: 2,
+  });
+  assert.equal(result.clientOrderId, wanted);
+  assert.equal(result.status, '4');
+  assert.deepEqual(offsets, [0, 100]);
+});
+
+test('RPC client rejects missing, duplicate and inconsistent on-chain orders', async () => {
+  const iface = new Interface(ORDER_PAGE_ABI);
+  const wanted = `0x${'78'.repeat(32)}`;
+  const clientFor = (orders) => new PopdexRpcClient({
+    fetchImpl: async (_input, options) => {
+      const request = JSON.parse(options.body);
+      return rpcResponse({
+        jsonrpc: '2.0',
+        id: request.id,
+        result: iface.encodeFunctionResult('getActiveOrdersByAccount', [{ orders, hasMore: false }]),
+      });
+    },
+  });
+
+  await assert.rejects(
+    clientFor([]).findUniqueOrderByClientId(ACCOUNT, wanted),
+    /clientOrderId.*未找到/,
+  );
+  await assert.rejects(
+    clientFor([
+      chainOrder({ clientOrderId: wanted }),
+      chainOrder({ orderId: 90071992547409931235n, clientOrderId: wanted }),
+    ]).findUniqueOrderByClientId(ACCOUNT, wanted),
+    /clientOrderId.*重复/,
+  );
+  const qty = parseUnits('0.0002', 18);
+  await assert.rejects(
+    clientFor([chainOrder({
+      clientOrderId: wanted,
+      quantities: {
+        ...chainOrder().quantities,
+        filledQty: qty,
+        remainingQty: qty,
+      },
+    })]).getActiveOrders(ACCOUNT),
+    /qty.*filledQty.*remainingQty.*cancelledQty/,
+  );
+  await assert.rejects(
+    clientFor([chainOrder({ walletId: AGENT, clientOrderId: wanted })]).getActiveOrders(ACCOUNT),
+    /walletId.*account.*不匹配/,
+  );
+  await assert.rejects(
+    clientFor([chainOrder({ symbolId: 20002, clientOrderId: wanted })]).getActiveOrders(ACCOUNT),
+    /symbolId.*白名单/,
+  );
+});
+
+test('RPC client stops order pagination at maxPages', async () => {
+  const iface = new Interface(ORDER_PAGE_ABI);
+  const client = new PopdexRpcClient({
+    fetchImpl: async (_input, options) => {
+      const request = JSON.parse(options.body);
+      return rpcResponse({
+        jsonrpc: '2.0',
+        id: request.id,
+        result: iface.encodeFunctionResult('getActiveOrdersByAccount', [{
+          orders: [],
+          hasMore: true,
+        }]),
+      });
+    },
+  });
+  await assert.rejects(
+    client.findUniqueOrderByClientId(ACCOUNT, `0x${'90'.repeat(32)}`, { maxPages: 1 }),
+    /分页超过.*1/,
+  );
 });
 
 test('RPC client reads exact official Agent authorization fields', async () => {

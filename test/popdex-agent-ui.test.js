@@ -10,7 +10,7 @@ test('dashboard adds a standalone PopDEX Agent tab without replacing Extended', 
   assert.match(html, /switchTab\('px-agent'\)[^>]*>🔐 PopDEX Agent</);
   assert.match(html, /id="tab-px-agent"/);
   assert.match(html, /switchTab\('ex'\)[^>]*>[\s\S]*Extended/);
-  assert.match(html, /<script src="\/vendor\/ethers\.js"><\/script>/);
+  assert.match(html, /<script src="\/vendor\/ethers\.js\?v=6\.13\.5-umd"><\/script>/);
   assert.match(html, /<script src="\/popdex-agent\.js"><\/script>/);
   assert.doesNotMatch(html, /cdn\.jsdelivr\.net|cdnjs\.cloudflare\.com|unpkg\.com/);
 });

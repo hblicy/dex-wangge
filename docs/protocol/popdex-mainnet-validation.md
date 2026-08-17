@@ -1,6 +1,6 @@
 # PopDEX Mainnet Protocol Validation
 
-Validated at: 2026-08-16T12:43:37.914Z
+Validated at: 2026-08-17T05:46:05.598Z
 
 Official app artifact hashes:
 
@@ -96,6 +96,15 @@ No transaction was signed, simulated as a write, or broadcast during this valida
 ## Order identity
 
 The Order precompile ABI proves that placement accepts a caller-provided `bytes32 clientOrderId`; cancellation requires both `uint128 orderId` and `bytes32 clientOrderId`; on-chain order getters expose both fields. All verifier parsers preserve IDs and cursors as strings.
+
+The current hashed artifact `/perp-static/client/js/98039.36abf38e738893c0cb67.chunk.js` also exposes both authoritative order-page reads:
+
+```text
+getActiveOrdersByAccount(address account,uint32 offset,uint32 limit) -> OrdersPage
+getCompletedOrdersByAccount(address account,uint32 offset,uint32 limit) -> OrdersPage
+```
+
+`OrdersPage` contains `OrderInfo[] orders` and `bool hasMore`. Each `OrderInfo` contains `walletId`, `category`, `source`, `orderId`, `clientOrderId`, `symbolId`, `side`, `isReduceOnly`, `orderType`, `timeInForce`, `stpMode`, `stpKey`, `status`, `price`, quantity fields (`qty`, `filledQty`, `remainingQty`, `cancelledQty` and their quote variants), `averagePrice`, `nonce`, timestamps and fee rates. These getters provide the authoritative `clientOrderId` to official `orderId` mapping required by the bounded write probe; REST order history is not used as the terminal source of truth.
 
 The same authoritative ABI exposes `getOpenPositionsByAccount(address account,uint32 offset,uint32 limit)` and returns `PositionInfo[] positions` plus `bool hasMore`. `PositionInfo` contains `walletId`, `positionId`, `symbolId`, `side`, `holdSize`, `avgOpenPrice`, `closeSize`, `lockedSize`, `realizedPnl`, `createdTime`, and `updatedTime`. A Mainnet read-only call against precompile `0x0000000000000000000000000000000000001000` decoded successfully. No REST position array is inferred from `/overview`.
 

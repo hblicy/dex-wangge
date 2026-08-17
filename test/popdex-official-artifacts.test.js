@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { inspectOfficialArtifacts } from '../src/exchange/px/official-artifacts.js';
+import {
+  inspectOfficialArtifacts,
+  POPDEX_REQUIRED_PROTOCOL_TOKENS,
+} from '../src/exchange/px/official-artifacts.js';
 
 const HTML = `<!doctype html><html><body>
   <script src="/runtime.js"></script>
@@ -45,6 +48,17 @@ test('artifact scanner records protocol tokens with bounded context', async () =
   assert.ok(result.matches.some((entry) => entry.token === 'placeOrder'));
   assert.ok(result.matches.some((entry) => entry.token === 'cancelOrder'));
   assert.ok(result.matches.every((entry) => entry.context.length <= 1200));
+});
+
+test('required protocol evidence includes on-chain active and completed order queries', () => {
+  for (const token of [
+    'getActiveOrdersByAccount',
+    'getCompletedOrdersByAccount',
+    'placeOrder',
+    'cancelOrder',
+  ]) {
+    assert.ok(POPDEX_REQUIRED_PROTOCOL_TOKENS.includes(token), token);
+  }
 });
 
 test('artifact scanner rejects cross-origin scripts and HTML without application chunks', async () => {
