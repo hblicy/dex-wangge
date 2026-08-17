@@ -1,10 +1,8 @@
 import {
-  concat,
+  encodeBytes32String,
   hexlify,
   Interface,
-  keccak256,
   parseUnits,
-  toUtf8Bytes,
   ZeroAddress,
 } from 'ethers';
 import { POPDEX_EXPECTED_MARKETS } from './constants.js';
@@ -116,10 +114,10 @@ export function prepareProbeOrder({
     throw new Error('PopDEX sell 探针价格必须严格高于 best ask。');
   }
 
-  const clientOrderId = keccak256(concat([
-    toUtf8Bytes(`dex-wangge:${symbol}:${normalizedSide}:${nowMs}:`),
-    entropy,
-  ])).toLowerCase();
+  const marketCode = symbol === 'BTCUSDT' ? 'b' : 'e';
+  const sideCode = normalizedSide === 'buy' ? 'b' : 's';
+  const clientOrderLabel = `dw-${marketCode}${sideCode}-${Buffer.from(entropy).toString('base64url')}`;
+  const clientOrderId = encodeBytes32String(clientOrderLabel).toLowerCase();
   const orderParams = encodeOrderParams(normalizedSide);
   const data = POPDEX_ORDER_INTERFACE.encodeFunctionData('placeOrder', [
     account,

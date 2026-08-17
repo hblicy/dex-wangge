@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { parseUnits, ZeroAddress } from 'ethers';
+import {
+  decodeBytes32String,
+  encodeBytes32String,
+  parseUnits,
+  ZeroAddress,
+} from 'ethers';
 import {
   encodeCancelOrder,
   encodeOrderParams,
@@ -83,6 +88,16 @@ test('prepareProbeOrder generates a different bytes32 client ID for different en
     randomBytesImpl: () => Uint8Array.from({ length: 16 }, (_, index) => index + 2),
   }));
   assert.notEqual(first.clientOrderId, second.clientOrderId);
+});
+
+test('prepareProbeOrder emits the canonical printable UTF-8 client ID required by mainnet', () => {
+  const plan = prepareProbeOrder(validOrder());
+  const label = decodeBytes32String(plan.clientOrderId);
+
+  assert.equal(label, 'dw-bb-AQIDBAUGBwgJCgsMDQ4PEA');
+  assert.match(label, /^dw-bb-[A-Za-z0-9_-]{22}$/);
+  assert.equal(Buffer.byteLength(label, 'utf8') <= 31, true);
+  assert.equal(encodeBytes32String(label), plan.clientOrderId);
 });
 
 for (const [name, overrides, expected] of [
