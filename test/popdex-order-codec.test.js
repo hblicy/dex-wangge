@@ -90,12 +90,13 @@ test('prepareProbeOrder generates a different bytes32 client ID for different en
   assert.notEqual(first.clientOrderId, second.clientOrderId);
 });
 
-test('prepareProbeOrder emits the canonical printable UTF-8 client ID required by mainnet', () => {
+test('prepareProbeOrder emits only ClientOrderID characters accepted by mainnet', () => {
   const plan = prepareProbeOrder(validOrder());
   const label = decodeBytes32String(plan.clientOrderId);
 
-  assert.equal(label, 'dw-bb-AQIDBAUGBwgJCgsMDQ4PEA');
-  assert.match(label, /^dw-bb-[A-Za-z0-9_-]{22}$/);
+  assert.equal(label, 'dw-bb-0102030405060708090a0b0c');
+  assert.match(label, /^dw-bb-[0-9a-f]{24}$/);
+  assert.doesNotMatch(label, /[_+/=]/);
   assert.equal(Buffer.byteLength(label, 'utf8') <= 31, true);
   assert.equal(encodeBytes32String(label), plan.clientOrderId);
 });
