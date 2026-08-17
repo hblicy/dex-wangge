@@ -23,6 +23,7 @@ export function parseArgs(argv) {
   const values = new Map(VALUE_FLAGS.map((flag) => [flag, null]));
   const seen = new Set();
   let confirmMainnetWrite = false;
+  let confirmMainnetCancel = false;
   let resume = false;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -37,10 +38,13 @@ export function parseArgs(argv) {
       index += 1;
       continue;
     }
-    if (arg === '--confirm-mainnet-write' || arg === '--resume') {
+    if (arg === '--confirm-mainnet-write'
+        || arg === '--confirm-mainnet-cancel'
+        || arg === '--resume') {
       if (seen.has(arg)) throw new Error(`PopDEX write-probe 重复参数 ${arg}。`);
       seen.add(arg);
       if (arg === '--confirm-mainnet-write') confirmMainnetWrite = true;
+      else if (arg === '--confirm-mainnet-cancel') confirmMainnetCancel = true;
       else resume = true;
       continue;
     }
@@ -51,6 +55,9 @@ export function parseArgs(argv) {
       throw new Error('PopDEX write-probe --resume 与下单参数及 --confirm-mainnet-write 互斥。');
     }
   } else {
+    if (confirmMainnetCancel) {
+      throw new Error('PopDEX write-probe --confirm-mainnet-cancel 必须与 --resume 同时使用。');
+    }
     for (const flag of VALUE_FLAGS) {
       if (values.get(flag) === null) throw new Error(`PopDEX write-probe 缺少参数 ${flag}。`);
     }
@@ -61,6 +68,7 @@ export function parseArgs(argv) {
     price: values.get('--price'),
     qty: values.get('--qty'),
     confirmMainnetWrite,
+    confirmMainnetCancel,
     resume,
   };
 }
@@ -276,12 +284,15 @@ function resumeFromRestOrder(record, order, journal) {
         `PopDEX resume REST 活动订单零成交数量不一致：remaining=${order.remainingQtyWad} cancelled=${order.cancelledQtyWad}。`,
       );
     }
+    const { status: restStatus, ...openOrder } = order;
     return {
       mode: 'resume',
       status: 'active-manual-cancel-required',
       source: 'receipt+REST',
+      restStatus,
       orderId: order.orderId,
       clientOrderId: record.clientOrderId,
+      openOrder,
     };
   }
   if (order.status !== 'Cancelled'
@@ -401,6 +412,88 @@ async function runResume({ mainAccount, readRpc, accountClient, journal }) {
   return { mode: 'resume', status: 'completed-zero-fill-cleared', orderId: completed.orderId };
 }
 
+async function runRecoveryCancel({
+  result,
+  mainAccount,
+  agentPrivateKey,
+  readRpc,
+  accountClient,
+  journal,
+  deps,
+}) {
+  if (result.status !== 'active-manual-cancel-required'
+      || result.source !== 'receipt+REST'
+      || result.restStatus !== 'NewAccept'
+      || !result.openOrder) {
+    throw new Error(
+      'PopDEX 恢复撤单只允许回执与 REST 已确认的 NewAccept 零成交订单。',
+    );
+  }
+  const current = journal.load();
+  if (current === null) throw new Error('PopDEX 恢复撤单记录不存在。');
+  if (current.stage === 'CANCEL_BROADCAST') {
+    throw new Error('PopDEX 撤单已经广播，禁止重复广播；请运行普通 --resume。');
+  }
+  if (current.stage !== 'BROADCAST' && current.stage !== 'OPEN_CONFIRMED') {
+    throw new Error(`PopDEX 恢复撤单不允许 journal 阶段 ${current.stage}。`);
+  }
+  if (current.orderId !== null && current.orderId !== result.orderId) {
+    throw new Error(
+      `PopDEX 恢复撤单 orderId 冲突：journal=${current.orderId} recovered=${result.orderId}。`,
+    );
+  }
+  const now = deps.now ?? (() => Date.now());
+  const writeRpc = deps.createWriteRpc
+    ? deps.createWriteRpc()
+    : new PopdexWriteRpcClient(deps.writeRpcOptions);
+  const trading = deps.createTradingClient
+    ? deps.createTradingClient({
+      mainAccount,
+      agentPrivateKey,
+      readRpc,
+      accountClient,
+      writeRpc,
+      now,
+    })
+    : new PopdexTradingClient({
+      mainAccount,
+      agentPrivateKey,
+      readRpc,
+      accountClient,
+      writeRpc,
+      now,
+    });
+  await trading.preflight();
+  if (current.stage === 'BROADCAST') {
+    journal.advance('BROADCAST', 'OPEN_CONFIRMED', { orderId: result.orderId });
+  }
+  const cancelled = await trading.cancelAndConfirm(result.openOrder, journal);
+  const completedRecord = journal.load();
+  if (completedRecord?.stage !== 'CANCEL_CONFIRMED') {
+    throw new Error('PopDEX 恢复撤单完成后 journal 未处于 CANCEL_CONFIRMED。');
+  }
+  const cancelTxHash = completedRecord.cancelTxHash;
+  if (typeof cancelTxHash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(cancelTxHash)) {
+    throw new Error('PopDEX 恢复撤单完成后 journal cancelTxHash 无效。');
+  }
+  if (cancelled.filledQtyWad !== '0'
+      || cancelled.remainingQtyWad !== '0'
+      || cancelled.cancelledQtyWad !== result.openOrder.qtyWad) {
+    throw new Error(
+      `PopDEX 恢复撤单终态数量不一致：filled=${String(cancelled.filledQtyWad)} remaining=${String(cancelled.remainingQtyWad)} cancelled=${String(cancelled.cancelledQtyWad)}。`,
+    );
+  }
+  journal.clearCompleted();
+  return {
+    mode: 'resume-cancel',
+    status: 'cancelled-zero-fill-cleared',
+    orderId: result.orderId,
+    cancelTxHash,
+    filledQtyWad: cancelled.filledQtyWad,
+    cancelledQtyWad: cancelled.cancelledQtyWad,
+  };
+}
+
 export async function runProbe(options, deps = {}) {
   const journal = deps.journal ?? new PopdexWriteJournal({
     file: deps.journalFile ?? JOURNAL_FILE,
@@ -410,9 +503,21 @@ export async function runProbe(options, deps = {}) {
   });
   const readRpc = deps.readRpc ?? new PopdexRpcClient(deps.readRpcOptions);
   if (options.resume) {
-    const { mainAccount } = exactEnvironment(deps, { requireAgent: false });
+    const { mainAccount, agentPrivateKey } = exactEnvironment(deps, {
+      requireAgent: options.confirmMainnetCancel,
+    });
     const accountClient = deps.accountClient ?? new PopdexAccountClient(deps.accountOptions);
-    return runResume({ mainAccount, readRpc, accountClient, journal });
+    const result = await runResume({ mainAccount, readRpc, accountClient, journal });
+    if (!options.confirmMainnetCancel) return result;
+    return runRecoveryCancel({
+      result,
+      mainAccount,
+      agentPrivateKey,
+      readRpc,
+      accountClient,
+      journal,
+      deps,
+    });
   }
 
   const existing = journal.load();
@@ -472,7 +577,7 @@ export async function runProbe(options, deps = {}) {
     ? deps.createWriteRpc()
     : new PopdexWriteRpcClient(deps.writeRpcOptions);
   const trading = deps.createTradingClient
-    ? deps.createTradingClient({ mainAccount, agentPrivateKey, readRpc, writeRpc, now })
+    ? deps.createTradingClient({ mainAccount, agentPrivateKey, readRpc, accountClient, writeRpc, now })
     : new PopdexTradingClient({ mainAccount, agentPrivateKey, readRpc, accountClient, writeRpc, now });
   journal.create({
     symbol: orderPlan.symbol,
@@ -516,6 +621,15 @@ function renderResult(result) {
       `main=${maskedAddress(result.mainAccount)} agent=${maskedAddress(result.agent)}`,
       `clientOrderId=${result.clientOrderId} calldataHash=${result.calldataHash}`,
       ...(result.orderId ? [`orderId=${result.orderId} cancelledQtyWad=${result.cancelledQtyWad}`] : []),
+    ];
+  }
+  if (result.mode === 'resume-cancel') {
+    return [
+      `PopDEX recovery-cancel status=${result.status}`,
+      `orderId=${result.orderId}`,
+      `cancelTxHash=${result.cancelTxHash}`,
+      `filledQtyWad=${result.filledQtyWad} cancelledQtyWad=${result.cancelledQtyWad}`,
+      '已确认零成交撤单并安全清理恢复记录。',
     ];
   }
   const lines = [`PopDEX resume status=${result.status}`];

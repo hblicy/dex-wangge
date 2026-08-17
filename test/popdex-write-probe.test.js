@@ -69,6 +69,7 @@ function options(overrides = {}) {
     price: '60000',
     qty: '0.0002',
     confirmMainnetWrite: false,
+    confirmMainnetCancel: false,
     resume: false,
     ...overrides,
   };
@@ -88,6 +89,12 @@ function fakeDependencies(overrides = {}) {
     create(plan) {
       calls.push('journal:create');
       this.record = { stage: 'PREPARED', ...plan };
+      return this.record;
+    },
+    advance(expectedStage, nextStage, fields = {}) {
+      assert.equal(this.record?.stage, expectedStage);
+      calls.push(`journal:advance:${expectedStage}:${nextStage}:${fields.orderId ?? ''}`);
+      this.record = { ...this.record, ...fields, stage: nextStage };
       return this.record;
     },
     completeFromChain(orderId) {
@@ -198,7 +205,7 @@ test('parseArgs accepts one exact dry-run, live or resume command', () => {
   ]).confirmMainnetWrite, true);
   assert.deepEqual(parseArgs(['--resume']), {
     symbol: null, side: null, price: null, qty: null,
-    confirmMainnetWrite: false, resume: true,
+    confirmMainnetWrite: false, confirmMainnetCancel: false, resume: true,
   });
 });
 
@@ -211,6 +218,33 @@ test('parseArgs rejects missing, duplicate, unknown and conflicting arguments', 
   assert.throws(() => parseArgs(['--unknown']), /不支持.*--unknown/);
   assert.throws(() => parseArgs(['--resume', '--confirm-mainnet-write']), /--resume.*互斥/);
   assert.throws(() => parseArgs(['--resume', '--symbol', 'BTCUSDT']), /--resume.*互斥/);
+});
+
+test('parseArgs accepts only the explicit resume cancel combination', () => {
+  assert.deepEqual(parseArgs(['--resume', '--confirm-mainnet-cancel']), {
+    symbol: null,
+    side: null,
+    price: null,
+    qty: null,
+    confirmMainnetWrite: false,
+    confirmMainnetCancel: true,
+    resume: true,
+  });
+  assert.throws(
+    () => parseArgs(['--confirm-mainnet-cancel']),
+    /--confirm-mainnet-cancel.*--resume/,
+  );
+  assert.throws(
+    () => parseArgs(['--resume', '--confirm-mainnet-cancel', '--confirm-mainnet-write']),
+    /互斥/,
+  );
+  assert.throws(
+    () => parseArgs([
+      '--resume', '--confirm-mainnet-cancel',
+      '--symbol', 'BTCUSDT', '--side', 'buy', '--price', '60000', '--qty', '0.0002',
+    ]),
+    /互斥/,
+  );
 });
 
 test('dry-run verifies market, book and Agent without constructing a write client', async () => {
@@ -429,7 +463,341 @@ test('resume uses a successful OrderCreate receipt plus REST when precompile ord
   assert.equal(result.status, 'active-manual-cancel-required');
   assert.equal(result.orderId, ORDER_ID);
   assert.equal(result.source, 'receipt+REST');
+  assert.equal(result.restStatus, 'NewAccept');
+  assert.deepEqual(result.openOrder, {
+    walletId: MAIN_ACCOUNT,
+    orderId: ORDER_ID,
+    clientOrderId: CLIENT_ORDER_ID,
+    symbolId: '20000',
+    side: '0',
+    priceWad: parseUnits('60000', 18).toString(),
+    qtyWad: parseUnits('0.0002', 18).toString(),
+    filledQtyWad: '0',
+    remainingQtyWad: parseUnits('0.0002', 18).toString(),
+    cancelledQtyWad: '0',
+    isReduceOnly: false,
+  });
   assert.equal(deps.journal.record.stage, 'BROADCAST');
+  assert.ok(!deps.calls.includes('journal:clear'));
+});
+
+test('explicit Agent recovery cancel advances the proven order, cancels once and clears zero-fill terminal state', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: null, placeTxHash: PLACE_TX_HASH,
+  };
+  deps.readRpc.getReceipt = async () => successfulPlacementReceipt();
+  deps.accountClient.findUniqueOrderByClientId = async () => restProbeOrder();
+  let cancelCalls = 0;
+  deps.createTradingClient = ({ accountClient }) => {
+    deps.calls.push('trading:create');
+    assert.equal(accountClient, deps.accountClient);
+    return {
+      async preflight() { deps.calls.push('trading:preflight'); },
+      async cancelAndConfirm(open, journal) {
+        deps.calls.push('trading:cancel');
+        cancelCalls += 1;
+        assert.equal(open.orderId, ORDER_ID);
+        assert.equal(open.clientOrderId, CLIENT_ORDER_ID);
+        journal.advance('OPEN_CONFIRMED', 'CANCEL_BROADCAST', { cancelTxHash: `0x${'56'.repeat(32)}` });
+        journal.advance('CANCEL_BROADCAST', 'CANCEL_CONFIRMED');
+        return {
+          ...open,
+          filledQtyWad: '0',
+          remainingQtyWad: '0',
+          cancelledQtyWad: open.qtyWad,
+        };
+      },
+    };
+  };
+
+  const result = await runProbe(
+    options({
+      symbol: null,
+      side: null,
+      price: null,
+      qty: null,
+      resume: true,
+      confirmMainnetCancel: true,
+    }),
+    deps,
+  );
+
+  assert.equal(result.mode, 'resume-cancel');
+  assert.equal(result.status, 'cancelled-zero-fill-cleared');
+  assert.equal(result.orderId, ORDER_ID);
+  assert.equal(cancelCalls, 1);
+  assert.ok(deps.calls.includes('write:create'));
+  assert.ok(deps.calls.includes('trading:preflight'));
+  assert.ok(deps.calls.includes(`journal:advance:BROADCAST:OPEN_CONFIRMED:${ORDER_ID}`));
+  assert.ok(deps.calls.includes('trading:cancel'));
+  assert.ok(deps.calls.includes('journal:clear'));
+  assert.equal(deps.journal.record, null);
+  assert.ok(!deps.calls.includes('trading:place'));
+});
+
+test('explicit Agent recovery cancel rejects non-NewAccept REST states before constructing write clients', async () => {
+  for (const restStatus of ['WaitToSend', 'PendingNew', 'PendingCancel', 'PartiallyFilled']) {
+    const deps = fakeDependencies();
+    deps.journal.record = {
+      stage: 'BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+      clientOrderId: CLIENT_ORDER_ID, orderId: null, placeTxHash: PLACE_TX_HASH,
+    };
+    deps.readRpc.getReceipt = async () => successfulPlacementReceipt();
+    deps.accountClient.findUniqueOrderByClientId = async () => restProbeOrder({ status: restStatus });
+
+    await assert.rejects(
+      runProbe(options({
+        symbol: null,
+        side: null,
+        price: null,
+        qty: null,
+        resume: true,
+        confirmMainnetCancel: true,
+      }), deps),
+      /只允许.*NewAccept.*零成交订单/,
+    );
+
+    assert.equal(deps.journal.record.stage, 'BROADCAST');
+    assert.ok(!deps.calls.includes('write:create'));
+    assert.ok(!deps.calls.includes('trading:create'));
+  }
+});
+
+test('explicit Agent recovery cancel rejects a missing recovery record before constructing write clients', async () => {
+  const deps = fakeDependencies();
+
+  await assert.rejects(
+    runProbe(options({
+      symbol: null,
+      side: null,
+      price: null,
+      qty: null,
+      resume: true,
+      confirmMainnetCancel: true,
+    }), deps),
+    /只允许.*NewAccept.*零成交订单/,
+  );
+
+  assert.ok(!deps.calls.includes('write:create'));
+  assert.ok(!deps.calls.includes('trading:create'));
+});
+
+test('explicit Agent recovery cancel rejects any fill before constructing write clients', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: null, placeTxHash: PLACE_TX_HASH,
+  };
+  deps.readRpc.getReceipt = async () => successfulPlacementReceipt();
+  deps.accountClient.findUniqueOrderByClientId = async () => restProbeOrder({
+    status: 'PartiallyFilled',
+    filledQty: '0.0001',
+    remainingQty: '0.0001',
+  });
+
+  await assert.rejects(
+    runProbe(options({
+      symbol: null,
+      side: null,
+      price: null,
+      qty: null,
+      resume: true,
+      confirmMainnetCancel: true,
+    }), deps),
+    /只允许.*NewAccept.*零成交订单/,
+  );
+
+  assert.equal(deps.journal.record.stage, 'BROADCAST');
+  assert.ok(!deps.calls.includes('write:create'));
+  assert.ok(!deps.calls.includes('trading:create'));
+});
+
+test('explicit Agent recovery cancel rejects legacy precompile-only facts before constructing write clients', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'OPEN_CONFIRMED', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: ORDER_ID,
+  };
+  deps.readRpc.findUniqueOrderByClientId = async (_account, _clientOrderId, query) => {
+    if (query.completed) throw notFound();
+    return {
+      walletId: MAIN_ACCOUNT,
+      orderId: ORDER_ID,
+      clientOrderId: CLIENT_ORDER_ID,
+      symbolId: '20000',
+      side: '0',
+      priceWad: parseUnits('60000', 18).toString(),
+      qtyWad: parseUnits('0.0002', 18).toString(),
+      filledQtyWad: '0',
+      remainingQtyWad: parseUnits('0.0002', 18).toString(),
+      cancelledQtyWad: '0',
+      isReduceOnly: false,
+    };
+  };
+
+  await assert.rejects(
+    runProbe(options({
+      symbol: null,
+      side: null,
+      price: null,
+      qty: null,
+      resume: true,
+      confirmMainnetCancel: true,
+    }), deps),
+    /只允许.*回执与 REST.*NewAccept/,
+  );
+
+  assert.equal(deps.journal.record.stage, 'OPEN_CONFIRMED');
+  assert.ok(!deps.calls.includes('write:create'));
+  assert.ok(!deps.calls.includes('trading:create'));
+});
+
+test('explicit Agent recovery cancel refuses to rebroadcast a CANCEL_BROADCAST journal', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'CANCEL_BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: ORDER_ID, placeTxHash: PLACE_TX_HASH,
+    cancelTxHash: `0x${'56'.repeat(32)}`,
+  };
+  deps.readRpc.getReceipt = async () => successfulPlacementReceipt();
+  deps.accountClient.findUniqueOrderByClientId = async () => restProbeOrder();
+
+  await assert.rejects(
+    runProbe(options({
+      symbol: null,
+      side: null,
+      price: null,
+      qty: null,
+      resume: true,
+      confirmMainnetCancel: true,
+    }), deps),
+    /撤单已经广播.*禁止重复广播.*普通 --resume/,
+  );
+
+  assert.equal(deps.journal.record.stage, 'CANCEL_BROADCAST');
+  assert.ok(!deps.calls.includes('write:create'));
+  assert.ok(!deps.calls.includes('trading:create'));
+});
+
+test('explicit Agent recovery cancel leaves BROADCAST unchanged when Agent preflight fails', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: null, placeTxHash: PLACE_TX_HASH,
+  };
+  deps.readRpc.getReceipt = async () => successfulPlacementReceipt();
+  deps.accountClient.findUniqueOrderByClientId = async () => restProbeOrder();
+  deps.createTradingClient = () => {
+    deps.calls.push('trading:create');
+    return {
+      async preflight() {
+        deps.calls.push('trading:preflight');
+        throw new Error('Agent 授权已过期');
+      },
+      async cancelAndConfirm() { deps.calls.push('trading:cancel'); },
+    };
+  };
+
+  await assert.rejects(
+    runProbe(options({
+      symbol: null,
+      side: null,
+      price: null,
+      qty: null,
+      resume: true,
+      confirmMainnetCancel: true,
+    }), deps),
+    /Agent 授权已过期/,
+  );
+
+  assert.equal(deps.journal.record.stage, 'BROADCAST');
+  assert.ok(deps.calls.includes('trading:preflight'));
+  assert.ok(!deps.calls.some((call) => call.startsWith('journal:advance:')));
+  assert.ok(!deps.calls.includes('trading:cancel'));
+  assert.ok(!deps.calls.includes('journal:clear'));
+});
+
+test('explicit Agent recovery cancel preserves CANCEL_BROADCAST after a cancel broadcast failure', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: null, placeTxHash: PLACE_TX_HASH,
+  };
+  deps.readRpc.getReceipt = async () => successfulPlacementReceipt();
+  deps.accountClient.findUniqueOrderByClientId = async () => restProbeOrder();
+  let cancelCalls = 0;
+  deps.createTradingClient = () => {
+    deps.calls.push('trading:create');
+    return {
+      async preflight() { deps.calls.push('trading:preflight'); },
+      async cancelAndConfirm(_open, journal) {
+        deps.calls.push('trading:cancel');
+        cancelCalls += 1;
+        journal.advance('OPEN_CONFIRMED', 'CANCEL_BROADCAST', {
+          cancelTxHash: `0x${'56'.repeat(32)}`,
+        });
+        throw new Error('撤单回执暂时不可用');
+      },
+    };
+  };
+
+  await assert.rejects(
+    runProbe(options({
+      symbol: null,
+      side: null,
+      price: null,
+      qty: null,
+      resume: true,
+      confirmMainnetCancel: true,
+    }), deps),
+    /撤单回执暂时不可用/,
+  );
+
+  assert.equal(cancelCalls, 1);
+  assert.equal(deps.journal.record.stage, 'CANCEL_BROADCAST');
+  assert.equal(deps.journal.record.cancelTxHash, `0x${'56'.repeat(32)}`);
+  assert.ok(!deps.calls.includes('journal:clear'));
+});
+
+test('explicit Agent recovery cancel never clears an inconsistent terminal quantity', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: null, placeTxHash: PLACE_TX_HASH,
+  };
+  deps.readRpc.getReceipt = async () => successfulPlacementReceipt();
+  deps.accountClient.findUniqueOrderByClientId = async () => restProbeOrder();
+  deps.createTradingClient = () => ({
+    async preflight() {},
+    async cancelAndConfirm(open, journal) {
+      journal.advance('OPEN_CONFIRMED', 'CANCEL_BROADCAST', {
+        cancelTxHash: `0x${'56'.repeat(32)}`,
+      });
+      journal.advance('CANCEL_BROADCAST', 'CANCEL_CONFIRMED');
+      return {
+        ...open,
+        filledQtyWad: '1',
+        remainingQtyWad: '0',
+        cancelledQtyWad: (BigInt(open.qtyWad) - 1n).toString(),
+      };
+    },
+  });
+
+  await assert.rejects(
+    runProbe(options({
+      symbol: null,
+      side: null,
+      price: null,
+      qty: null,
+      resume: true,
+      confirmMainnetCancel: true,
+    }), deps),
+    /恢复撤单终态数量不一致/,
+  );
+
+  assert.equal(deps.journal.record.stage, 'CANCEL_CONFIRMED');
   assert.ok(!deps.calls.includes('journal:clear'));
 });
 
@@ -524,6 +892,51 @@ test('main masks addresses and never prints the Agent private key or raw calldat
     assert.match(rendered, /dry-run/i);
     assert.doesNotMatch(rendered, new RegExp(AGENT_PRIVATE_KEY.slice(2), 'i'));
     assert.doesNotMatch(rendered, /serializedTransaction|raw transaction/i);
+  } finally {
+    process.exitCode = previousExitCode;
+  }
+});
+
+test('main reports an explicit recovery cancel without leaking the Agent key', async () => {
+  const output = [];
+  const deps = fakeDependencies({
+    log: (line) => output.push(String(line)),
+    error: (line) => output.push(String(line)),
+  });
+  deps.journal.record = {
+    stage: 'BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: null, placeTxHash: PLACE_TX_HASH,
+  };
+  deps.readRpc.getReceipt = async () => successfulPlacementReceipt();
+  deps.accountClient.findUniqueOrderByClientId = async () => restProbeOrder();
+  deps.createTradingClient = () => ({
+    async preflight() {},
+    async cancelAndConfirm(open, journal) {
+      journal.advance('OPEN_CONFIRMED', 'CANCEL_BROADCAST', {
+        cancelTxHash: `0x${'56'.repeat(32)}`,
+      });
+      journal.advance('CANCEL_BROADCAST', 'CANCEL_CONFIRMED');
+      return {
+        ...open,
+        filledQtyWad: '0',
+        remainingQtyWad: '0',
+        cancelledQtyWad: open.qtyWad,
+      };
+    },
+  });
+
+  const previousExitCode = process.exitCode;
+  try {
+    process.exitCode = undefined;
+    const result = await main(['--resume', '--confirm-mainnet-cancel'], deps);
+    assert.equal(process.exitCode, 0);
+    assert.equal(result.mode, 'resume-cancel');
+    const rendered = output.join('\n');
+    assert.match(rendered, /recovery-cancel status=cancelled-zero-fill-cleared/);
+    assert.match(rendered, new RegExp(`orderId=${ORDER_ID}`));
+    assert.match(rendered, new RegExp(`cancelTxHash=0x${'56'.repeat(32)}`));
+    assert.match(rendered, /零成交撤单.*安全清理/);
+    assert.doesNotMatch(rendered, new RegExp(AGENT_PRIVATE_KEY.slice(2), 'i'));
   } finally {
     process.exitCode = previousExitCode;
   }

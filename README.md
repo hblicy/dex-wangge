@@ -264,7 +264,15 @@ npm run popdex:write-probe -- --symbol BTCUSDT --side buy --price <同一价格>
 npm run popdex:write-probe -- --resume
 ```
 
-`--resume` 不会发送交易。成功下单回执与 REST 都表明订单仍活动时，它会输出 `active-manual-cancel-required`，需要先在 PopDEX 网页人工撤单，再次运行 `--resume`；只有 REST 明确返回 `Cancelled`、成交量为零且数量守恒时才会清除恢复记录。若下单回执明确失败，则还必须确认 REST 和预编译活动/完成查询都不存在该订单，才会输出 `reverted-placement-cleared`。回执缺失、格式不一致、查询冲突或任何成交都会保留记录并拒绝重试。
+`--resume` 不会发送交易。成功下单回执与 REST 都表明订单仍活动时，它会输出 `active-manual-cancel-required`；只有 REST 明确返回 `Cancelled`、成交量为零且数量守恒时才会清除恢复记录。若下单回执明确失败，则还必须确认 REST 和预编译活动/完成查询都不存在该订单，才会输出 `reverted-placement-cleared`。回执缺失、格式不一致、查询冲突或任何成交都会保留记录并拒绝重试。
+
+如果 PopDEX 网页无法连接钱包撤销探针遗留订单，可在普通 `--resume` 已确认 `source=receipt+REST`、REST 状态精确为 `NewAccept` 且成交量为零后，显式授权临时 Agent 只撤销恢复记录中唯一那一单：
+
+```bash
+npm run popdex:write-probe -- --resume --confirm-mainnet-cancel
+```
+
+这条命令会发送一笔 PopDEX Mainnet 撤单交易，但不会创建新订单。它会再次校验 Agent 授权、订单身份和零成交事实，广播一次撤单，随后通过 `OrderCancel` 回执和官方 REST 确认零成交终态；确认成功才清除恢复记录。若日志阶段已经是 `CANCEL_BROADCAST`，严禁再次执行该命令，只运行普通 `--resume` 查询既有撤单结果。任何成交、待发送/待确认/待撤状态、订单身份冲突或非 REST+回执事实都会在构造写客户端前拒绝。
 
 建议先用 BTCUSDT 最小金额完成闭环，再单独验收 ETHUSDT。本阶段尚未开放 PopDEX 自动网格、服务器交易路由或网页交易；该探针不能替代实盘网格验收。
 
@@ -646,7 +654,7 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 7. **VPS 使用独立服务用户**，并执行 `chmod 600 .env`；程序会拒绝读取权限过宽的密钥文件。
 8. **RISEx 使用独立小资金账户**：不得与人工交易或其他机器人共享；私有日志保存在本机终端/进程管理器日志中，排障时不要公开 `.env`、签名或账户敏感信息。
 9. **RISEx 实盘先完成人工七步验收**：程序不会自动发送真实验证订单；任何 `HALTED` 都应先到交易所网页核对挂单和持仓。
-10. **PopDEX 探针不是网格机器人**：只用最小金额人工执行一次；看到失败或 `.popdex-write-probe.json` 时禁止重新下单，先核对网页并运行 `--resume`。
+10. **PopDEX 探针不是网格机器人**：只用最小金额人工执行一次；看到失败或 `.popdex-write-probe.json` 时禁止重新下单，先核对网页并运行只读 `--resume`。仅当网页无法撤单且只读恢复严格确认 `NewAccept` 零成交时，才可显式执行 `--resume --confirm-mainnet-cancel` 撤销恢复记录中的唯一订单。
 11. 本程序没有远程服务器、不上传任何数据，所有状态都在你本机。
 
 ---
