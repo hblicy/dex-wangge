@@ -20,6 +20,15 @@ const ORDER_PAGE_INTERFACE = new Interface([
 const TARGET_SYMBOL_IDS = new Set(['20000', '20001']);
 const ORDER_PAGE_SIZE = 100;
 
+export class PopdexOrderNotFoundError extends Error {
+  constructor(clientOrderId) {
+    super(`PopDEX clientOrderId ${clientOrderId} 在链上订单中未找到。`);
+    this.name = 'PopdexOrderNotFoundError';
+    this.code = 'POPDEX_ORDER_NOT_FOUND';
+    this.clientOrderId = clientOrderId;
+  }
+}
+
 const READ_ONLY_METHODS = new Set([
   'eth_chainId',
   'eth_call',
@@ -330,7 +339,7 @@ export class PopdexRpcClient {
       }
       if (!page.hasMore) {
         if (matches.length === 0) {
-          throw new Error(`PopDEX clientOrderId ${wanted} 在链上订单中未找到。`);
+          throw new PopdexOrderNotFoundError(wanted);
         }
         return matches[0];
       }
