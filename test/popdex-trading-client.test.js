@@ -101,8 +101,8 @@ function dependencies({ agentInfo = activeAgent(), findOrder, simulate, broadcas
       async simulate(transaction) {
         calls.push('write:simulate');
         if (simulate) return simulate(transaction);
-        const name = POPDEX_ORDER_INTERFACE.parseTransaction({ data: transaction.data }).name;
-        return POPDEX_ORDER_INTERFACE.encodeFunctionResult(name, [true]);
+        POPDEX_ORDER_INTERFACE.parseTransaction({ data: transaction.data });
+        return '0x';
       },
       async broadcast(raw) {
         calls.push('write:broadcast');
@@ -170,6 +170,28 @@ test('placeAndConfirm signs one exact Agent legacy transaction and confirms the 
   ]);
   assert.equal(journal.advances[0].fields.placeTxHash, keccak256(deps.serialized[0]));
   assert.equal(activeReads, 2);
+});
+
+test('placeAndConfirm accepts the empty eth_call result returned by the Mainnet Order precompile', async () => {
+  const orderPlan = plan();
+  const deps = dependencies({
+    simulate: async () => '0x',
+    findOrder: async (_account, _clientOrderId, options) => {
+      if (options?.completed === true) {
+        const error = new Error('not completed');
+        error.code = 'POPDEX_ORDER_NOT_FOUND';
+        throw error;
+      }
+      return openOrder(orderPlan);
+    },
+  });
+  const journal = fakeJournal();
+
+  const result = await createClient(deps).placeAndConfirm(orderPlan, journal);
+
+  assert.equal(result.orderId, '90071992547409931234');
+  assert.equal(deps.serialized.length, 1);
+  assert.equal(journal.stage, 'OPEN_CONFIRMED');
 });
 
 test('cancelAndConfirm uses the next monotonic nonce and confirms zero-fill terminal state', async () => {

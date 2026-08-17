@@ -97,6 +97,8 @@ No transaction was signed, simulated as a write, or broadcast during this valida
 
 The Order precompile ABI proves that placement accepts a caller-provided `bytes32 clientOrderId`; cancellation requires both `uint128 orderId` and `bytes32 clientOrderId`; on-chain order getters expose both fields. Mainnet preflight evidence proves that the precompile parses this field as a restricted UTF-8 identifier: an arbitrary Keccak digest was rejected with `invalid UTF-8 in client order ID`, and a valid UTF-8 Base64URL label was rejected at its `_` character. The reference implementation uses `encodeBytes32String` with letters, digits and hyphens. New probe IDs therefore use the fixed `dw-<market><side>-` prefix plus 96 bits of lowercase hexadecimal randomness, remain within 31 UTF-8 bytes, and use canonical bytes32 zero padding. All verifier parsers preserve IDs and cursors as strings.
 
+Mainnet `eth_call` evidence also corrects the write return ABI: a valid `placeOrder` simulation returned exact empty data `0x`, while rejected inputs returned explicit JSON-RPC errors from the precompile. Therefore `placeOrder` and `cancelOrder` have no decodable bool result. The probe accepts only exact `0x` as a successful simulation and still rejects every RPC error or non-empty result before signing.
+
 The current hashed artifact `/perp-static/client/js/98039.36abf38e738893c0cb67.chunk.js` also exposes both authoritative order-page reads:
 
 ```text
