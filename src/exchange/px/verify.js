@@ -7,7 +7,7 @@ import {
   inspectOfficialArtifacts,
   POPDEX_REQUIRED_PROTOCOL_TOKENS,
 } from './official-artifacts.js';
-import { strictAddress } from './normalize.js';
+import { strictAddress, strictDecimalString } from './normalize.js';
 import { PopdexPublicClient } from './public-client.js';
 import { PopdexRpcClient } from './rpc-client.js';
 
@@ -132,6 +132,9 @@ export async function verifyPopdexAccount(config = {}, deps = {}) {
   if (positionPage.hasMore) {
     throw new Error('PopDEX 链上 positions 超过单页上限，验证器拒绝截断。');
   }
+  const accountEquity = strictDecimalString(overview.accountEquity, 'overview.accountEquity');
+  const availableMargin = strictDecimalString(overview.availableMargin, 'overview.availableMargin');
+  const totalCollateral = strictDecimalString(overview.totalCollateral, 'overview.totalCollateral');
 
   return {
     mode: 'account',
@@ -139,6 +142,9 @@ export async function verifyPopdexAccount(config = {}, deps = {}) {
     agentKeyRequired: false,
     markets,
     overviewKeys: Object.keys(overview).sort(),
+    accountEquity,
+    availableMargin,
+    totalCollateral,
     positions: positionPage.positions.length,
     positionSource: 'rpc:getOpenPositionsByAccount',
     writeMethodsCalled: 0,
@@ -198,6 +204,9 @@ function renderAccount(result) {
   for (const market of result.markets) {
     lines.push(`${market.name} open=${market.openOrders} fills=${market.fills}`);
   }
+  lines.push(
+    `equity=${result.accountEquity} availableMargin=${result.availableMargin} totalCollateral=${result.totalCollateral}`,
+  );
   lines.push(`positions=${result.positions} writeMethodsCalled=${result.writeMethodsCalled}`);
   return lines;
 }

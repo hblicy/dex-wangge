@@ -73,7 +73,12 @@ function fakeDependencies(calls = []) {
       },
       async getOverview(account) {
         calls.push(`account:overview:${account}`);
-        return { balances: [] };
+        return {
+          accountEquity: '0.00',
+          availableMargin: '0.00',
+          totalCollateral: '0.00',
+          balances: [],
+        };
       },
     },
   };
@@ -107,6 +112,9 @@ test('account verification reads orders fills overview and official on-chain pos
   assert.equal(result.writeMethodsCalled, 0);
   assert.equal(result.markets[0].openOrders, 1);
   assert.equal(result.markets[0].fills, 1);
+  assert.equal(result.accountEquity, '0.00');
+  assert.equal(result.availableMargin, '0.00');
+  assert.equal(result.totalCollateral, '0.00');
   assert.ok(calls.includes(`account:overview:${ACCOUNT}`));
   assert.ok(calls.includes(`rpc:positions:${ACCOUNT}`));
 });
@@ -139,6 +147,7 @@ test('main accepts only POPDEX_MAIN_ACCOUNT and masks it in output', async () =>
     assert.equal(result.account.account, ACCOUNT);
     const rendered = output.join('\n');
     assert.match(rendered, /0x1111…1111/);
+    assert.match(rendered, /equity=0\.00 availableMargin=0\.00 totalCollateral=0\.00/);
     assert.doesNotMatch(rendered, new RegExp(ACCOUNT, 'i'));
 
     process.exitCode = undefined;

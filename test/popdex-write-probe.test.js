@@ -11,6 +11,7 @@ const MAIN_ACCOUNT = '0x1111111111111111111111111111111111111111';
 const AGENT_PRIVATE_KEY = `0x${'22'.repeat(32)}`;
 const AGENT = new Wallet(AGENT_PRIVATE_KEY).address;
 const CLIENT_ORDER_ID = `0x${'12'.repeat(32)}`;
+const PLACE_TX_HASH = `0x${'34'.repeat(32)}`;
 
 function options(overrides = {}) {
   return {
@@ -46,6 +47,10 @@ function fakeDependencies(overrides = {}) {
     },
     clearCompleted() { calls.push('journal:clear'); this.record = null; },
     clearPrepared() { calls.push('journal:clear-prepared'); this.record = null; },
+    clearRevertedPlacement(txHash) {
+      calls.push(`journal:clear-reverted:${txHash}`);
+      this.record = null;
+    },
   };
   return {
     calls,
@@ -68,6 +73,17 @@ function fakeDependencies(overrides = {}) {
         return { bid: 62900, ask: 62901, last: 62900.5, index: 62910, mark: 62900.5 };
       },
     },
+    accountClient: {
+      async getOverview(account) {
+        calls.push(`account:overview:${account}`);
+        return {
+          accountEquity: '100.00',
+          availableMargin: '100.00',
+          totalCollateral: '100.00',
+          balances: [{ balance: '100.00' }],
+        };
+      },
+    },
     readRpc: {
       async verifyChain() { calls.push('read:chain'); return 2184n; },
       async getAgentInfo(agent) {
@@ -81,6 +97,8 @@ function fakeDependencies(overrides = {}) {
         };
       },
       async findUniqueOrderByClientId() { throw notFound(); },
+      async getReceipt(txHash) { calls.push(`read:receipt:${txHash}`); return null; },
+      async getTransactionFailure(txHash) { calls.push(`read:failure:${txHash}`); return null; },
     },
     journal,
     createWriteRpc() { calls.push('write:create'); return { name: 'writeRpc' }; },
@@ -153,10 +171,30 @@ test('dry-run verifies market, book and Agent without constructing a write clien
   assert.equal(result.agent, AGENT);
   assert.match(result.clientOrderId, /^0x[0-9a-f]{64}$/);
   assert.match(result.calldataHash, /^0x[0-9a-f]{64}$/);
+  assert.equal(result.availableMargin, '100.00');
   assert.ok(deps.calls.includes('read:chain'));
+  assert.ok(deps.calls.includes(`account:overview:${MAIN_ACCOUNT}`));
   assert.ok(deps.calls.includes(`read:agent:${AGENT}`));
   assert.ok(!deps.calls.includes('write:create'));
   assert.ok(!deps.calls.includes('trading:create'));
+});
+
+test('mainnet mode rejects zero available margin before creating a write client or journal', async () => {
+  const deps = fakeDependencies();
+  deps.accountClient.getOverview = async () => ({
+    accountEquity: '0.00',
+    availableMargin: '0.00',
+    totalCollateral: '0.00',
+    balances: [],
+  });
+
+  await assert.rejects(
+    runProbe(options({ confirmMainnetWrite: true }), deps),
+    /availableMargin=0\.00.*无法下单/,
+  );
+
+  assert.ok(!deps.calls.includes('write:create'));
+  assert.ok(!deps.calls.includes('journal:create'));
 });
 
 test('explicit mainnet mode creates the journal before place, then cancels and clears', async () => {
@@ -239,6 +277,54 @@ test('resume clears only an authoritative zero-fill completed order', async () =
   assert.ok(deps.calls.includes('journal:complete:9'));
   assert.ok(deps.calls.includes('journal:clear'));
   assert.ok(!deps.calls.includes('write:create'));
+});
+
+test('resume clears a BROADCAST journal only after the recorded placement receipt reverted', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: null, placeTxHash: PLACE_TX_HASH,
+  };
+  deps.readRpc.getReceipt = async (txHash) => {
+    deps.calls.push(`read:receipt:${txHash}`);
+    return { transactionHash: txHash, status: '0x0' };
+  };
+  deps.readRpc.getTransactionFailure = async (txHash) => {
+    deps.calls.push(`read:failure:${txHash}`);
+    return { message: '[13004] Quantity exceeds maximum' };
+  };
+
+  const result = await runProbe(
+    options({ resume: true, symbol: null, side: null, price: null, qty: null }),
+    deps,
+  );
+
+  assert.equal(result.status, 'reverted-placement-cleared');
+  assert.equal(result.txHash, PLACE_TX_HASH);
+  assert.equal(result.failure, '[13004] Quantity exceeds maximum');
+  assert.ok(deps.calls.includes(`journal:clear-reverted:${PLACE_TX_HASH}`));
+  assert.equal(deps.journal.record, null);
+  assert.ok(!deps.calls.includes('write:create'));
+});
+
+test('resume keeps an unresolved BROADCAST journal without an authoritative failed receipt', async () => {
+  for (const receipt of [null, { transactionHash: PLACE_TX_HASH, status: '0x1' }]) {
+    const deps = fakeDependencies();
+    deps.journal.record = {
+      stage: 'BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+      clientOrderId: CLIENT_ORDER_ID, orderId: null, placeTxHash: PLACE_TX_HASH,
+    };
+    deps.readRpc.getReceipt = async () => receipt;
+
+    const result = await runProbe(
+      options({ resume: true, symbol: null, side: null, price: null, qty: null }),
+      deps,
+    );
+
+    assert.equal(result.status, 'order-fact-unresolved');
+    assert.equal(deps.journal.record.stage, 'BROADCAST');
+    assert.ok(!deps.calls.some((call) => call.startsWith('journal:clear-reverted:')));
+  }
 });
 
 test('resume preserves the journal and requires manual position handling after any fill', async () => {
