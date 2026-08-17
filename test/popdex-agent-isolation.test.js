@@ -22,6 +22,11 @@ test('PopDEX Agent modules do not import Bot, persistence, AI, Decibel or RISEx'
   const combined = [
     readProject('src/exchange/px/agent.js'),
     readProject('src/exchange/px/agent-service.js'),
+    readProject('src/exchange/px/order-codec.js'),
+    readProject('src/exchange/px/trading-client.js'),
+    readProject('src/exchange/px/write-journal.js'),
+    readProject('src/exchange/px/write-probe.js'),
+    readProject('src/exchange/px/write-rpc-client.js'),
   ].join('\n');
   for (const forbidden of [
     '../../bot.js',
@@ -34,4 +39,29 @@ test('PopDEX Agent modules do not import Bot, persistence, AI, Decibel or RISEx'
   ]) {
     assert.equal(combined.includes(forbidden), false, forbidden);
   }
+});
+
+test('PopDEX write probe stays CLI-only and is not exposed as a grid or server route', () => {
+  const server = readProject('src/server.js');
+  const readme = readProject('README.md');
+  const agents = readProject('AGENTS.md');
+  const packageJson = readProject('package.json');
+  assert.match(packageJson, /"popdex:write-probe"/);
+  assert.match(readme, /popdex:write-probe/);
+  assert.match(readme, /--confirm-mainnet-write/);
+  assert.match(readme, /尚未.*PopDEX.*网格/s);
+  assert.match(agents, /单笔.*下单.*撤单.*探针/s);
+  assert.match(agents, /尚未.*自动网格/s);
+  assert.doesNotMatch(server, /createPxExchange|new GridBot\([^\n]*px/i);
+  assert.doesNotMatch(server, /\/api\/px\/(?:start|stop|orders|cancel|leverage|close)/i);
+});
+
+test('only the isolated PopDEX write RPC boundary can broadcast raw transactions', () => {
+  const pxFiles = fs.readdirSync(new URL('src/exchange/px/', root))
+    .filter((file) => file.endsWith('.js'));
+  const broadcasters = pxFiles.filter((file) => (
+    readProject(`src/exchange/px/${file}`).includes('eth_sendRawTransaction')
+  ));
+  assert.deepEqual(broadcasters.sort(), ['official-artifacts.js', 'write-rpc-client.js']);
+  assert.doesNotMatch(readProject('src/exchange/px/write-probe.js'), /eth_sendRawTransaction/);
 });

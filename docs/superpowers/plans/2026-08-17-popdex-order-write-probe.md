@@ -408,7 +408,7 @@ export class PopdexWriteJournal {
 }
 ```
 
-只保存设计文档允许的字段；用 `JSON.stringify(record, null, 2)` 写临时文件后原子重命名。`clearCompleted()` 只允许当前阶段为 `CANCEL_CONFIRMED`，其他阶段不能删除。
+只保存设计文档允许的字段；用 `JSON.stringify(record, null, 2)` 写临时文件后原子重命名。`clearPrepared()` 只允许清理尚无广播证据的 `PREPARED`；`clearCompleted()` 只允许当前阶段为 `CANCEL_CONFIRMED`，其他阶段不能删除。人工撤单由链上完成订单恢复时记录 `recoveredFromChain=true`，不得伪造撤单交易哈希。
 
 - [ ] **Step 4: 运行测试并确认 GREEN**
 
@@ -571,7 +571,7 @@ return { mode: 'mainnet-write', open, cancelled };
 `--resume` 只读取 journal，并查询活动/完成订单：
 
 - 找到活动订单：打印官方 `orderId`，要求用户到 PopDEX 人工撤单；不自动写。
-- 找到完成且零成交订单：按允许的单向转换依次补齐 `OPEN_CONFIRMED -> CANCEL_BROADCAST -> CANCEL_CONFIRMED`（已有阶段跳过），每一步都记录同一条链上完成订单证据，然后允许清理；禁止直接绕过阶段校验。
+- 找到完成且零成交订单：严格核对同一订单的身份、原始数量、零成交、零剩余和完整取消量，使用专用链上恢复转换写入 `recoveredFromChain=true` 后进入 `CANCEL_CONFIRMED` 并清理；禁止伪造 `cancelTxHash` 或绕过字段校验。
 - 找到任何成交：打印成交量并要求人工处理仓位。
 - 两处都找不到：报告事实不完整并保留 journal。
 
