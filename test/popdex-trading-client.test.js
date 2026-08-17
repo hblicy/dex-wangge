@@ -178,6 +178,8 @@ function dependencies({
   agentInfo = activeAgent(),
   findOrder,
   findRestOrder,
+  getFills,
+  getPositions,
   simulate,
   broadcast,
   waitReceipt,
@@ -194,12 +196,22 @@ function dependencies({
         calls.push(`read:order:${options?.completed === true ? 'completed' : 'active'}`);
         return findOrder(account, clientOrderId, options);
       },
+      async getOpenPositions(account, offset, limit) {
+        calls.push(`read:positions:${offset}:${limit}`);
+        if (getPositions) return getPositions(account, offset, limit);
+        return { positions: [], hasMore: false };
+      },
     },
     accountClient: {
       async findUniqueOrderByClientId(account, symbol, clientOrderId) {
         calls.push('rest:order');
         if (findRestOrder) return findRestOrder(account, symbol, clientOrderId);
         return restOrder();
+      },
+      async getFills(account, symbol, cursor) {
+        calls.push(`rest:fills:${cursor ?? 'first'}`);
+        if (getFills) return getFills(account, symbol, cursor);
+        return [];
       },
     },
     writeRpc: {
@@ -375,6 +387,82 @@ test('cancelAndConfirm uses OrderCancel receipt plus REST terminal state when pr
   assert.ok(deps.calls.includes('rest:order'));
   assert.equal(deps.calls.some((call) => call.startsWith('read:order:')), false);
   assert.equal(journal.stage, 'CANCEL_CONFIRMED');
+});
+
+test('cancelAndConfirm accepts exact OrderCancel when REST removes the order and no fill or position exists', async () => {
+  const orderPlan = plan();
+  const deps = dependencies({
+    findRestOrder: async () => {
+      const error = new Error('order removed from open list');
+      error.code = 'POPDEX_ORDER_NOT_FOUND';
+      throw error;
+    },
+    getFills: async () => [],
+    getPositions: async () => ({ positions: [], hasMore: false }),
+  });
+  const journal = fakeJournal('OPEN_CONFIRMED');
+
+  const result = await createClient(deps).cancelAndConfirm(openOrder(orderPlan), journal);
+
+  assert.equal(result.filledQtyWad, '0');
+  assert.equal(result.remainingQtyWad, '0');
+  assert.equal(result.cancelledQtyWad, orderPlan.qtyWad);
+  assert.ok(deps.calls.includes('rest:fills:first'));
+  assert.ok(deps.calls.includes('read:positions:0:100'));
+  assert.equal(journal.stage, 'CANCEL_CONFIRMED');
+});
+
+test('cancelAndConfirm keeps recovery state when the removed REST order has an exact fill', async () => {
+  const orderPlan = plan();
+  const open = openOrder(orderPlan);
+  const deps = dependencies({
+    findRestOrder: async () => {
+      const error = new Error('order removed from open list');
+      error.code = 'POPDEX_ORDER_NOT_FOUND';
+      throw error;
+    },
+    getFills: async () => [{ orderId: open.orderId, execQty: '0.0001' }],
+  });
+  const journal = fakeJournal('OPEN_CONFIRMED');
+
+  await assert.rejects(
+    createClient(deps).cancelAndConfirm(open, journal),
+    /CANCEL_CONFIRMED.*发生成交 100000000000000.*人工处理仓位/,
+  );
+
+  assert.equal(journal.stage, 'CANCEL_BROADCAST');
+  assert.equal(journal.errors.length, 1);
+  assert.ok(!deps.calls.includes('read:positions:0:100'));
+});
+
+test('cancelAndConfirm keeps recovery state when the removed REST order market still has a position', async () => {
+  const orderPlan = plan();
+  const open = openOrder(orderPlan);
+  const deps = dependencies({
+    findRestOrder: async () => {
+      const error = new Error('order removed from open list');
+      error.code = 'POPDEX_ORDER_NOT_FOUND';
+      throw error;
+    },
+    getFills: async () => [],
+    getPositions: async () => ({
+      positions: [{
+        walletId: MAIN_ACCOUNT,
+        symbolId: orderPlan.symbolId,
+        holdSizeWad: '100000000000000',
+      }],
+      hasMore: false,
+    }),
+  });
+  const journal = fakeJournal('OPEN_CONFIRMED');
+
+  await assert.rejects(
+    createClient(deps).cancelAndConfirm(open, journal),
+    /CANCEL_CONFIRMED market BTCUSDT 仍有持仓 100000000000000.*人工处理/,
+  );
+
+  assert.equal(journal.stage, 'CANCEL_BROADCAST');
+  assert.equal(journal.errors.length, 1);
 });
 
 test('preflight rejects missing, expired, global and conflicting Agent authorization', async () => {

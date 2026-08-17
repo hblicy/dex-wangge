@@ -89,9 +89,7 @@ updateLeverage(address account,(uint8 newLeverage,uint16 symbolId,address tokenA
 
 The official ABI uses `placeReverseOrder`, not `closePosition`, for the reverse-position close primitive. Artifact `/perp-static/client/js/screens-Main.3500ad687658add27232.chunk.js` proves at least one Agent write path: `updatePositionMode` is sent with the Agent account, `type="legacy"`, `nonce=Date.now()`, `gas=1000000`, and `gasPrice=0`, followed by receipt confirmation.
 
-The captured official app also routes order actions through authenticated REST paths including `/web/v1/uta/order/place`, `/web/v1/uta/order/closePlace`, and `/web/v1/uta/order/closeAll`. Static evidence did not connect those REST calls to the local Agent's exact calldata, nonce, raw transaction sender, or receipt. The bundled viem library contains generic local-account signing and `eth_sendRawTransaction`, but library capability alone is not proof that PopDEX order placement uses that path. Consequently, the actual Agent transaction sender, `msg.sender` relationship, gas policy, and nonce policy for order writes remain unvalidated.
-
-No transaction was signed, simulated as a write, or broadcast during this validation.
+The captured official app also routes order actions through authenticated REST paths including `/web/v1/uta/order/place`, `/web/v1/uta/order/closePlace`, and `/web/v1/uta/order/closeAll`. Static evidence alone did not connect those REST calls to the local Agent's exact calldata, nonce, raw transaction sender, or receipt. The later bounded Mainnet probe supplied the missing evidence for one direct Agent `placeOrder` and `cancelOrder` flow; it does not prove the separate authenticated REST write routes or any other order action.
 
 ## Order identity
 
@@ -106,20 +104,20 @@ getActiveOrdersByAccount(address account,uint32 offset,uint32 limit) -> OrdersPa
 getCompletedOrdersByAccount(address account,uint32 offset,uint32 limit) -> OrdersPage
 ```
 
-`OrdersPage` contains `OrderInfo[] orders` and `bool hasMore`. Each `OrderInfo` contains `walletId`, `category`, `source`, `orderId`, `clientOrderId`, `symbolId`, `side`, `isReduceOnly`, `orderType`, `timeInForce`, `stpMode`, `stpKey`, `status`, `price`, quantity fields (`qty`, `filledQty`, `remainingQty`, `cancelledQty` and their quote variants), `averagePrice`, `nonce`, timestamps and fee rates. These getters provide the authoritative `clientOrderId` to official `orderId` mapping required by the bounded write probe; REST order history is not used as the terminal source of truth.
+`OrdersPage` contains `OrderInfo[] orders` and `bool hasMore`. Each `OrderInfo` contains `walletId`, `category`, `source`, `orderId`, `clientOrderId`, `symbolId`, `side`, `isReduceOnly`, `orderType`, `timeInForce`, `stpMode`, `stpKey`, `status`, `price`, quantity fields (`qty`, `filledQty`, `remainingQty`, `cancelledQty` and their quote variants), `averagePrice`, `nonce`, timestamps and fee rates. Mainnet evidence showed that both precompile order pages can remain empty while the official REST endpoint and web UI show a live `NewAccept` order, and that the REST order endpoint removes the row after cancellation instead of returning a `Cancelled` row. The bounded probe therefore anchors cancellation on the exact successful transaction receipt and matching `OrderCancel` event, then requires absence from the REST open-order set, zero matching fills across bounded REST pagination, and no target-market position across bounded on-chain pagination before clearing recovery state.
+
+The approved 2026-08-17 minimum-value write probe placed BTCUSDT order `234237619377012736` through the authorized Agent. The web UI and official REST exposed the live order. Agent cancellation produced a successful receipt and exact `OrderCancel`; subsequent verification returned BTCUSDT `open=0`, `fills=0`, ETHUSDT `open=0`, `fills=0`, and `positions=0`. This establishes the observed cancellation disappearance semantics used by recovery. It does not authorize automated grid trading, marketable fills, leverage changes, or position closing.
 
 The same authoritative ABI exposes `getOpenPositionsByAccount(address account,uint32 offset,uint32 limit)` and returns `PositionInfo[] positions` plus `bool hasMore`. `PositionInfo` contains `walletId`, `positionId`, `symbolId`, `side`, `holdSize`, `avgOpenPrice`, `closeSize`, `lockedSize`, `realizedPnl`, `createdTime`, and `updatedTime`. A Mainnet read-only call against precompile `0x0000000000000000000000000000000000001000` decoded successfully. No REST position array is inferred from `/overview`.
 
-No captured artifact or non-empty account response proved how a placement transaction's `txHash` maps to the official `orderId`, or whether the REST placement response returns that mapping. Treating `txHash` as `orderId`, as the reference repository does, is therefore rejected.
+The bounded Mainnet probe established the mapping through the exact `OrderCreate` event in the recorded placement receipt and the matching official REST row. The implementation still rejects treating `txHash` itself as `orderId`.
 
 ## Required write probes
 
-No write probe was performed under this read-only plan. A later, separately approved Mainnet probe must use these bounded steps:
+The first bounded probe is complete: a newly authorized Agent was verified on chain, one non-marketable minimum-value BTCUSDT order was signed and broadcast by that Agent, the exact `OrderCreate` receipt mapped the deterministic `clientOrderId` to the official `orderId`, REST and the web UI confirmed the live order, and a single Agent cancellation produced the exact `OrderCancel` receipt. The remaining separately approved probes are:
 
-1. Authorize one newly generated Agent from the main wallet and confirm `getAgent` returns the same Agent, delegator, expiry and initial nonce.
-2. Place one non-marketable BTCUSDT limit order using the smallest aligned quantity that satisfies the 10 USDT minimum at the then-current price, capture calldata, sender, nonce, `txHash`, `clientOrderId`, REST order row and official `orderId`, then cancel it and confirm its terminal state.
-3. With a separate explicit approval, execute the minimum aligned marketable quantity, confirm the fill stream and position REST row, submit reduce-only close behavior, and confirm the position is flat.
-4. During the same probes, record the official maximum-open-order response and bounded rate-limit headers or errors; no current authoritative limit was found in the read-only artifacts.
+1. Execute the minimum aligned marketable quantity, confirm the fill stream and non-empty on-chain position schema, submit the proven reduce-only close primitive, and confirm the position is flat.
+2. Record the official maximum-open-order response and bounded rate-limit headers or errors; no current authoritative limit was found in the captured evidence.
 
 ## Conclusion
 
@@ -129,11 +127,11 @@ BLOCKED
 |---|---|
 | Mainnet chain ID and RPC identity | Validated: chain ID 2184. |
 | Account precompile, Agent ABI, nonce units and readback | Validated from hashed official artifacts. |
-| Order precompile ABI and Agent signing/send model | Blocked: ABI is known, but the real order sender/signing path is not connected to the authenticated REST order flow. |
-| `msg.sender`, main account and Agent relationship | Blocked for order writes; only Agent authorization and position-mode write behavior were proven. |
-| `txHash`, `clientOrderId`, `orderId` mapping | Blocked: no authoritative mapping was observed. |
-| Place, cancel, leverage and reduce-only close terminal states | Blocked: no approved Mainnet write probe was executed. |
+| Order precompile ABI and Agent signing/send model | Validated for one non-marketable place and cancel probe. |
+| Agent, main account and delegated order relationship | Validated for the bounded place/cancel probe through on-chain Agent readback, signed transactions and exact receipt events. |
+| `txHash`, `clientOrderId`, `orderId` mapping | Validated for the bounded probe through the exact `OrderCreate` receipt and REST order identity. |
+| Place and cancel terminal states | Validated for one non-marketable zero-fill BTCUSDT probe; marketable fill, leverage and reduce-only close remain blocked. |
 | Complete order, fill and position schema and pagination | Partially validated: a real empty account passed both target-market REST reads, overview, and the official on-chain position read. Non-empty rows and pagination remain blocked. |
 | Maximum open orders and rate limits | Blocked: no authoritative value was present in the read-only evidence. |
 
-The single next action is a separately approved minimum-value Mainnet write-probe session following the bounded steps above. It must capture Agent authorization, exact order sender/signing behavior, `txHash`/`clientOrderId`/`orderId` mapping, cancellation terminal state, one minimum fill and reduce-only close. Live adapter, Agent UI, Extended removal and all PopDEX trading writes remain disabled until every blocked gate has authoritative evidence.
+The next protocol action requires separate approval: one minimum marketable fill followed by a proven reduce-only close and flat-position confirmation. The Agent authorization UI and isolated bounded CLI probe are available; PopDEX automatic grid trading and server trading routes remain disabled until the remaining gates have authoritative evidence.

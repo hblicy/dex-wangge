@@ -5,12 +5,13 @@ import { decodeBytes32String, formatUnits, keccak256, parseUnits } from 'ethers'
 import { loadEnv, ROOT } from '../../config.js';
 import { PopdexAccountClient } from './account-client.js';
 import { deriveAgentAddress } from './agent.js';
+import { confirmMissingCancelledOrder } from './cancel-confirmation.js';
 import { POPDEX_EXPECTED_MARKETS } from './constants.js';
 import { strictAddress, strictDecimalString, strictIntegerString } from './normalize.js';
 import { prepareProbeOrder } from './order-codec.js';
 import { PopdexPublicClient } from './public-client.js';
 import { PopdexRpcClient } from './rpc-client.js';
-import { parseOrderCreateReceipt } from './receipt-events.js';
+import { parseOrderCancelReceipt, parseOrderCreateReceipt } from './receipt-events.js';
 import { PopdexTradingClient, validateAgentAuthorization } from './trading-client.js';
 import { PopdexWriteJournal } from './write-journal.js';
 import { PopdexWriteRpcClient } from './write-rpc-client.js';
@@ -137,19 +138,19 @@ function exactFailedReceipt(receipt, expectedTxHash) {
 
 function exactSuccessfulReceipt(receipt, expectedTxHash) {
   if (!receipt || typeof receipt !== 'object') {
-    throw new Error('PopDEX 成功下单回执必须是对象。');
+    throw new Error('PopDEX 成功交易回执必须是对象。');
   }
   const transactionHash = String(receipt.transactionHash || '').toLowerCase();
   if (!/^0x[0-9a-f]{64}$/.test(transactionHash)) {
-    throw new Error('PopDEX 成功下单回执 transactionHash 无效。');
+    throw new Error('PopDEX 成功交易回执 transactionHash 无效。');
   }
   if (transactionHash !== expectedTxHash) {
     throw new Error(
-      `PopDEX 成功下单回执 transactionHash 不匹配：expected=${expectedTxHash} actual=${transactionHash}。`,
+      `PopDEX 成功交易回执 transactionHash 不匹配：expected=${expectedTxHash} actual=${transactionHash}。`,
     );
   }
   if (receipt.status !== '0x1') {
-    throw new Error(`PopDEX 成功下单回执 status 必须是 0x1，实际 ${String(receipt.status)}。`);
+    throw new Error(`PopDEX 成功交易回执 status 必须是 0x1，实际 ${String(receipt.status)}。`);
   }
 }
 
@@ -312,10 +313,132 @@ function resumeFromRestOrder(record, order, journal) {
   };
 }
 
+async function resumeCancelBroadcast({ mainAccount, readRpc, accountClient, record, journal }) {
+  if (record.stage !== 'CANCEL_BROADCAST' || typeof record.cancelTxHash !== 'string') return null;
+  const receipt = await readRpc.getReceipt(record.cancelTxHash);
+  if (receipt === null) return null;
+  exactSuccessfulReceipt(receipt, record.cancelTxHash);
+  parseOrderCancelReceipt(receipt, {
+    account: mainAccount,
+    orderId: record.orderId,
+    clientOrderId: record.clientOrderId,
+  });
+
+  const rest = await findRestOptional(
+    accountClient,
+    mainAccount,
+    record.symbol,
+    record.clientOrderId,
+  );
+  if (rest !== null) {
+    const result = resumeFromRestOrder(
+      record,
+      recoveredRestOrder(record, rest, mainAccount, { orderId: record.orderId }),
+      journal,
+    );
+    if (result.status === 'active-manual-cancel-required') {
+      return { ...result, status: 'cancel-indexing-pending' };
+    }
+    return result;
+  }
+
+  const active = await findOptional(readRpc, mainAccount, record.clientOrderId, false);
+  if (active !== null) {
+    exactRecoveredIdentity(record, active, mainAccount);
+    if (active.filledQtyWad !== '0') {
+      return {
+        mode: 'resume',
+        status: 'filled-manual-position-required',
+        source: 'cancel-receipt+precompile-active',
+        orderId: active.orderId,
+        filledQtyWad: active.filledQtyWad,
+      };
+    }
+    return {
+      mode: 'resume',
+      status: 'cancel-indexing-pending',
+      source: 'cancel-receipt+precompile-active',
+      orderId: active.orderId,
+    };
+  }
+
+  const completed = await findOptional(readRpc, mainAccount, record.clientOrderId, true);
+  if (completed !== null) {
+    exactRecoveredIdentity(record, completed, mainAccount);
+    if (completed.filledQtyWad !== '0') {
+      return {
+        mode: 'resume',
+        status: 'filled-manual-position-required',
+        source: 'cancel-receipt+precompile-completed',
+        orderId: completed.orderId,
+        filledQtyWad: completed.filledQtyWad,
+      };
+    }
+    const expectedQtyWad = parseUnits(record.qty, 18).toString();
+    if (completed.remainingQtyWad !== '0' || completed.cancelledQtyWad !== expectedQtyWad) {
+      throw new Error(
+        `PopDEX resume 撤单完成数量不一致：remaining=${completed.remainingQtyWad} cancelled=${completed.cancelledQtyWad}。`,
+      );
+    }
+    journal.completeFromChain(completed.orderId);
+    journal.clearCompleted();
+    return {
+      mode: 'resume',
+      status: 'completed-zero-fill-cleared',
+      source: 'cancel-receipt+precompile-completed',
+      orderId: completed.orderId,
+    };
+  }
+
+  const evidence = await confirmMissingCancelledOrder({
+    accountClient,
+    readRpc,
+    mainAccount,
+    symbol: record.symbol,
+    orderId: record.orderId,
+  });
+  if (evidence.status === 'filled') {
+    return {
+      mode: 'resume',
+      status: 'filled-manual-position-required',
+      source: 'cancel-receipt+fills',
+      orderId: record.orderId,
+      filledQtyWad: evidence.filledQtyWad,
+    };
+  }
+  if (evidence.status === 'position-open') {
+    return {
+      mode: 'resume',
+      status: 'position-manual-required',
+      source: 'cancel-receipt+positions',
+      orderId: record.orderId,
+      holdSizeWad: evidence.holdSizeWad,
+    };
+  }
+  journal.completeFromChain(record.orderId);
+  journal.clearCompleted();
+  return {
+    mode: 'resume',
+    status: 'completed-zero-fill-cleared',
+    source: 'cancel-receipt+REST-open+fills+positions',
+    orderId: record.orderId,
+    fillPages: evidence.fillPages,
+    positionPages: evidence.positionPages,
+  };
+}
+
 async function runResume({ mainAccount, readRpc, accountClient, journal }) {
   const record = journal.load();
   if (record === null) return { mode: 'resume', status: 'no-record' };
   await readRpc.verifyChain();
+  const cancelResult = await resumeCancelBroadcast({
+    mainAccount,
+    readRpc,
+    accountClient,
+    record,
+    journal,
+  });
+  if (cancelResult !== null) return cancelResult;
   if (typeof record.placeTxHash === 'string') {
     const txHash = record.placeTxHash.toLowerCase();
     const receipt = await readRpc.getReceipt(txHash);
@@ -503,6 +626,9 @@ export async function runProbe(options, deps = {}) {
   });
   const readRpc = deps.readRpc ?? new PopdexRpcClient(deps.readRpcOptions);
   if (options.resume) {
+    if (options.confirmMainnetCancel && journal.load()?.stage === 'CANCEL_BROADCAST') {
+      throw new Error('PopDEX 撤单已经广播，禁止重复广播；请运行普通 --resume。');
+    }
     const { mainAccount, agentPrivateKey } = exactEnvironment(deps, {
       requireAgent: options.confirmMainnetCancel,
     });

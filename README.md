@@ -258,13 +258,13 @@ dry-run 会额外显示 `availableMargin`。确认 `POPDEX_MAIN_ACCOUNT` 正是�
 npm run popdex:write-probe -- --symbol BTCUSDT --side buy --price <同一价格> --qty <同一数量> --confirm-mainnet-write
 ```
 
-最后一条命令会先读取官方账户概览；可用保证金不足时会在签名和广播前拒绝。通过后才向 PopDEX Mainnet 发送真实限价单，解析同一交易回执的 `OrderCreate` 事件，并用官方 REST 精确核对 `clientOid`、订单状态与数量，确认挂单后才自动尝试撤单；撤单同样需要 `OrderCancel` 回执和 REST 零成交终态共同确认。任何阶段失败都不要重复执行实盘命令；先到 PopDEX 网页核对挂单和持仓，再运行只读恢复检查：
+最后一条命令会先读取官方账户概览；可用保证金不足时会在签名和广播前拒绝。通过后才向 PopDEX Mainnet 发送真实限价单，解析同一交易回执的 `OrderCreate` 事件，并用官方 REST 精确核对 `clientOid`、订单状态与数量，确认挂单后才自动尝试撤单。撤单必须先取得精确匹配的 `OrderCancel` 回执；若 REST 已移除该订单，还必须确认活动订单不存在、该 `orderId` 没有成交且目标市场没有持仓。任何阶段失败都不要重复执行实盘命令；先到 PopDEX 网页核对挂单和持仓，再运行只读恢复检查：
 
 ```bash
 npm run popdex:write-probe -- --resume
 ```
 
-`--resume` 不会发送交易。成功下单回执与 REST 都表明订单仍活动时，它会输出 `active-manual-cancel-required`；只有 REST 明确返回 `Cancelled`、成交量为零且数量守恒时才会清除恢复记录。若下单回执明确失败，则还必须确认 REST 和预编译活动/完成查询都不存在该订单，才会输出 `reverted-placement-cleared`。回执缺失、格式不一致、查询冲突或任何成交都会保留记录并拒绝重试。
+`--resume` 不会发送交易。成功下单回执与 REST 都表明订单仍活动时，它会输出 `active-manual-cancel-required`。若恢复记录已经是 `CANCEL_BROADCAST`，程序会核验已记录撤单交易的精确 `OrderCancel` 回执；官方 REST 会在撤单后移除活动订单，因此只有同时确认 REST 活动订单不存在、该 `orderId` 的全部成交分页为零、目标市场全部链上持仓分页为空，才会输出 `completed-zero-fill-cleared` 并清除恢复记录。若发现成交或持仓则保留记录并要求人工处理。若下单回执明确失败，则还必须确认 REST 和预编译活动/完成查询都不存在该订单，才会输出 `reverted-placement-cleared`。回执缺失、格式不一致或查询冲突都会保留记录。
 
 如果 PopDEX 网页无法连接钱包撤销探针遗留订单，可在普通 `--resume` 已确认 `source=receipt+REST`、REST 状态精确为 `NewAccept` 且成交量为零后，显式授权临时 Agent 只撤销恢复记录中唯一那一单：
 
@@ -272,7 +272,7 @@ npm run popdex:write-probe -- --resume
 npm run popdex:write-probe -- --resume --confirm-mainnet-cancel
 ```
 
-这条命令会发送一笔 PopDEX Mainnet 撤单交易，但不会创建新订单。它会再次校验 Agent 授权、订单身份和零成交事实，广播一次撤单，随后通过 `OrderCancel` 回执和官方 REST 确认零成交终态；确认成功才清除恢复记录。若日志阶段已经是 `CANCEL_BROADCAST`，严禁再次执行该命令，只运行普通 `--resume` 查询既有撤单结果。任何成交、待发送/待确认/待撤状态、订单身份冲突或非 REST+回执事实都会在构造写客户端前拒绝。
+这条命令会发送一笔 PopDEX Mainnet 撤单交易，但不会创建新订单。它会再次校验 Agent 授权、订单身份和零成交事实，只广播一次撤单；撤单后若 REST 不再返回该活动订单，则按上一段的回执、成交和持仓证据完成确认。若日志阶段已经是 `CANCEL_BROADCAST`，严禁再次执行该命令，只运行普通 `--resume` 查询既有撤单结果。任何成交、待发送/待确认/待撤状态、订单身份冲突或证据不完整都会保留恢复记录。
 
 建议先用 BTCUSDT 最小金额完成闭环，再单独验收 ETHUSDT。本阶段尚未开放 PopDEX 自动网格、服务器交易路由或网页交易；该探针不能替代实盘网格验收。
 
