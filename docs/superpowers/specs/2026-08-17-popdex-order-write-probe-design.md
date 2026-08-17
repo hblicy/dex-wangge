@@ -66,7 +66,7 @@ npm run popdex:write-probe -- --symbol BTCUSDT --side buy --price 60000 --qty 0.
 
 1. 加载安全的 `.env`，派生 Agent 地址，但不输出私钥。
 2. 验证官方 chainId、市场身份、最新盘口和 Agent 授权。
-3. 生成不可重复、可打印且不超过 31 个 UTF-8 字节的标签，再通过 `encodeBytes32String` 得到规范 bytes32 `clientOrderId`；禁止使用任意 Keccak/随机 32 字节。随后把阶段 `PREPARED` 原子写入仅所有者可读写的恢复文件。
+3. 使用固定 `dw-<market><side>-` 前缀和 96 位小写十六进制随机值生成不超过 31 个 UTF-8 字节的标签，再通过 `encodeBytes32String` 得到规范 bytes32 `clientOrderId`；禁止使用任意 Keccak/随机 32 字节，也禁止 Base64/Base64URL 的 `_`、`+`、`/`、`=`。随后把阶段 `PREPARED` 原子写入仅所有者可读写的恢复文件。
 4. 使用当前官方网页产物验证过的格式编码 `placeOrder`。
 5. 在广播前执行只读模拟；模拟失败时不广播。
 6. Agent 签名并在广播前保存可由签名交易确定计算的 `txHash` 和阶段 `BROADCAST`。
@@ -132,7 +132,7 @@ npm run popdex:write-probe -- --symbol BTCUSDT --side buy --price 60000 --qty 0.
 
 - 两个白名单市场和所有非白名单市场。
 - tick、lot、`minQty`、最低名义金额和盘口外价格保护。
-- bytes32 `clientOrderId` 唯一性、可打印 UTF-8、31 字节上限和 `encodeBytes32String` 往返解码。
+- bytes32 `clientOrderId` 唯一性、受限十六进制字符集、31 字节上限和 `encodeBytes32String` 往返解码。
 - `placeOrder`/`cancelOrder` 的固定 ABI 向量与 `orderParams` 字节向量。
 - Agent 与主账户关系、授权过期、delegator 冲突和 global 授权拒绝。
 - 模拟、广播、回执失败与超时。

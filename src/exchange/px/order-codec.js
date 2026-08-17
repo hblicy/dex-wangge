@@ -116,7 +116,7 @@ export function prepareProbeOrder({
 
   const marketCode = symbol === 'BTCUSDT' ? 'b' : 'e';
   const sideCode = normalizedSide === 'buy' ? 'b' : 's';
-  const clientOrderLabel = `dw-${marketCode}${sideCode}-${Buffer.from(entropy).toString('base64url')}`;
+  const clientOrderLabel = `dw-${marketCode}${sideCode}-${hexlify(entropy.slice(0, 12)).slice(2)}`;
   const clientOrderId = encodeBytes32String(clientOrderLabel).toLowerCase();
   const orderParams = encodeOrderParams(normalizedSide);
   const data = POPDEX_ORDER_INTERFACE.encodeFunctionData('placeOrder', [
