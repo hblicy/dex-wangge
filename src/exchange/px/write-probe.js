@@ -1,15 +1,16 @@
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { formatUnits, keccak256, parseUnits } from 'ethers';
+import { decodeBytes32String, formatUnits, keccak256, parseUnits } from 'ethers';
 import { loadEnv, ROOT } from '../../config.js';
 import { PopdexAccountClient } from './account-client.js';
 import { deriveAgentAddress } from './agent.js';
 import { POPDEX_EXPECTED_MARKETS } from './constants.js';
-import { strictAddress, strictDecimalString } from './normalize.js';
+import { strictAddress, strictDecimalString, strictIntegerString } from './normalize.js';
 import { prepareProbeOrder } from './order-codec.js';
 import { PopdexPublicClient } from './public-client.js';
 import { PopdexRpcClient } from './rpc-client.js';
+import { parseOrderCreateReceipt } from './receipt-events.js';
 import { PopdexTradingClient, validateAgentAuthorization } from './trading-client.js';
 import { PopdexWriteJournal } from './write-journal.js';
 import { PopdexWriteRpcClient } from './write-rpc-client.js';
@@ -126,6 +127,24 @@ function exactFailedReceipt(receipt, expectedTxHash) {
   }
 }
 
+function exactSuccessfulReceipt(receipt, expectedTxHash) {
+  if (!receipt || typeof receipt !== 'object') {
+    throw new Error('PopDEX 成功下单回执必须是对象。');
+  }
+  const transactionHash = String(receipt.transactionHash || '').toLowerCase();
+  if (!/^0x[0-9a-f]{64}$/.test(transactionHash)) {
+    throw new Error('PopDEX 成功下单回执 transactionHash 无效。');
+  }
+  if (transactionHash !== expectedTxHash) {
+    throw new Error(
+      `PopDEX 成功下单回执 transactionHash 不匹配：expected=${expectedTxHash} actual=${transactionHash}。`,
+    );
+  }
+  if (receipt.status !== '0x1') {
+    throw new Error(`PopDEX 成功下单回执 status 必须是 0x1，实际 ${String(receipt.status)}。`);
+  }
+}
+
 function exactAvailableMargin(overview) {
   if (!overview || typeof overview !== 'object' || Array.isArray(overview)) {
     throw new Error('PopDEX account overview 必须是对象。');
@@ -179,10 +198,167 @@ async function findOptional(readRpc, account, clientOrderId, completed) {
   }
 }
 
-async function runResume({ mainAccount, readRpc, journal }) {
+async function findRestOptional(accountClient, account, symbol, clientOrderId) {
+  try {
+    return await accountClient.findUniqueOrderByClientId(account, symbol, clientOrderId);
+  } catch (error) {
+    if (error?.code === 'POPDEX_ORDER_NOT_FOUND') return null;
+    throw error;
+  }
+}
+
+function recoveredRestOrder(record, order, mainAccount, receiptOrder) {
+  if (!order || typeof order !== 'object' || Array.isArray(order)) {
+    throw new Error('PopDEX resume REST order 必须是对象。');
+  }
+  const market = POPDEX_EXPECTED_MARKETS[record.symbol];
+  if (!market) throw new Error(`PopDEX journal symbol ${String(record.symbol)} 不在白名单。`);
+  const wad = (value, field) => parseUnits(strictDecimalString(value, field), 18).toString();
+  const filledQtyWad = wad(order.filledQty, 'resume REST order.filledQty');
+  const remainingQtyWad = wad(order.remainingQty, 'resume REST order.remainingQty');
+  const cancelledQtyWad = wad(order.cancelledQty, 'resume REST order.cancelledQty');
+  const qtyWad = parseUnits(record.qty, 18).toString();
+  const fields = [
+    ['walletId', mainAccount.toLowerCase(), strictAddress(order.walletId, 'resume REST order.walletId').toLowerCase()],
+    ['orderId', receiptOrder.orderId, strictIntegerString(order.orderId, 'resume REST order.orderId')],
+    ['clientOid', decodeBytes32String(record.clientOrderId), order.clientOid],
+    ['symbolId', market.symbolId, String(order.symbolId)],
+    ['symbol', record.symbol, order.symbol],
+    ['side', record.side === 'buy' ? 'Buy' : 'Sell', order.side],
+    ['priceWad', parseUnits(record.price, 18).toString(), wad(order.price, 'resume REST order.price')],
+    ['qtyWad', qtyWad, wad(order.qty, 'resume REST order.qty')],
+  ];
+  for (const [field, expected, actual] of fields) {
+    if (expected !== actual) {
+      throw new Error(
+        `PopDEX resume REST ${field} 不匹配：expected=${String(expected)} actual=${String(actual)}。`,
+      );
+    }
+  }
+  if (order.reduceOnly !== false) throw new Error('PopDEX resume REST reduceOnly 必须是 false。');
+  if (BigInt(qtyWad) !== BigInt(filledQtyWad) + BigInt(remainingQtyWad) + BigInt(cancelledQtyWad)) {
+    throw new Error('PopDEX resume REST qty 不等于 filled + remaining + cancelled。');
+  }
+  return {
+    walletId: mainAccount,
+    orderId: receiptOrder.orderId,
+    clientOrderId: record.clientOrderId,
+    symbolId: market.symbolId,
+    side: record.side === 'buy' ? '0' : '1',
+    priceWad: parseUnits(record.price, 18).toString(),
+    qtyWad,
+    filledQtyWad,
+    remainingQtyWad,
+    cancelledQtyWad,
+    isReduceOnly: false,
+    status: order.status,
+  };
+}
+
+function resumeFromRestOrder(record, order, journal) {
+  const activeStatuses = new Set(['WaitToSend', 'PendingNew', 'NewAccept', 'PendingCancel', 'PartiallyFilled']);
+  const terminalStatuses = new Set(['Cancelled', 'FullyFilled', 'PartiallyFilledCancelled']);
+  if (!activeStatuses.has(order.status) && !terminalStatuses.has(order.status)) {
+    throw new Error(`PopDEX resume REST order.status 未验证：${String(order.status)}。`);
+  }
+  if (order.filledQtyWad !== '0') {
+    return {
+      mode: 'resume',
+      status: 'filled-manual-position-required',
+      source: 'receipt+REST',
+      orderId: order.orderId,
+      filledQtyWad: order.filledQtyWad,
+    };
+  }
+  if (activeStatuses.has(order.status)) {
+    if (order.remainingQtyWad !== order.qtyWad || order.cancelledQtyWad !== '0') {
+      throw new Error(
+        `PopDEX resume REST 活动订单零成交数量不一致：remaining=${order.remainingQtyWad} cancelled=${order.cancelledQtyWad}。`,
+      );
+    }
+    return {
+      mode: 'resume',
+      status: 'active-manual-cancel-required',
+      source: 'receipt+REST',
+      orderId: order.orderId,
+      clientOrderId: record.clientOrderId,
+    };
+  }
+  if (order.status !== 'Cancelled'
+      || order.remainingQtyWad !== '0'
+      || order.cancelledQtyWad !== order.qtyWad) {
+    throw new Error(
+      `PopDEX resume REST 零成交终态不一致：status=${order.status} remaining=${order.remainingQtyWad} cancelled=${order.cancelledQtyWad}。`,
+    );
+  }
+  if (record.stage !== 'CANCEL_CONFIRMED') journal.completeFromChain(order.orderId);
+  journal.clearCompleted();
+  return {
+    mode: 'resume',
+    status: 'completed-zero-fill-cleared',
+    source: 'receipt+REST',
+    orderId: order.orderId,
+  };
+}
+
+async function runResume({ mainAccount, readRpc, accountClient, journal }) {
   const record = journal.load();
   if (record === null) return { mode: 'resume', status: 'no-record' };
   await readRpc.verifyChain();
+  if (typeof record.placeTxHash === 'string') {
+    const txHash = record.placeTxHash.toLowerCase();
+    const receipt = await readRpc.getReceipt(txHash);
+    if (receipt?.status === '0x0') {
+      exactFailedReceipt(receipt, txHash);
+      const active = await findOptional(readRpc, mainAccount, record.clientOrderId, false);
+      const completed = await findOptional(readRpc, mainAccount, record.clientOrderId, true);
+      const rest = await findRestOptional(
+        accountClient,
+        mainAccount,
+        record.symbol,
+        record.clientOrderId,
+      );
+      if (active !== null || completed !== null || rest !== null) {
+        throw new Error('PopDEX 失败下单回执与订单查询事实冲突。');
+      }
+      const failure = safeFailureMessage(
+        await readRpc.getTransactionFailure(txHash),
+        mainAccount,
+      );
+      journal.clearRevertedPlacement(txHash);
+      return {
+        mode: 'resume',
+        status: 'reverted-placement-cleared',
+        txHash,
+        failure,
+      };
+    }
+    if (receipt?.status === '0x1') {
+      exactSuccessfulReceipt(receipt, txHash);
+      const market = POPDEX_EXPECTED_MARKETS[record.symbol];
+      if (!market) throw new Error(`PopDEX journal symbol ${String(record.symbol)} 不在白名单。`);
+      const receiptOrder = parseOrderCreateReceipt(receipt, {
+        account: mainAccount,
+        symbolId: market.symbolId,
+        clientOrderId: record.clientOrderId,
+        priceWad: parseUnits(record.price, 18).toString(),
+        qtyWad: parseUnits(record.qty, 18).toString(),
+      });
+      const rest = await findRestOptional(
+        accountClient,
+        mainAccount,
+        record.symbol,
+        record.clientOrderId,
+      );
+      if (rest !== null) {
+        return resumeFromRestOrder(
+          record,
+          recoveredRestOrder(record, rest, mainAccount, receiptOrder),
+          journal,
+        );
+      }
+    }
+  }
   const active = await findOptional(readRpc, mainAccount, record.clientOrderId, false);
   if (active !== null) {
     exactRecoveredIdentity(record, active, mainAccount);
@@ -203,24 +379,6 @@ async function runResume({ mainAccount, readRpc, journal }) {
   }
   const completed = await findOptional(readRpc, mainAccount, record.clientOrderId, true);
   if (completed === null) {
-    if (record.stage === 'BROADCAST' && typeof record.placeTxHash === 'string') {
-      const txHash = record.placeTxHash.toLowerCase();
-      const receipt = await readRpc.getReceipt(txHash);
-      if (receipt?.status === '0x0') {
-        exactFailedReceipt(receipt, txHash);
-        const failure = safeFailureMessage(
-          await readRpc.getTransactionFailure(txHash),
-          mainAccount,
-        );
-        journal.clearRevertedPlacement(txHash);
-        return {
-          mode: 'resume',
-          status: 'reverted-placement-cleared',
-          txHash,
-          failure,
-        };
-      }
-    }
     return { mode: 'resume', status: 'order-fact-unresolved', clientOrderId: record.clientOrderId };
   }
   exactRecoveredIdentity(record, completed, mainAccount);
@@ -253,7 +411,8 @@ export async function runProbe(options, deps = {}) {
   const readRpc = deps.readRpc ?? new PopdexRpcClient(deps.readRpcOptions);
   if (options.resume) {
     const { mainAccount } = exactEnvironment(deps, { requireAgent: false });
-    return runResume({ mainAccount, readRpc, journal });
+    const accountClient = deps.accountClient ?? new PopdexAccountClient(deps.accountOptions);
+    return runResume({ mainAccount, readRpc, accountClient, journal });
   }
 
   const existing = journal.load();
@@ -314,7 +473,7 @@ export async function runProbe(options, deps = {}) {
     : new PopdexWriteRpcClient(deps.writeRpcOptions);
   const trading = deps.createTradingClient
     ? deps.createTradingClient({ mainAccount, agentPrivateKey, readRpc, writeRpc, now })
-    : new PopdexTradingClient({ mainAccount, agentPrivateKey, readRpc, writeRpc, now });
+    : new PopdexTradingClient({ mainAccount, agentPrivateKey, readRpc, accountClient, writeRpc, now });
   journal.create({
     symbol: orderPlan.symbol,
     side: orderPlan.side,

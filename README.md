@@ -258,13 +258,13 @@ dry-run 会额外显示 `availableMargin`。确认 `POPDEX_MAIN_ACCOUNT` 正是�
 npm run popdex:write-probe -- --symbol BTCUSDT --side buy --price <同一价格> --qty <同一数量> --confirm-mainnet-write
 ```
 
-最后一条命令会先读取官方账户概览；可用保证金不足时会在签名和广播前拒绝。通过后才向 PopDEX Mainnet 发送真实限价单，并在链上确认订单后自动尝试撤单。任何阶段失败都不要重复执行实盘命令；先到 PopDEX 网页核对挂单和持仓，再运行只读恢复检查：
+最后一条命令会先读取官方账户概览；可用保证金不足时会在签名和广播前拒绝。通过后才向 PopDEX Mainnet 发送真实限价单，解析同一交易回执的 `OrderCreate` 事件，并用官方 REST 精确核对 `clientOid`、订单状态与数量，确认挂单后才自动尝试撤单；撤单同样需要 `OrderCancel` 回执和 REST 零成交终态共同确认。任何阶段失败都不要重复执行实盘命令；先到 PopDEX 网页核对挂单和持仓，再运行只读恢复检查：
 
 ```bash
 npm run popdex:write-probe -- --resume
 ```
 
-如果已记录下单交易的链上回执明确为失败、同时活动订单和完成订单都不存在，`--resume` 会输出 `reverted-placement-cleared` 并安全清除恢复记录；回执缺失、成功或格式不一致时仍会保留记录并拒绝重试。
+`--resume` 不会发送交易。成功下单回执与 REST 都表明订单仍活动时，它会输出 `active-manual-cancel-required`，需要先在 PopDEX 网页人工撤单，再次运行 `--resume`；只有 REST 明确返回 `Cancelled`、成交量为零且数量守恒时才会清除恢复记录。若下单回执明确失败，则还必须确认 REST 和预编译活动/完成查询都不存在该订单，才会输出 `reverted-placement-cleared`。回执缺失、格式不一致、查询冲突或任何成交都会保留记录并拒绝重试。
 
 建议先用 BTCUSDT 最小金额完成闭环，再单独验收 ETHUSDT。本阶段尚未开放 PopDEX 自动网格、服务器交易路由或网页交易；该探针不能替代实盘网格验收。
 

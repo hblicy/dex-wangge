@@ -1,7 +1,8 @@
-import { keccak256, Wallet } from 'ethers';
-import { POPDEX_CHAIN_ID, POPDEX_ORDER_PRECOMPILE } from './constants.js';
+import { decodeBytes32String, keccak256, parseUnits, Wallet } from 'ethers';
+import { POPDEX_CHAIN_ID, POPDEX_EXPECTED_MARKETS, POPDEX_ORDER_PRECOMPILE } from './constants.js';
 import { encodeCancelOrder, POPDEX_ORDER_INTERFACE } from './order-codec.js';
 import { strictAddress, strictIntegerString } from './normalize.js';
+import { parseOrderCancelReceipt, parseOrderCreateReceipt } from './receipt-events.js';
 
 const LEGACY_GAS_LIMIT = 1_000_000n;
 const LEGACY_GAS_PRICE = 0n;
@@ -20,12 +21,39 @@ function exactHex(value, field) {
   return value.toLowerCase();
 }
 
+function exactReceiptHash(receipt, expectedTxHash, functionName) {
+  if (!receipt || typeof receipt !== 'object') {
+    throw new Error(`PopDEX ${functionName} 回执必须是对象。`);
+  }
+  const transactionHash = typeof receipt.transactionHash === 'string'
+    ? receipt.transactionHash.toLowerCase()
+    : '';
+  if (!/^0x[0-9a-f]{64}$/.test(transactionHash)) {
+    throw new Error(`PopDEX ${functionName} 回执 transactionHash 无效。`);
+  }
+  if (transactionHash !== expectedTxHash) {
+    throw new Error(
+      `PopDEX ${functionName} 回执 transactionHash 不匹配：expected=${expectedTxHash} actual=${transactionHash}。`,
+    );
+  }
+  return receipt;
+}
+
 function sameAddress(left, right) {
   return left.toLowerCase() === right.toLowerCase();
 }
 
 function sideCode(side) {
   return side === 'buy' ? '0' : '1';
+}
+
+function symbolForId(symbolId) {
+  const symbol = Object.entries(POPDEX_EXPECTED_MARKETS)
+    .find(([, market]) => market.symbolId === symbolId)?.[0];
+  if (!symbol) {
+    throw new Error(`PopDEX openOrder.symbolId ${String(symbolId)} 不在白名单。`);
+  }
+  return symbol;
 }
 
 function mismatch(stage, field, expected, actual) {
@@ -48,6 +76,93 @@ function validateIdentity(order, plan, stage) {
     if (order[field] !== expected) mismatch(stage, field, expected, order[field]);
   }
   if (order.isReduceOnly !== false) mismatch(stage, 'isReduceOnly', false, order.isReduceOnly);
+}
+
+function restDecimalToWad(value, field) {
+  if (typeof value !== 'string') throw new Error(`PopDEX ${field} 必须是十进制字符串。`);
+  try {
+    return parseUnits(value, 18).toString();
+  } catch (cause) {
+    throw new Error(`PopDEX ${field} 无法转换为 WAD：${cause?.message || cause}`, { cause });
+  }
+}
+
+function exactRestOpenOrder(order, plan, receiptOrder) {
+  if (!order || typeof order !== 'object') throw new Error('PopDEX REST 活动订单必须是对象。');
+  const expectedClientOid = decodeBytes32String(plan.clientOrderId);
+  const fields = [
+    ['walletId', plan.mainAccount.toLowerCase(), strictAddress(order.walletId, 'REST order.walletId').toLowerCase()],
+    ['orderId', receiptOrder.orderId, strictIntegerString(order.orderId, 'REST order.orderId')],
+    ['clientOid', expectedClientOid, order.clientOid],
+    ['symbolId', plan.symbolId, String(order.symbolId)],
+    ['symbol', plan.symbol, order.symbol],
+    ['side', plan.side === 'buy' ? 'Buy' : 'Sell', order.side],
+    ['priceWad', plan.priceWad, restDecimalToWad(order.price, 'REST order.price')],
+    ['qtyWad', plan.qtyWad, restDecimalToWad(order.qty, 'REST order.qty')],
+    ['filledQtyWad', '0', restDecimalToWad(order.filledQty, 'REST order.filledQty')],
+    ['remainingQtyWad', plan.qtyWad, restDecimalToWad(order.remainingQty, 'REST order.remainingQty')],
+    ['cancelledQtyWad', '0', restDecimalToWad(order.cancelledQty, 'REST order.cancelledQty')],
+    ['status', 'NewAccept', order.status],
+  ];
+  for (const [field, expected, actual] of fields) {
+    if (actual !== expected) mismatch('OPEN_CONFIRMED REST', field, expected, actual);
+  }
+  if (order.reduceOnly !== false) mismatch('OPEN_CONFIRMED REST', 'reduceOnly', false, order.reduceOnly);
+  return {
+    walletId: plan.mainAccount,
+    orderId: receiptOrder.orderId,
+    clientOrderId: plan.clientOrderId,
+    symbolId: plan.symbolId,
+    side: sideCode(plan.side),
+    isReduceOnly: false,
+    priceWad: plan.priceWad,
+    qtyWad: plan.qtyWad,
+    filledQtyWad: '0',
+    remainingQtyWad: plan.qtyWad,
+    cancelledQtyWad: '0',
+  };
+}
+
+function exactRestCancelledOrder(order, openOrder) {
+  if (!order || typeof order !== 'object') throw new Error('PopDEX REST 撤单终态必须是对象。');
+  const expectedClientOid = decodeBytes32String(openOrder.clientOrderId);
+  const filledQtyWad = restDecimalToWad(order.filledQty, 'REST order.filledQty');
+  const remainingQtyWad = restDecimalToWad(order.remainingQty, 'REST order.remainingQty');
+  const cancelledQtyWad = restDecimalToWad(order.cancelledQty, 'REST order.cancelledQty');
+  const fields = [
+    ['walletId', openOrder.walletId.toLowerCase(), strictAddress(order.walletId, 'REST order.walletId').toLowerCase()],
+    ['orderId', openOrder.orderId, strictIntegerString(order.orderId, 'REST order.orderId')],
+    ['clientOid', expectedClientOid, order.clientOid],
+    ['symbolId', openOrder.symbolId, String(order.symbolId)],
+    ['side', openOrder.side === '0' ? 'Buy' : 'Sell', order.side],
+    ['priceWad', openOrder.priceWad, restDecimalToWad(order.price, 'REST order.price')],
+    ['qtyWad', openOrder.qtyWad, restDecimalToWad(order.qty, 'REST order.qty')],
+  ];
+  for (const [field, expected, actual] of fields) {
+    if (actual !== expected) mismatch('CANCEL_CONFIRMED REST', field, expected, actual);
+  }
+  if (BigInt(openOrder.qtyWad) !== BigInt(filledQtyWad) + BigInt(remainingQtyWad) + BigInt(cancelledQtyWad)) {
+    throw new Error('PopDEX CANCEL_CONFIRMED REST qty 不等于 filled + remaining + cancelled。');
+  }
+  if (filledQtyWad !== '0') {
+    throw new Error(
+      `PopDEX CANCEL_CONFIRMED 订单 ${openOrder.orderId} 发生成交 ${filledQtyWad}，请人工处理仓位。`,
+    );
+  }
+  for (const [field, expected, actual] of [
+    ['status', 'Cancelled', order.status],
+    ['remainingQtyWad', '0', remainingQtyWad],
+    ['cancelledQtyWad', openOrder.qtyWad, cancelledQtyWad],
+  ]) {
+    if (actual !== expected) mismatch('CANCEL_CONFIRMED REST', field, expected, actual);
+  }
+  if (order.reduceOnly !== false) mismatch('CANCEL_CONFIRMED REST', 'reduceOnly', false, order.reduceOnly);
+  return {
+    ...openOrder,
+    filledQtyWad,
+    remainingQtyWad,
+    cancelledQtyWad,
+  };
 }
 
 function safeJournalError(journal, stage, error) {
@@ -90,6 +205,7 @@ export class PopdexTradingClient {
     mainAccount,
     agentPrivateKey,
     readRpc,
+    accountClient,
     writeRpc,
     now = () => Date.now(),
     sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -105,13 +221,16 @@ export class PopdexTradingClient {
     if (sameAddress(this.wallet.address, this.mainAccount)) {
       throw new Error('PopDEX Agent 地址不能与主账户相同。');
     }
-    if (!readRpc || typeof readRpc !== 'object' || !writeRpc || typeof writeRpc !== 'object') {
-      throw new Error('PopDEX readRpc 和 writeRpc 必须是对象。');
+    if (!readRpc || typeof readRpc !== 'object'
+        || !accountClient || typeof accountClient !== 'object'
+        || !writeRpc || typeof writeRpc !== 'object') {
+      throw new Error('PopDEX readRpc、accountClient 和 writeRpc 必须是对象。');
     }
     if (typeof now !== 'function' || typeof sleep !== 'function') {
       throw new Error('PopDEX now 和 sleep 必须是函数。');
     }
     this.readRpc = readRpc;
+    this.accountClient = accountClient;
     this.writeRpc = writeRpc;
     this.now = now;
     this.sleep = sleep;
@@ -192,60 +311,59 @@ export class PopdexTradingClient {
           `PopDEX ${functionName} RPC txHash 不匹配：local=${localTxHash} remote=${remoteTxHash}。`,
         );
       }
-      await this.writeRpc.waitForReceipt(localTxHash);
-      return localTxHash;
+      return exactReceiptHash(
+        await this.writeRpc.waitForReceipt(localTxHash),
+        localTxHash,
+        functionName,
+      );
     } catch (error) {
       safeJournalError(journal, nextStage, error);
       throw error;
     }
   }
 
-  async #findOrder(clientOrderId, completed) {
-    try {
-      return await this.readRpc.findUniqueOrderByClientId(
-        this.mainAccount,
-        clientOrderId,
-        { completed },
-      );
-    } catch (error) {
-      if (error?.code === 'POPDEX_ORDER_NOT_FOUND') return null;
-      throw error;
-    }
-  }
-
-  async #pollOpenConfirmation(plan) {
+  async #pollOpenConfirmation(plan, receiptOrder) {
     const attempts = Math.ceil(this.orderTimeoutMs / this.orderPollMs) + 1;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      const order = await this.#findOrder(plan.clientOrderId, false);
-      if (order !== null) return order;
-      const completed = await this.#findOrder(plan.clientOrderId, true);
-      if (completed !== null) {
-        validateIdentity(completed, plan, 'OPEN_CONFIRMED');
-        if (completed.filledQtyWad !== '0') {
-          throw new Error(
-            `PopDEX OPEN_CONFIRMED 订单 ${completed.orderId} 发生成交 ${completed.filledQtyWad}，请人工处理仓位。`,
-          );
-        }
-        throw new Error(
-          `PopDEX OPEN_CONFIRMED 订单 ${completed.orderId} 已进入完成集合，未能确认活动挂单。`,
+      try {
+        const order = await this.accountClient.findUniqueOrderByClientId(
+          this.mainAccount,
+          plan.symbol,
+          plan.clientOrderId,
         );
+        if (['WaitToSend', 'PendingNew'].includes(order.status)) {
+          exactRestOpenOrder({ ...order, status: 'NewAccept' }, plan, receiptOrder);
+          if (attempt < attempts) await this.sleep(this.orderPollMs);
+          continue;
+        }
+        return exactRestOpenOrder(order, plan, receiptOrder);
+      } catch (error) {
+        if (error?.code !== 'POPDEX_ORDER_NOT_FOUND') throw error;
       }
       if (attempt < attempts) await this.sleep(this.orderPollMs);
     }
     throw new Error(`PopDEX OPEN_CONFIRMED 超时：clientOrderId=${plan.clientOrderId}。`);
   }
 
-  async #pollCancelled(clientOrderId) {
+  async #pollCancelled(openOrder) {
+    const symbol = symbolForId(openOrder.symbolId);
     const attempts = Math.ceil(this.orderTimeoutMs / this.orderPollMs) + 1;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      const active = await this.#findOrder(clientOrderId, false);
-      if (active === null) {
-        const completed = await this.#findOrder(clientOrderId, true);
-        if (completed !== null) return completed;
+      try {
+        const order = await this.accountClient.findUniqueOrderByClientId(
+          this.mainAccount,
+          symbol,
+          openOrder.clientOrderId,
+        );
+        if (!['WaitToSend', 'PendingNew', 'NewAccept', 'PendingCancel'].includes(order.status)) {
+          return exactRestCancelledOrder(order, openOrder);
+        }
+      } catch (error) {
+        if (error?.code !== 'POPDEX_ORDER_NOT_FOUND') throw error;
       }
       if (attempt < attempts) await this.sleep(this.orderPollMs);
     }
-    throw new Error(`PopDEX CANCEL_CONFIRMED 超时：clientOrderId=${clientOrderId}。`);
+    throw new Error(`PopDEX CANCEL_CONFIRMED 超时：clientOrderId=${openOrder.clientOrderId}。`);
   }
 
   async placeAndConfirm(plan, journal) {
@@ -253,7 +371,7 @@ export class PopdexTradingClient {
       throw new Error('PopDEX 下单计划 mainAccount 与交易客户端不匹配。');
     }
     await this.preflight();
-    await this.#submit({
+    const receipt = await this.#submit({
       data: plan.data,
       functionName: 'placeOrder',
       journal,
@@ -262,7 +380,14 @@ export class PopdexTradingClient {
       txHashField: 'placeTxHash',
     });
     try {
-      const order = await this.#pollOpenConfirmation(plan);
+      const receiptOrder = parseOrderCreateReceipt(receipt, {
+        account: plan.mainAccount,
+        symbolId: plan.symbolId,
+        clientOrderId: plan.clientOrderId,
+        priceWad: plan.priceWad,
+        qtyWad: plan.qtyWad,
+      });
+      const order = await this.#pollOpenConfirmation(plan, receiptOrder);
       validateIdentity(order, plan, 'OPEN_CONFIRMED');
       if (order.filledQtyWad !== '0') mismatch('OPEN_CONFIRMED', 'filledQtyWad', '0', order.filledQtyWad);
       if (order.remainingQtyWad !== plan.qtyWad) {
@@ -294,13 +419,14 @@ export class PopdexTradingClient {
     if (openOrder.isReduceOnly !== false) {
       throw new Error('PopDEX openOrder.isReduceOnly 必须是 false。');
     }
+    symbolForId(openOrder.symbolId);
     await this.preflight();
     const data = encodeCancelOrder({
       mainAccount: this.mainAccount,
       orderId: openOrder.orderId,
       clientOrderId: openOrder.clientOrderId,
     });
-    await this.#submit({
+    const receipt = await this.#submit({
       data,
       functionName: 'cancelOrder',
       journal,
@@ -308,28 +434,13 @@ export class PopdexTradingClient {
       nextStage: 'CANCEL_BROADCAST',
       txHashField: 'cancelTxHash',
     });
-    const plan = {
-      mainAccount: this.mainAccount,
-      clientOrderId: openOrder.clientOrderId,
-      symbolId: openOrder.symbolId,
-      side: openOrder.side === '0' ? 'buy' : 'sell',
-      priceWad: openOrder.priceWad,
-      qtyWad: openOrder.qtyWad,
-    };
     try {
-      const completed = await this.#pollCancelled(openOrder.clientOrderId);
-      validateIdentity(completed, plan, 'CANCEL_CONFIRMED');
-      if (completed.filledQtyWad !== '0') {
-        throw new Error(
-          `PopDEX CANCEL_CONFIRMED 订单 ${completed.orderId} 发生成交 ${completed.filledQtyWad}，请人工处理仓位。`,
-        );
-      }
-      if (completed.remainingQtyWad !== '0') {
-        mismatch('CANCEL_CONFIRMED', 'remainingQtyWad', '0', completed.remainingQtyWad);
-      }
-      if (completed.cancelledQtyWad !== openOrder.qtyWad) {
-        mismatch('CANCEL_CONFIRMED', 'cancelledQtyWad', openOrder.qtyWad, completed.cancelledQtyWad);
-      }
+      parseOrderCancelReceipt(receipt, {
+        account: this.mainAccount,
+        orderId: openOrder.orderId,
+        clientOrderId: openOrder.clientOrderId,
+      });
+      const completed = await this.#pollCancelled(openOrder);
       journal.advance('CANCEL_BROADCAST', 'CANCEL_CONFIRMED');
       return completed;
     } catch (error) {
