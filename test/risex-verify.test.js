@@ -49,14 +49,15 @@ function makeInfo(calls) {
         side: 0, price_ticks: 600000, size_steps: 10, reduce_only: false,
       }] : [];
     },
-    async getPosition(marketId, account) {
-      calls.push(`getPosition:${marketId}:${account}`);
-      return marketId === 1
-        ? {
-          market_id: '1', side: 'BUY', size: (WAD / 100n).toString(),
-          avg_entry_price: wad(60000), unrealized_pnl: wad(1), leverage: wad(3),
-        }
-        : null;
+    async getAllPositions(account) {
+      calls.push(`getAllPositions:${account}`);
+      return [{
+        market_id: '1', side: 'BUY', size: (WAD / 100n).toString(),
+        avg_entry_price: wad(60000), unrealized_pnl: wad(1), leverage: wad(3),
+      }];
+    },
+    async getPosition() {
+      throw new Error('private verification must use getAllPositions');
     },
     async getAccountTradeHistory(account, marketId) {
       calls.push(`getAccountTradeHistory:${account}:${marketId}`);
@@ -123,6 +124,8 @@ test('private verification authenticates and reads account state without Exchang
   assert.equal(result.markets[0].position.sizeBase, 0.01);
   assert.ok(calls.includes('privateWs:connect'));
   assert.ok(calls.includes('privateWs:snapshot'));
+  assert.equal(calls.filter((call) => call.startsWith('getAllPositions:')).length, 1);
+  assert.equal(calls.some((call) => call.startsWith('getPosition:')), false);
   assert.equal(calls.some((call) => /place|cancel|leverage|close/i.test(call)), false);
 });
 
