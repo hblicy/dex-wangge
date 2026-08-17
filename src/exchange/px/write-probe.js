@@ -1,11 +1,12 @@
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { keccak256, parseUnits } from 'ethers';
+import { formatUnits, keccak256, parseUnits } from 'ethers';
 import { loadEnv, ROOT } from '../../config.js';
+import { PopdexAccountClient } from './account-client.js';
 import { deriveAgentAddress } from './agent.js';
 import { POPDEX_EXPECTED_MARKETS } from './constants.js';
-import { strictAddress } from './normalize.js';
+import { strictAddress, strictDecimalString } from './normalize.js';
 import { prepareProbeOrder } from './order-codec.js';
 import { PopdexPublicClient } from './public-client.js';
 import { PopdexRpcClient } from './rpc-client.js';
@@ -96,6 +97,53 @@ function maskedAddress(value) {
   return `${value.slice(0, 6)}…${value.slice(-4)}`;
 }
 
+function safeFailureMessage(value, mainAccount) {
+  const raw = typeof value?.message === 'string'
+    ? value.message
+    : JSON.stringify(value);
+  const text = typeof raw === 'string' && raw.length > 0 ? raw : '链上未返回失败详情';
+  return text
+    .replace(new RegExp(mainAccount, 'ig'), maskedAddress(mainAccount))
+    .replace(/\s+/g, ' ')
+    .slice(0, 500);
+}
+
+function exactFailedReceipt(receipt, expectedTxHash) {
+  if (!receipt || typeof receipt !== 'object') {
+    throw new Error('PopDEX 失败下单回执必须是对象。');
+  }
+  const transactionHash = String(receipt.transactionHash || '').toLowerCase();
+  if (!/^0x[0-9a-f]{64}$/.test(transactionHash)) {
+    throw new Error('PopDEX 失败下单回执 transactionHash 无效。');
+  }
+  if (transactionHash !== expectedTxHash) {
+    throw new Error(
+      `PopDEX 失败下单回执 transactionHash 不匹配：expected=${expectedTxHash} actual=${transactionHash}。`,
+    );
+  }
+  if (receipt.status !== '0x0') {
+    throw new Error(`PopDEX 失败下单回执 status 必须是 0x0，实际 ${String(receipt.status)}。`);
+  }
+}
+
+function exactAvailableMargin(overview) {
+  if (!overview || typeof overview !== 'object' || Array.isArray(overview)) {
+    throw new Error('PopDEX account overview 必须是对象。');
+  }
+  return strictDecimalString(overview.availableMargin, 'overview.availableMargin');
+}
+
+function assertProbeCapacity(availableMargin, orderPlan) {
+  const availableWad = parseUnits(availableMargin, 18);
+  const oneWad = 10n ** 18n;
+  const notionalWad = (BigInt(orderPlan.priceWad) * BigInt(orderPlan.qtyWad)) / oneWad;
+  if (availableWad < notionalWad) {
+    throw new Error(
+      `PopDEX availableMargin=${availableMargin} 小于本次保守验收所需名义金额 ${formatUnits(notionalWad, 18)}，无法下单。请先给 POPDEX_MAIN_ACCOUNT 充值保证金。`,
+    );
+  }
+}
+
 function exactRecoveredIdentity(record, order, mainAccount) {
   const expected = POPDEX_EXPECTED_MARKETS[record.symbol];
   if (!expected) throw new Error(`PopDEX journal symbol ${String(record.symbol)} 不在白名单。`);
@@ -155,6 +203,24 @@ async function runResume({ mainAccount, readRpc, journal }) {
   }
   const completed = await findOptional(readRpc, mainAccount, record.clientOrderId, true);
   if (completed === null) {
+    if (record.stage === 'BROADCAST' && typeof record.placeTxHash === 'string') {
+      const txHash = record.placeTxHash.toLowerCase();
+      const receipt = await readRpc.getReceipt(txHash);
+      if (receipt?.status === '0x0') {
+        exactFailedReceipt(receipt, txHash);
+        const failure = safeFailureMessage(
+          await readRpc.getTransactionFailure(txHash),
+          mainAccount,
+        );
+        journal.clearRevertedPlacement(txHash);
+        return {
+          mode: 'resume',
+          status: 'reverted-placement-cleared',
+          txHash,
+          failure,
+        };
+      }
+    }
     return { mode: 'resume', status: 'order-fact-unresolved', clientOrderId: record.clientOrderId };
   }
   exactRecoveredIdentity(record, completed, mainAccount);
@@ -198,6 +264,7 @@ export async function runProbe(options, deps = {}) {
   }
   const { mainAccount, agentPrivateKey } = exactEnvironment(deps, { requireAgent: true });
   const publicClient = deps.publicClient ?? new PopdexPublicClient(deps.publicOptions);
+  const accountClient = deps.accountClient ?? new PopdexAccountClient(deps.accountOptions);
   await readRpc.verifyChain();
   assertMarketIdentity(await publicClient.getMarkets(), options.symbol);
   const ticker = await publicClient.getTicker(options.symbol);
@@ -222,6 +289,7 @@ export async function runProbe(options, deps = {}) {
     randomBytesImpl: deps.randomBytesImpl ?? randomBytes,
     nowMs,
   });
+  const availableMargin = exactAvailableMargin(await accountClient.getOverview(mainAccount));
   const safeResult = {
     mode: options.confirmMainnetWrite ? 'mainnet-write' : 'dry-run',
     symbol: orderPlan.symbol,
@@ -236,8 +304,10 @@ export async function runProbe(options, deps = {}) {
     agentExpiresAt: authorization.expiresAt,
     clientOrderId: orderPlan.clientOrderId,
     calldataHash: keccak256(orderPlan.data),
+    availableMargin,
   };
   if (!options.confirmMainnetWrite) return safeResult;
+  assertProbeCapacity(availableMargin, orderPlan);
 
   const writeRpc = deps.createWriteRpc
     ? deps.createWriteRpc()
@@ -283,6 +353,7 @@ function renderResult(result) {
       `PopDEX ${result.mode} 完成`,
       `market=${result.symbol} side=${result.side} price=${result.price} qty=${result.qty}`,
       `book bid=${result.bid} ask=${result.ask}`,
+      `availableMargin=${result.availableMargin}`,
       `main=${maskedAddress(result.mainAccount)} agent=${maskedAddress(result.agent)}`,
       `clientOrderId=${result.clientOrderId} calldataHash=${result.calldataHash}`,
       ...(result.orderId ? [`orderId=${result.orderId} cancelledQtyWad=${result.cancelledQtyWad}`] : []),
@@ -293,6 +364,11 @@ function renderResult(result) {
   if (result.filledQtyWad) lines.push(`filledQtyWad=${result.filledQtyWad}，请人工检查并处理仓位。`);
   if (result.status === 'active-manual-cancel-required') {
     lines.push('订单仍为活动状态，请先在 PopDEX 网页人工撤单，再重新运行 --resume。');
+  }
+  if (result.status === 'reverted-placement-cleared') {
+    lines.push(`txHash=${result.txHash}`);
+    lines.push(`failure=${result.failure}`);
+    lines.push('已确认下单交易回执失败且没有活动/完成订单，恢复记录已安全清理。');
   }
   return lines;
 }

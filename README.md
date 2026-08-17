@@ -252,17 +252,19 @@ npm run popdex:verify -- --account-env POPDEX_MAIN_ACCOUNT
 npm run popdex:write-probe -- --symbol BTCUSDT --side buy --price <盘口外价格> --qty <满足10_USDT最小名义价值的数量>
 ```
 
-确认网页没有未知挂单或持仓，并用同一组最小金额参数完成 dry-run 后，才可显式执行一次真实下单—撤单验收：
+dry-run 会额外显示 `availableMargin`。确认 `POPDEX_MAIN_ACCOUNT` 正是已入金的 PopDEX 主账户、可用保证金至少覆盖本次订单的完整名义金额，并确认网页没有未知挂单或持仓后，才可用同一组最小金额参数显式执行一次真实下单—撤单验收：
 
 ```bash
 npm run popdex:write-probe -- --symbol BTCUSDT --side buy --price <同一价格> --qty <同一数量> --confirm-mainnet-write
 ```
 
-最后一条命令会向 PopDEX Mainnet 发送真实限价单，并在链上确认订单后自动尝试撤单。任何阶段失败都不要重复执行实盘命令；先到 PopDEX 网页核对挂单和持仓，再运行只读恢复检查：
+最后一条命令会先读取官方账户概览；可用保证金不足时会在签名和广播前拒绝。通过后才向 PopDEX Mainnet 发送真实限价单，并在链上确认订单后自动尝试撤单。任何阶段失败都不要重复执行实盘命令；先到 PopDEX 网页核对挂单和持仓，再运行只读恢复检查：
 
 ```bash
 npm run popdex:write-probe -- --resume
 ```
+
+如果已记录下单交易的链上回执明确为失败、同时活动订单和完成订单都不存在，`--resume` 会输出 `reverted-placement-cleared` 并安全清除恢复记录；回执缺失、成功或格式不一致时仍会保留记录并拒绝重试。
 
 建议先用 BTCUSDT 最小金额完成闭环，再单独验收 ETHUSDT。本阶段尚未开放 PopDEX 自动网格、服务器交易路由或网页交易；该探针不能替代实盘网格验收。
 

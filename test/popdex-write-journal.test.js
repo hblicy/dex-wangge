@@ -199,3 +199,28 @@ test('journal clears only PREPARED records that have no broadcast evidence', () 
   assert.throws(() => journal.clearPrepared(), /PREPARED/);
   assert.equal(journal.load().stage, 'BROADCAST');
 });
+
+test('journal clears only a BROADCAST placement with the exact reverted transaction hash', () => {
+  const fsImpl = memoryFs();
+  const journal = new PopdexWriteJournal({ file: 'probe.json', fsImpl, platform: 'linux' });
+  journal.create(orderPlan());
+  journal.advance('PREPARED', 'BROADCAST', { placeTxHash: PLACE_TX_HASH });
+
+  assert.throws(
+    () => journal.clearRevertedPlacement(`0x${'78'.repeat(32)}`),
+    /placeTxHash.*不匹配/,
+  );
+  assert.equal(journal.load().stage, 'BROADCAST');
+
+  journal.clearRevertedPlacement(PLACE_TX_HASH);
+  assert.equal(journal.load(), null);
+  assert.deepEqual(fsImpl.calls.at(-1), ['unlink', 'probe.json']);
+});
+
+test('journal never clears a reverted transaction from a stage other than BROADCAST', () => {
+  const fsImpl = memoryFs();
+  const journal = new PopdexWriteJournal({ file: 'probe.json', fsImpl, platform: 'linux' });
+  journal.create(orderPlan());
+  assert.throws(() => journal.clearRevertedPlacement(PLACE_TX_HASH), /BROADCAST/);
+  assert.equal(journal.load().stage, 'PREPARED');
+});

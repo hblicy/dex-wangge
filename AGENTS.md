@@ -9,9 +9,9 @@
 - PopDEX 主钱包私钥禁止进入前端、后端、配置或日志。临时 Agent 私钥只能由浏览器内存生成，链上授权回验成功且用户明确确认后才能写入 `.env`；撤销必须先确认链上 Agent 已失效，再清除本地私钥。
 - PopDEX Agent API 必须独立于 exchange registry、GridBot、`.state.json`、AI、Decibel 和 RISEx；本阶段禁止新增 PopDEX start/stop/order/cancel/leverage/close 路由。
 - PopDEX 真实订单只允许由 `npm run popdex:write-probe` 独立 CLI 触发；默认必须 dry-run，真实写入必须显式传入 `--confirm-mainnet-write`。服务器、网页、Agent API 和 GridBot 禁止导入或调用交易客户端。
-- PopDEX 写入只允许 `write-rpc-client.js` 广播，顺序必须为模拟、签名、广播前落盘确定性交易哈希、单次广播、回执、链上订单事实确认；Order 预编译的 `placeOrder`/`cancelOrder` 成功模拟返回精确空数据 `0x`，无 bool 返回值，RPC 错误或任何非空结果都必须在签名前拒绝。禁止把交易哈希当订单 ID，禁止不确定结果自动重试。
+- PopDEX 写入只允许 `write-rpc-client.js` 广播，顺序必须为账户可用保证金校验、模拟、签名、广播前落盘确定性交易哈希、单次广播、回执、链上订单事实确认；当前官方静态 ABI 声明 `placeOrder`/`cancelOrder` 返回 bool，但 2026-08-17 主网 Order 预编译的成功 `eth_call` 实测返回精确空数据 `0x`，探针以主网实测结果为模拟成功条件。RPC 错误或任何非空结果都必须在签名前拒绝。禁止把交易哈希当订单 ID，禁止不确定结果自动重试。
 - PopDEX Order 预编译会把 `clientOrderId` 作为受限字符集的 UTF-8 字符串解析；新订单必须使用 `encodeBytes32String` 生成不超过 31 字节、仅包含固定前缀、连字符和小写十六进制随机字符的规范 ID。禁止使用 Keccak、任意随机 32 字节或包含 `_`、`+`、`/`、`=` 的 Base64/Base64URL 标识。
-- PopDEX `.popdex-write-probe.json` 是单笔探针的恢复事实。`PREPARED` 且尚未广播可安全清理；广播后必须保留到链上确认零成交撤单终态。`--resume` 只读，活动订单要求人工撤单；链上已存在零成交完成订单时可记录 `recoveredFromChain` 后清理，但不得伪造撤单交易哈希；任何成交都必须停止并人工处理仓位。
+- PopDEX `.popdex-write-probe.json` 是单笔探针的恢复事实。`PREPARED` 且尚未广播可安全清理；广播后必须保留到链上确认零成交撤单终态，或同时确认已记录下单哈希的回执为 `0x0` 且活动/完成订单均不存在。`--resume` 只读，活动订单要求人工撤单；链上已存在零成交完成订单时可记录 `recoveredFromChain` 后清理，但不得伪造撤单交易哈希；任何成交都必须停止并人工处理仓位。
 - PopDEX `/overview` 只用于账户概览，持仓事实必须从订单预编译合约 `0x0000000000000000000000000000000000001000` 的只读方法 `getOpenPositionsByAccount` 获取，禁止猜测 overview 内含 `positions`。
 - RISEx 私有 Orders/Fills WebSocket 与 REST 对账共同构成订单、成交和持仓的事实来源。
 - RISEx Orders WebSocket、订单历史和单笔订单接口的价量字段按当前主网人类可读十进制字符串解析；开放订单仍按 ticks/steps，仓位仍按已验证的 WAD 结构，禁止按字符串长度猜单位。

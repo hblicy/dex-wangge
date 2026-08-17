@@ -285,6 +285,24 @@ export class PopdexWriteJournal {
     }
   }
 
+  clearRevertedPlacement(placeTxHash) {
+    const exactHash = exactHex32(placeTxHash, 'reverted placeTxHash');
+    const current = this.load();
+    if (current === null || current.stage !== 'BROADCAST') {
+      throw new Error('PopDEX journal 只有 BROADCAST 才能做失败下单清理。');
+    }
+    if (current.placeTxHash !== exactHash) {
+      throw new Error(
+        `PopDEX journal placeTxHash 不匹配：expected=${current.placeTxHash} actual=${exactHash}。`,
+      );
+    }
+    try {
+      this.fs.unlinkSync(this.file);
+    } catch (cause) {
+      throw new Error(`PopDEX journal 失败下单清理失败 (${this.file})：${cause?.message || cause}`, { cause });
+    }
+  }
+
   clearCompleted() {
     const current = this.load();
     if (current === null || current.stage !== 'CANCEL_CONFIRMED') {
