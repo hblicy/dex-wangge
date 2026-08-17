@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { Wallet, isAddress } from 'ethers';
+import { describeError } from './error-details.js';
 import { WebSocket as UndiciWebSocket } from 'undici';
 import { compareRisexCursor, parseFillEnvelope, parseOrderEnvelope } from './normalize.js';
 
@@ -241,7 +242,7 @@ export class RisexPrivateStream extends EventEmitter {
       if (error?.name === 'AbortError') {
         throw new Error(`RISEx GET ${pathname} ${this._requestTimeoutMs}ms 超时。`, { cause: error });
       }
-      throw error;
+      throw new Error(`RISEx GET ${pathname} 失败：${describeError(error)}。`, { cause: error });
     } finally {
       this._clearDeadline(deadline);
     }

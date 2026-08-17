@@ -187,12 +187,12 @@ export async function verifyRisexPrivate(config, deps = {}) {
     await withTimeout(stream.connect(), 10_000, '私有 WebSocket 认证', deps);
     await withTimeout(stream.waitForOrderSnapshot(), 10_000, '私有 Orders 快照', deps);
     if (stream.authenticated !== true) throw new Error('RISEx 私有 WebSocket 未认证。');
-    const [balance, markets] = await Promise.all([
+    const [balance, positionsRaw, marketRows] = await Promise.all([
       rest.info.getBalance(account),
+      rest.info.getAllPositions(account),
       Promise.all(rest.markets.map(async (market) => {
-        const [open, position, trades] = await Promise.all([
+        const [open, trades] = await Promise.all([
           rest.info.getOpenOrders(account, market.marketId),
-          rest.info.getPosition(market.marketId, account),
           rest.info.getAccountTradeHistory(account, market.marketId, 100),
         ]);
         if (!Array.isArray(open) || !Array.isArray(trades)) {
@@ -200,23 +200,36 @@ export async function verifyRisexPrivate(config, deps = {}) {
         }
         const normalizedOpen = open.map((row) => normalizeRestOpenOrder(row, market));
         const normalizedTrades = trades.map(normalizeRestFill);
-        const normalizedPosition = normalizeRestPosition(position, { markPrice: market.lastPrice });
-        if (normalizedPosition && normalizedPosition.marketId !== market.marketId) {
-          throw new Error(`RISEx market ${market.marketId} 仓位市场不匹配。`);
-        }
         return {
+          market,
           marketId: market.marketId,
           name: market.displayName,
           openOrders: normalizedOpen.length,
           trades: normalizedTrades.length,
-          position: normalizedPosition && normalizedPosition.sizeBase !== 0 ? {
-            sizeBase: normalizedPosition.sizeBase,
-            entryPrice: normalizedPosition.entryPrice,
-            leverage: normalizedPosition.leverage,
-          } : null,
         };
       })),
     ]);
+    if (!Array.isArray(positionsRaw)) throw new Error('RISEx positions 私有 REST 响应不是数组。');
+    const priceByMarket = new Map(rest.markets.map((market) => [market.marketId, market.lastPrice]));
+    const positionsByMarket = new Map();
+    for (const row of positionsRaw) {
+      const position = normalizeRestPosition(row, { markPrice: priceByMarket.get(Number(row?.market_id)) });
+      if (positionsByMarket.has(position.marketId)) {
+        throw new Error(`RISEx market ${position.marketId} 返回重复仓位。`);
+      }
+      positionsByMarket.set(position.marketId, position);
+    }
+    const markets = marketRows.map(({ market, ...row }) => {
+      const position = positionsByMarket.get(market.marketId);
+      return {
+        ...row,
+        position: position && position.sizeBase !== 0 ? {
+          sizeBase: position.sizeBase,
+          entryPrice: position.entryPrice,
+          leverage: position.leverage,
+        } : null,
+      };
+    });
     finiteDecimal(balance, 'balance');
     return {
       mode: 'private',
