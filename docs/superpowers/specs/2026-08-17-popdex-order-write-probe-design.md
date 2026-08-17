@@ -69,8 +69,8 @@ npm run popdex:write-probe -- --symbol BTCUSDT --side buy --price 60000 --qty 0.
 3. 生成不可重复的 bytes32 `clientOrderId`，并把阶段 `PREPARED` 原子写入仅所有者可读写的恢复文件。
 4. 使用当前官方网页产物验证过的格式编码 `placeOrder`。
 5. 在广播前执行只读模拟；模拟失败时不广播。
-6. Agent 签名并广播一次，不对不确定结果自动重试。
-7. 保存脱敏后的 `txHash` 和阶段 `BROADCAST`，等待成功回执。
+6. Agent 签名并在广播前保存可由签名交易确定计算的 `txHash` 和阶段 `BROADCAST`。
+7. 只广播一次并核对 RPC 返回的交易哈希；不对不确定结果自动重试，随后等待成功回执。
 8. 有界轮询 Order 预编译的 `getActiveOrdersByAccount`，按完整 `clientOrderId` 找到唯一官方订单。
 9. 严格核对主账户、市场、方向、价格、数量和官方字符串 `orderId`，然后记录 `OPEN_CONFIRMED`。
 
