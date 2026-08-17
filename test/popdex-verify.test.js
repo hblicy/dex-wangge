@@ -11,6 +11,7 @@ const ACCOUNT = '0x1111111111111111111111111111111111111111';
 const CONFIG = { candleInterval: '1H', candleLimit: 2 };
 const REQUIRED_TOKENS = [
   'approveAgent', 'revokeAgent', 'placeOrder', 'cancelOrder',
+  'getActiveOrdersByAccount', 'getCompletedOrdersByAccount',
   'updateLeverage', 'placeReverseOrder', 'clientOrderId',
   '0x0000000000000000000000000000000000001000',
   '0x0000000000000000000000000000000000001008',
