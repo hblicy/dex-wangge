@@ -168,14 +168,8 @@ export class PopdexTradingClient {
   }
 
   #verifySimulation(functionName, raw) {
-    let decoded;
-    try {
-      decoded = POPDEX_ORDER_INTERFACE.decodeFunctionResult(functionName, raw);
-    } catch (cause) {
-      throw new Error(`PopDEX ${functionName} 模拟结果解码失败：${cause?.message || cause}`, { cause });
-    }
-    if (decoded[0] !== true) {
-      throw new Error(`PopDEX ${functionName} 模拟返回 false。`);
+    if (raw !== '0x') {
+      throw new Error(`PopDEX ${functionName} 模拟必须返回主网预编译的空结果 0x。`);
     }
   }
 

@@ -68,7 +68,7 @@ npm run popdex:write-probe -- --symbol BTCUSDT --side buy --price 60000 --qty 0.
 2. 验证官方 chainId、市场身份、最新盘口和 Agent 授权。
 3. 使用固定 `dw-<market><side>-` 前缀和 96 位小写十六进制随机值生成不超过 31 个 UTF-8 字节的标签，再通过 `encodeBytes32String` 得到规范 bytes32 `clientOrderId`；禁止使用任意 Keccak/随机 32 字节，也禁止 Base64/Base64URL 的 `_`、`+`、`/`、`=`。随后把阶段 `PREPARED` 原子写入仅所有者可读写的恢复文件。
 4. 使用当前官方网页产物验证过的格式编码 `placeOrder`。
-5. 在广播前执行只读模拟；模拟失败时不广播。
+5. 在广播前执行只读模拟；主网 Order 预编译的成功结果必须是精确空数据 `0x`，它没有 bool 返回值。RPC 错误或任何非空结果都视为模拟失败且不广播。
 6. Agent 签名并在广播前保存可由签名交易确定计算的 `txHash` 和阶段 `BROADCAST`。
 7. 只广播一次并核对 RPC 返回的交易哈希；不对不确定结果自动重试，随后等待成功回执。
 8. 有界轮询 Order 预编译的 `getActiveOrdersByAccount`，按完整 `clientOrderId` 找到唯一官方订单。
@@ -133,7 +133,7 @@ npm run popdex:write-probe -- --symbol BTCUSDT --side buy --price 60000 --qty 0.
 - 两个白名单市场和所有非白名单市场。
 - tick、lot、`minQty`、最低名义金额和盘口外价格保护。
 - bytes32 `clientOrderId` 唯一性、受限十六进制字符集、31 字节上限和 `encodeBytes32String` 往返解码。
-- `placeOrder`/`cancelOrder` 的固定 ABI 向量与 `orderParams` 字节向量。
+- `placeOrder`/`cancelOrder` 的无返回值固定 ABI 向量、成功模拟空结果 `0x` 与 `orderParams` 字节向量。
 - Agent 与主账户关系、授权过期、delegator 冲突和 global 授权拒绝。
 - 模拟、广播、回执失败与超时。
 - 成功回执后通过链上活动订单分页完成唯一订单映射，以及零个/多个/字段冲突的拒绝。

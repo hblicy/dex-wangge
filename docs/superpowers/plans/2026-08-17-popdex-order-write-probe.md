@@ -153,8 +153,8 @@ Expected: FAIL，模块不存在。
 
 ```js
 export const POPDEX_ORDER_INTERFACE = new Interface([
-  'function placeOrder(address account,bytes32 clientOrderId,uint16 symbolId,bytes32 orderParams,uint256 price,uint256 qty,uint256 slippage,address builder,uint256 builderFeeRate) returns (bool)',
-  'function cancelOrder(address account,uint128 orderId,bytes32 clientOrderId) returns (bool)',
+  'function placeOrder(address account,bytes32 clientOrderId,uint16 symbolId,bytes32 orderParams,uint256 price,uint256 qty,uint256 slippage,address builder,uint256 builderFeeRate)',
+  'function cancelOrder(address account,uint128 orderId,bytes32 clientOrderId)',
 ]);
 
 export function encodeOrderParams(side) {
