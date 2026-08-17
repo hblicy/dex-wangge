@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node test/grid.test.js && node --test test/security.test.js test/bot.test.js test/exchange-adapters.test.js test/startup.test.js test/persist.test.js test/risex-normalize.test.js test/risex-order-state.test.js test/risex-private-stream.test.js test/risex-mainnet-client.test.js test/risex-adapter.test.js test/risex-verify.test.js test/popdex-normalize.test.js test/popdex-public-client.test.js test/popdex-account-client.test.js test/popdex-rpc-client.test.js test/popdex-official-artifacts.test.js test/popdex-verify.test.js test/popdex-agent.test.js test/popdex-agent-service.test.js test/popdex-agent-isolation.test.js",
+    "test": "node test/grid.test.js && node --test test/security.test.js test/bot.test.js test/exchange-adapters.test.js test/startup.test.js test/persist.test.js test/risex-normalize.test.js test/risex-order-state.test.js test/risex-private-stream.test.js test/risex-mainnet-client.test.js test/risex-adapter.test.js test/risex-verify.test.js test/popdex-normalize.test.js test/popdex-public-client.test.js test/popdex-account-client.test.js test/popdex-rpc-client.test.js test/popdex-official-artifacts.test.js test/popdex-verify.test.js test/popdex-agent.test.js test/popdex-agent-service.test.js test/popdex-agent-isolation.test.js test/popdex-agent-ui.test.js",
     "risex:verify": "node src/exchange/rs/verify.js",
     "popdex:verify": "node src/exchange/px/verify.js"
   },

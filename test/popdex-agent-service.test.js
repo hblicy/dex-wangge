@@ -160,6 +160,26 @@ test('configured status derives the Agent address but never returns its private 
   assert.equal(JSON.stringify(status).includes(PRIVATE_KEY), false);
 });
 
+test('configured status reports a revoked Agent without hiding the configured identity', async () => {
+  const processEnv = {
+    POPDEX_MAIN_ACCOUNT: MAIN,
+    POPDEX_AGENT_PRIVATE_KEY: PRIVATE_KEY,
+  };
+  const ctx = service({
+    processEnv,
+    info: authorizedInfo({ exists: false, delegator: null }),
+  });
+  assert.deepEqual(await ctx.service.status(), {
+    configured: true,
+    mainAccount: MAIN,
+    agentAddress: AGENT,
+    authorized: false,
+    reason: 'Agent 不存在或已撤销',
+    expiresAt: '1789531200123',
+    isGlobal: false,
+  });
+});
+
 test('prepare approval reads existing Agents and chooses the exact replace target', async () => {
   const ctx = service({ agents: [{
     agent: OLD_AGENT,

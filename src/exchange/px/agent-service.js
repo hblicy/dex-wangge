@@ -106,10 +106,12 @@ export class PopdexAgentService {
     if (!rawMain) {
       throw new Error('PopDEX Agent 已配置私钥但缺少主账户。');
     }
-    return this.verifyAuthorization({
-      mainAccount: rawMain,
-      agentAddress: deriveAgentAddress(privateKey),
-    });
+    const status = await this.inspectAuthorization(
+      rawMain,
+      deriveAgentAddress(privateKey),
+    );
+    const { info: _info, ...publicStatus } = status;
+    return publicStatus;
   }
 
   async prepareApproval({ agentAddress, delegator, hostname }) {
