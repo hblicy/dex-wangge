@@ -1,5 +1,11 @@
-import { Interface } from 'ethers';
-import { POPDEX_CHAIN_ID, POPDEX_ORDER_PRECOMPILE, POPDEX_RPC_URL } from './constants.js';
+import { Interface, ZeroAddress } from 'ethers';
+import { POPDEX_ACCOUNT_INTERFACE } from './agent.js';
+import {
+  POPDEX_ACCOUNT_PRECOMPILE,
+  POPDEX_CHAIN_ID,
+  POPDEX_ORDER_PRECOMPILE,
+  POPDEX_RPC_URL,
+} from './constants.js';
 import { strictAddress } from './normalize.js';
 
 const OPEN_POSITIONS_INTERFACE = new Interface([
@@ -65,6 +71,13 @@ function exactPosition(value) {
     createdTime: value.createdTime.toString(),
     updatedTime: value.updatedTime.toString(),
   };
+}
+
+function bytes32(value, field) {
+  if (typeof value !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(value)) {
+    throw new Error(`PopDEX ${field} 必须是 bytes32 十六进制字符串。`);
+  }
+  return value;
 }
 
 export class PopdexRpcClient {
@@ -176,6 +189,86 @@ export class PopdexRpcClient {
       positions: decoded.positions.map(exactPosition),
       hasMore: decoded.hasMore,
     };
+  }
+
+  async getAgentInfo(agentAddress) {
+    const agent = strictAddress(agentAddress, 'agentAddress');
+    const data = POPDEX_ACCOUNT_INTERFACE.encodeFunctionData('getAgentInfo', [agent]);
+    const raw = await this.call('eth_call', [
+      { to: POPDEX_ACCOUNT_PRECOMPILE, data },
+      'latest',
+    ]);
+    let decoded;
+    try {
+      decoded = POPDEX_ACCOUNT_INTERFACE.decodeFunctionResult('getAgentInfo', raw);
+    } catch (error) {
+      throw new Error(
+        `PopDEX RPC getAgentInfo 解码失败：${sanitizedCause(error)}`,
+        { cause: error },
+      );
+    }
+    const exists = decoded.exists;
+    if (typeof exists !== 'boolean' || typeof decoded.isExpired !== 'boolean' || typeof decoded.isGlobal !== 'boolean') {
+      throw new Error('PopDEX RPC getAgentInfo 布尔字段无效。');
+    }
+    let delegator = null;
+    if (exists) {
+      delegator = strictAddress(decoded.delegator, 'agent.delegator');
+    } else if (decoded.delegator !== ZeroAddress) {
+      throw new Error('PopDEX RPC getAgentInfo 未存在 Agent 却返回非零 delegator。');
+    }
+    return {
+      exists,
+      expiresAt: decoded.expiresAt.toString(),
+      isExpired: decoded.isExpired,
+      delegator,
+      name: bytes32(decoded.name, 'agent.name'),
+      isGlobal: decoded.isGlobal,
+    };
+  }
+
+  async getAgents(delegatorAddress) {
+    const delegator = strictAddress(delegatorAddress, 'delegator');
+    const data = POPDEX_ACCOUNT_INTERFACE.encodeFunctionData('getAgents', [delegator]);
+    const raw = await this.call('eth_call', [
+      { to: POPDEX_ACCOUNT_PRECOMPILE, data },
+      'latest',
+    ]);
+    let decoded;
+    try {
+      decoded = POPDEX_ACCOUNT_INTERFACE.decodeFunctionResult('getAgents', raw);
+    } catch (error) {
+      throw new Error(
+        `PopDEX RPC getAgents 解码失败：${sanitizedCause(error)}`,
+        { cause: error },
+      );
+    }
+    const arrays = [
+      decoded.agents,
+      decoded.expiresAts,
+      decoded.isExpireds,
+      decoded.names,
+      decoded.isGlobals,
+    ];
+    if (arrays.some((value) => !Array.isArray(value) && !ArrayBuffer.isView(value))) {
+      throw new Error('PopDEX RPC getAgents 返回字段不是数组。');
+    }
+    const length = decoded.agents.length;
+    if (arrays.some((value) => value.length !== length)) {
+      throw new Error('PopDEX RPC getAgents 数组长度不一致。');
+    }
+    return Array.from({ length }, (_unused, index) => {
+      if (typeof decoded.isExpireds[index] !== 'boolean' || typeof decoded.isGlobals[index] !== 'boolean') {
+        throw new Error(`PopDEX RPC getAgents[${index}] 布尔字段无效。`);
+      }
+      return {
+        agent: strictAddress(decoded.agents[index], `agents[${index}].agent`),
+        expiresAt: decoded.expiresAts[index].toString(),
+        isExpired: decoded.isExpireds[index],
+        name: bytes32(decoded.names[index], `agents[${index}].name`),
+        isGlobal: decoded.isGlobals[index],
+      };
+    });
   }
 
   async getTransaction(txHash) {
