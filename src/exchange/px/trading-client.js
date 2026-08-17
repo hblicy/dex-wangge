@@ -1,4 +1,5 @@
 import { decodeBytes32String, keccak256, parseUnits, Wallet } from 'ethers';
+import { confirmMissingCancelledOrder } from './cancel-confirmation.js';
 import { POPDEX_CHAIN_ID, POPDEX_EXPECTED_MARKETS, POPDEX_ORDER_PRECOMPILE } from './constants.js';
 import { encodeCancelOrder, POPDEX_ORDER_INTERFACE } from './order-codec.js';
 import { strictAddress, strictIntegerString } from './normalize.js';
@@ -360,6 +361,30 @@ export class PopdexTradingClient {
         }
       } catch (error) {
         if (error?.code !== 'POPDEX_ORDER_NOT_FOUND') throw error;
+        const evidence = await confirmMissingCancelledOrder({
+          accountClient: this.accountClient,
+          readRpc: this.readRpc,
+          mainAccount: this.mainAccount,
+          symbol,
+          orderId: openOrder.orderId,
+        });
+        if (evidence.status === 'filled') {
+          throw new Error(
+            `PopDEX CANCEL_CONFIRMED 订单 ${openOrder.orderId} 发生成交 ${evidence.filledQtyWad}，请人工处理仓位。`,
+          );
+        }
+        if (evidence.status === 'position-open') {
+          throw new Error(
+            `PopDEX CANCEL_CONFIRMED market ${symbol} 仍有持仓 ${evidence.holdSizeWad}，请人工处理仓位。`,
+          );
+        }
+        return {
+          ...openOrder,
+          filledQtyWad: '0',
+          remainingQtyWad: '0',
+          cancelledQtyWad: openOrder.qtyWad,
+          confirmationSource: 'OrderCancel+REST-open+fills+positions',
+        };
       }
       if (attempt < attempts) await this.sleep(this.orderPollMs);
     }

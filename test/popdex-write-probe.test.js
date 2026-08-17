@@ -13,6 +13,7 @@ const AGENT_PRIVATE_KEY = `0x${'22'.repeat(32)}`;
 const AGENT = new Wallet(AGENT_PRIVATE_KEY).address;
 const CLIENT_ORDER_ID = encodeBytes32String('dw-bb-0123456789abcdef01234567');
 const PLACE_TX_HASH = `0x${'34'.repeat(32)}`;
+const CANCEL_TX_HASH = `0x${'56'.repeat(32)}`;
 const ORDER_ID = '234237619377012736';
 
 function successfulPlacementReceipt(overrides = {}) {
@@ -33,6 +34,23 @@ function successfulPlacementReceipt(overrides = {}) {
   );
   return {
     transactionHash: PLACE_TX_HASH,
+    status: '0x1',
+    logs: [{
+      address: '0x0000000000000000000000000000000000001000',
+      data: event.data,
+      topics: event.topics,
+    }],
+    ...overrides,
+  };
+}
+
+function successfulCancelReceipt(overrides = {}) {
+  const event = POPDEX_ORDER_EVENT_INTERFACE.encodeEventLog(
+    POPDEX_ORDER_EVENT_INTERFACE.getEvent('OrderCancel'),
+    [MAIN_ACCOUNT, ORDER_ID, CLIENT_ORDER_ID, true, 0],
+  );
+  return {
+    transactionHash: CANCEL_TX_HASH,
     status: '0x1',
     logs: [{
       address: '0x0000000000000000000000000000000000001000',
@@ -871,6 +889,129 @@ test('resume preserves the journal and requires manual position handling after a
   assert.equal(result.status, 'filled-manual-position-required');
   assert.equal(result.filledQtyWad, '100000000000000');
   assert.ok(!deps.calls.includes('journal:clear'));
+});
+
+test('resume clears CANCEL_BROADCAST after exact cancel receipt, open-order absence, no fills and no position', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'CANCEL_BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: ORDER_ID,
+    placeTxHash: PLACE_TX_HASH, cancelTxHash: CANCEL_TX_HASH,
+  };
+  deps.readRpc.getReceipt = async (txHash) => {
+    deps.calls.push(`read:receipt:${txHash}`);
+    if (txHash === CANCEL_TX_HASH) return successfulCancelReceipt();
+    if (txHash === PLACE_TX_HASH) return successfulPlacementReceipt();
+    throw new Error(`unexpected receipt ${txHash}`);
+  };
+  deps.accountClient.getFills = async (account, symbol) => {
+    deps.calls.push(`account:fills:${account}:${symbol}`);
+    return [];
+  };
+  deps.readRpc.getOpenPositions = async (account) => {
+    deps.calls.push(`read:positions:${account}`);
+    return { positions: [], hasMore: false };
+  };
+
+  const result = await runProbe(
+    options({ resume: true, symbol: null, side: null, price: null, qty: null }),
+    deps,
+  );
+
+  assert.equal(result.status, 'completed-zero-fill-cleared');
+  assert.equal(result.source, 'cancel-receipt+REST-open+fills+positions');
+  assert.equal(result.orderId, ORDER_ID);
+  assert.ok(deps.calls.includes(`read:receipt:${CANCEL_TX_HASH}`));
+  assert.ok(deps.calls.includes(`account:fills:${MAIN_ACCOUNT}:BTCUSDT`));
+  assert.ok(deps.calls.includes(`read:positions:${MAIN_ACCOUNT}`));
+  assert.ok(deps.calls.includes(`journal:complete:${ORDER_ID}`));
+  assert.ok(deps.calls.includes('journal:clear'));
+  assert.equal(deps.journal.record, null);
+  assert.ok(!deps.calls.includes('write:create'));
+  assert.ok(!deps.calls.includes('trading:create'));
+});
+
+test('resume preserves CANCEL_BROADCAST when an exact fill exists after the cancel receipt', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'CANCEL_BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: ORDER_ID,
+    placeTxHash: PLACE_TX_HASH, cancelTxHash: CANCEL_TX_HASH,
+  };
+  deps.readRpc.getReceipt = async (txHash) => (
+    txHash === CANCEL_TX_HASH ? successfulCancelReceipt() : successfulPlacementReceipt()
+  );
+  deps.accountClient.getFills = async () => [{ orderId: ORDER_ID, execQty: '0.0001' }];
+  deps.readRpc.getOpenPositions = async () => {
+    throw new Error('成交存在时不应查询持仓');
+  };
+
+  const result = await runProbe(
+    options({ resume: true, symbol: null, side: null, price: null, qty: null }),
+    deps,
+  );
+
+  assert.equal(result.status, 'filled-manual-position-required');
+  assert.equal(result.source, 'cancel-receipt+fills');
+  assert.equal(result.filledQtyWad, '100000000000000');
+  assert.equal(deps.journal.record.stage, 'CANCEL_BROADCAST');
+  assert.ok(!deps.calls.includes('journal:clear'));
+  assert.ok(!deps.calls.includes('write:create'));
+});
+
+test('resume preserves CANCEL_BROADCAST when the target market still has a position', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'CANCEL_BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: ORDER_ID,
+    placeTxHash: PLACE_TX_HASH, cancelTxHash: CANCEL_TX_HASH,
+  };
+  deps.readRpc.getReceipt = async (txHash) => (
+    txHash === CANCEL_TX_HASH ? successfulCancelReceipt() : successfulPlacementReceipt()
+  );
+  deps.accountClient.getFills = async () => [];
+  deps.readRpc.getOpenPositions = async () => ({
+    positions: [{
+      walletId: MAIN_ACCOUNT,
+      symbolId: '20000',
+      holdSizeWad: '100000000000000',
+    }],
+    hasMore: false,
+  });
+
+  const result = await runProbe(
+    options({ resume: true, symbol: null, side: null, price: null, qty: null }),
+    deps,
+  );
+
+  assert.equal(result.status, 'position-manual-required');
+  assert.equal(result.source, 'cancel-receipt+positions');
+  assert.equal(result.holdSizeWad, '100000000000000');
+  assert.equal(deps.journal.record.stage, 'CANCEL_BROADCAST');
+  assert.ok(!deps.calls.includes('journal:clear'));
+  assert.ok(!deps.calls.includes('write:create'));
+});
+
+test('resume rejects a failed recorded cancel receipt and preserves recovery state', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'CANCEL_BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: ORDER_ID,
+    placeTxHash: PLACE_TX_HASH, cancelTxHash: CANCEL_TX_HASH,
+  };
+  deps.readRpc.getReceipt = async () => ({ transactionHash: CANCEL_TX_HASH, status: '0x0' });
+
+  await assert.rejects(
+    runProbe(
+      options({ resume: true, symbol: null, side: null, price: null, qty: null }),
+      deps,
+    ),
+    /成功交易回执 status 必须是 0x1/,
+  );
+
+  assert.equal(deps.journal.record.stage, 'CANCEL_BROADCAST');
+  assert.ok(!deps.calls.includes('journal:clear'));
+  assert.ok(!deps.calls.includes('write:create'));
 });
 
 test('main masks addresses and never prints the Agent private key or raw calldata', async () => {
