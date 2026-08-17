@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { loadEnv } from '../../config.js';
 import { PopdexAccountClient } from './account-client.js';
 import { POPDEX_EXPECTED_MARKETS } from './constants.js';
 import {
@@ -210,6 +211,9 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   let account = '';
   try {
     const args = parseArgs(argv);
+    if (args.accountEnv && deps.env === undefined) {
+      (deps.loadEnv ?? loadEnv)();
+    }
     const publicResult = await verifyPopdexPublic(
       { allowMissingArtifactTokens: args.artifactsJson },
       deps,
