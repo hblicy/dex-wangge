@@ -22,6 +22,7 @@ const RECORD_KEYS = Object.freeze([
   'side',
   'price',
   'qty',
+  'recoveredFromChain',
   'clientOrderId',
   'orderId',
   'placeTxHash',
@@ -93,6 +94,9 @@ function validateRecord(value) {
   }
   strictDecimalString(value.price, 'journal.price');
   strictDecimalString(value.qty, 'journal.qty');
+  if (typeof value.recoveredFromChain !== 'boolean') {
+    throw new Error('PopDEX journal recoveredFromChain 必须是布尔值。');
+  }
   value.clientOrderId = exactHex32(value.clientOrderId, 'clientOrderId');
   if (value.orderId !== null) value.orderId = exactOrderId(value.orderId);
   if (value.placeTxHash !== null) value.placeTxHash = exactHex32(value.placeTxHash, 'placeTxHash');
@@ -109,8 +113,12 @@ function validateRecord(value) {
   if (STAGES.indexOf(value.stage) >= STAGES.indexOf('OPEN_CONFIRMED') && value.orderId === null) {
     throw new Error(`PopDEX journal ${value.stage} 缺少 orderId。`);
   }
-  if (STAGES.indexOf(value.stage) >= STAGES.indexOf('CANCEL_BROADCAST') && value.cancelTxHash === null) {
+  if (STAGES.indexOf(value.stage) >= STAGES.indexOf('CANCEL_BROADCAST')
+      && value.cancelTxHash === null && !value.recoveredFromChain) {
     throw new Error(`PopDEX journal ${value.stage} 缺少 cancelTxHash。`);
+  }
+  if (value.recoveredFromChain && value.stage !== 'CANCEL_CONFIRMED') {
+    throw new Error('PopDEX journal recoveredFromChain 只允许用于 CANCEL_CONFIRMED。');
   }
   return value;
 }
@@ -193,6 +201,7 @@ export class PopdexWriteJournal {
       side: orderPlan.side,
       price: orderPlan.price,
       qty: orderPlan.qty,
+      recoveredFromChain: false,
       clientOrderId: orderPlan.clientOrderId,
       orderId: null,
       placeTxHash: null,
@@ -237,6 +246,43 @@ export class PopdexWriteJournal {
       lastError: sanitizedError(error),
       updatedAt: this.#timestamp(),
     });
+  }
+
+  completeFromChain(orderId) {
+    const current = this.load();
+    if (current === null) throw new Error('PopDEX journal 不存在，无法记录链上完成。');
+    if (current.stage === 'PREPARED') {
+      throw new Error('PopDEX journal PREPARED 没有广播证据，不能标记链上完成。');
+    }
+    if (current.stage === 'CANCEL_CONFIRMED') {
+      throw new Error('PopDEX journal 已经是 CANCEL_CONFIRMED。');
+    }
+    const exactId = exactOrderId(orderId);
+    if (current.orderId !== null && current.orderId !== exactId) {
+      throw new Error(
+        `PopDEX journal 链上 orderId 冲突：expected=${current.orderId} actual=${exactId}。`,
+      );
+    }
+    return this.#persist({
+      ...current,
+      stage: 'CANCEL_CONFIRMED',
+      orderId: exactId,
+      recoveredFromChain: true,
+      lastError: null,
+      updatedAt: this.#timestamp(),
+    });
+  }
+
+  clearPrepared() {
+    const current = this.load();
+    if (current === null || current.stage !== 'PREPARED') {
+      throw new Error('PopDEX journal 只有 PREPARED 才能做广播前清理。');
+    }
+    try {
+      this.fs.unlinkSync(this.file);
+    } catch (cause) {
+      throw new Error(`PopDEX journal PREPARED 清理失败 (${this.file})：${cause?.message || cause}`, { cause });
+    }
   }
 
   clearCompleted() {

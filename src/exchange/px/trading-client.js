@@ -61,6 +61,30 @@ function safeJournalError(journal, stage, error) {
   }
 }
 
+export function validateAgentAuthorization({ mainAccount, agentAddress, info, nowMs }) {
+  const main = strictAddress(mainAccount, 'mainAccount');
+  const agent = strictAddress(agentAddress, 'agentAddress');
+  if (sameAddress(main, agent)) {
+    throw new Error('PopDEX Agent 地址不能与主账户相同。');
+  }
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
+    throw new Error('PopDEX Agent 当前时间必须是非负安全整数。');
+  }
+  if (!info || typeof info !== 'object' || !info.exists) {
+    throw new Error('PopDEX Agent 链上授权不存在。');
+  }
+  if (info.isExpired || BigInt(strictIntegerString(info.expiresAt, 'Agent expiresAt')) <= BigInt(nowMs)) {
+    throw new Error(`PopDEX Agent 授权已过期：expiresAt=${String(info.expiresAt)}。`);
+  }
+  if (info.isGlobal !== false) {
+    throw new Error('PopDEX Agent 必须是 isGlobal=false 的非 global 授权。');
+  }
+  if (typeof info.delegator !== 'string' || !sameAddress(info.delegator, main)) {
+    throw new Error('PopDEX Agent delegator 与主账户不匹配。');
+  }
+  return { mainAccount: main, agent, expiresAt: info.expiresAt };
+}
+
 export class PopdexTradingClient {
   constructor({
     mainAccount,
@@ -122,21 +146,12 @@ export class PopdexTradingClient {
       throw new Error('PopDEX 读写 RPC chainId 必须同时为 2184。');
     }
     const info = await this.readRpc.getAgentInfo(this.wallet.address);
-    if (!info.exists) throw new Error('PopDEX Agent 链上授权不存在。');
-    if (info.isExpired || BigInt(strictIntegerString(info.expiresAt, 'Agent expiresAt')) <= BigInt(this.#currentTime())) {
-      throw new Error(`PopDEX Agent 授权已过期：expiresAt=${String(info.expiresAt)}。`);
-    }
-    if (info.isGlobal !== false) {
-      throw new Error('PopDEX Agent 必须是 isGlobal=false 的非 global 授权。');
-    }
-    if (typeof info.delegator !== 'string' || !sameAddress(info.delegator, this.mainAccount)) {
-      throw new Error('PopDEX Agent delegator 与主账户不匹配。');
-    }
-    return {
+    return validateAgentAuthorization({
       mainAccount: this.mainAccount,
-      agent: this.wallet.address,
-      expiresAt: info.expiresAt,
-    };
+      agentAddress: this.wallet.address,
+      info,
+      nowMs: this.#currentTime(),
+    });
   }
 
   async #sign(data) {

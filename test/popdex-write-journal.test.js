@@ -68,7 +68,7 @@ test('journal create atomically writes an owner-only PREPARED record', () => {
   const persisted = JSON.parse(fsImpl.files.get('probe.json'));
   assert.deepEqual(Object.keys(persisted).sort(), [
     'cancelTxHash', 'clientOrderId', 'lastError', 'orderId', 'placeTxHash',
-    'price', 'qty', 'side', 'stage', 'symbol', 'updatedAt', 'version',
+    'price', 'qty', 'recoveredFromChain', 'side', 'stage', 'symbol', 'updatedAt', 'version',
   ]);
   assert.doesNotMatch(fsImpl.files.get('probe.json'), /private|secret|signature|serialized/i);
 });
@@ -168,4 +168,34 @@ test('journal clearCompleted deletes only a confirmed cancellation', () => {
   journal.clearCompleted();
   assert.equal(journal.load(), null);
   assert.deepEqual(fsImpl.calls.at(-1), ['unlink', 'probe.json']);
+});
+
+test('journal marks a zero-fill manual cancellation as chain-recovered without a fake txHash', () => {
+  const fsImpl = memoryFs();
+  const journal = new PopdexWriteJournal({ file: 'probe.json', fsImpl, platform: 'linux' });
+  journal.create(orderPlan());
+  journal.advance('PREPARED', 'BROADCAST', { placeTxHash: PLACE_TX_HASH });
+  const recovered = journal.completeFromChain('90071992547409931234');
+  assert.equal(recovered.stage, 'CANCEL_CONFIRMED');
+  assert.equal(recovered.orderId, '90071992547409931234');
+  assert.equal(recovered.cancelTxHash, null);
+  assert.equal(recovered.recoveredFromChain, true);
+  journal.clearCompleted();
+
+  const prepared = new PopdexWriteJournal({ file: 'other.json', fsImpl, platform: 'linux' });
+  prepared.create(orderPlan({ clientOrderId: `0x${'99'.repeat(32)}` }));
+  assert.throws(() => prepared.completeFromChain('1'), /PREPARED.*链上完成/);
+});
+
+test('journal clears only PREPARED records that have no broadcast evidence', () => {
+  const fsImpl = memoryFs();
+  const journal = new PopdexWriteJournal({ file: 'probe.json', fsImpl, platform: 'linux' });
+  journal.create(orderPlan());
+  journal.clearPrepared();
+  assert.equal(journal.load(), null);
+
+  journal.create(orderPlan());
+  journal.advance('PREPARED', 'BROADCAST', { placeTxHash: PLACE_TX_HASH });
+  assert.throws(() => journal.clearPrepared(), /PREPARED/);
+  assert.equal(journal.load().stage, 'BROADCAST');
 });
