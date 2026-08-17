@@ -35,7 +35,7 @@
 4. 从事件取得精确 `orderId`，并与恢复记录已有 `orderId`（如果存在）一致。
 5. 用官方 REST 按规范 UTF-8 `clientOid` 精确查找订单。
 6. 校验主账户、BTCUSDT/ETHUSDT 白名单、方向、价格、数量、非 reduce-only、订单 ID 和客户端订单 ID 全部一致。
-7. 仅允许 `WaitToSend`、`PendingNew`、`NewAccept` 或 `PendingCancel` 且 `filledQty=0`、`remainingQty=qty`、`cancelledQty=0` 的订单进入撤单。
+7. 仅允许状态精确为 `NewAccept`，且 `filledQty=0`、`remainingQty=qty`、`cancelledQty=0` 的订单进入撤单。`WaitToSend`、`PendingNew` 和 `PendingCancel` 都表示状态尚未稳定，必须保持只读并停止，防止重复动作。
 8. 再次验证 `.env` 中临时 Agent 私钥对应的 Agent 授权仍有效、未过期、非 global 且 delegator 是主账户。
 
 任何一步失败都必须在签名和广播前终止，并保留恢复记录。
