@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { encodeBytes32String } from 'ethers';
 import { PopdexAccountClient } from '../src/exchange/px/account-client.js';
 
 const ACCOUNT = '0x1111111111111111111111111111111111111111';
@@ -26,7 +27,7 @@ function makeAccountFetch(seen = []) {
         data: {
           orders: [{
             orderId: '90071992547409931234',
-            clientOrderId: '0x' + '11'.repeat(32),
+            clientOid: 'dw-bb-111111111111111111111111',
             symbol: 'BTCUSDT',
             side: 'Buy',
             status: 'OPEN',
@@ -84,10 +85,19 @@ test('order and fill IDs remain exact strings', async () => {
   const orders = await client.getOpenOrders(ACCOUNT, 'BTCUSDT');
   const [order] = orders;
   assert.equal(order.orderId, '90071992547409931234');
+  assert.equal(order.clientOid, 'dw-bb-111111111111111111111111');
   assert.equal(orders.cursor, '90071992547409935555');
   const [fill] = await client.getFills(ACCOUNT, 'BTCUSDT');
   assert.equal(fill.fillId, '90071992547409939999');
   assert.equal(fill.orderId, '90071992547409931234');
+});
+
+test('REST order lookup matches the bytes32 client ID through the official clientOid string', async () => {
+  const client = new PopdexAccountClient({ fetchImpl: makeAccountFetch() });
+  const clientOrderId = encodeBytes32String('dw-bb-111111111111111111111111');
+  const order = await client.findUniqueOrderByClientId(ACCOUNT, 'BTCUSDT', clientOrderId);
+  assert.equal(order.orderId, '90071992547409931234');
+  assert.equal(order.clientOid, 'dw-bb-111111111111111111111111');
 });
 
 test('overview is read without assuming it contains positions', async () => {

@@ -114,13 +114,18 @@ export function normalizeOrder(value) {
     throw new Error('PopDEX order 必须是对象。');
   }
   const orderId = strictIntegerString(value.orderId, 'order.orderId');
-  const clientOrderId = value.clientOrderId === undefined || value.clientOrderId === null
-    ? value.clientOrderId
-    : strictNonEmptyString(value.clientOrderId, 'order.clientOrderId');
+  if (value.clientOid !== undefined && value.clientOrderId !== undefined
+      && value.clientOid !== value.clientOrderId) {
+    throw new Error('PopDEX order.clientOid 与 order.clientOrderId 冲突。');
+  }
+  const rawClientOid = value.clientOid ?? value.clientOrderId;
+  const clientOid = rawClientOid === undefined || rawClientOid === null
+    ? rawClientOid
+    : strictNonEmptyString(rawClientOid, 'order.clientOid');
   return {
     ...value,
     orderId,
-    clientOrderId,
+    clientOid,
     symbol: strictTargetSymbol(value.symbol, 'order.symbol'),
     side: strictNonEmptyString(value.side, 'order.side'),
     status: strictNonEmptyString(value.status, 'order.status'),

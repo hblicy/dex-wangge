@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { Wallet } from 'ethers';
+import { decodeBytes32String, encodeBytes32String, parseUnits, Wallet } from 'ethers';
+import { POPDEX_ORDER_EVENT_INTERFACE } from '../src/exchange/px/receipt-events.js';
 import {
   main,
   parseArgs,
@@ -10,8 +11,56 @@ import {
 const MAIN_ACCOUNT = '0x1111111111111111111111111111111111111111';
 const AGENT_PRIVATE_KEY = `0x${'22'.repeat(32)}`;
 const AGENT = new Wallet(AGENT_PRIVATE_KEY).address;
-const CLIENT_ORDER_ID = `0x${'12'.repeat(32)}`;
+const CLIENT_ORDER_ID = encodeBytes32String('dw-bb-0123456789abcdef01234567');
 const PLACE_TX_HASH = `0x${'34'.repeat(32)}`;
+const ORDER_ID = '234237619377012736';
+
+function successfulPlacementReceipt(overrides = {}) {
+  const event = POPDEX_ORDER_EVENT_INTERFACE.encodeEventLog(
+    POPDEX_ORDER_EVENT_INTERFACE.getEvent('OrderCreate'),
+    [
+      MAIN_ACCOUNT,
+      '20000',
+      ORDER_ID,
+      CLIENT_ORDER_ID,
+      parseUnits('60000', 18),
+      parseUnits('0.0002', 18),
+      0,
+      2,
+      true,
+      0,
+    ],
+  );
+  return {
+    transactionHash: PLACE_TX_HASH,
+    status: '0x1',
+    logs: [{
+      address: '0x0000000000000000000000000000000000001000',
+      data: event.data,
+      topics: event.topics,
+    }],
+    ...overrides,
+  };
+}
+
+function restProbeOrder(overrides = {}) {
+  return {
+    walletId: MAIN_ACCOUNT,
+    orderId: ORDER_ID,
+    clientOid: decodeBytes32String(CLIENT_ORDER_ID),
+    symbolId: '20000',
+    symbol: 'BTCUSDT',
+    side: 'Buy',
+    status: 'NewAccept',
+    price: '60000',
+    qty: '0.0002',
+    filledQty: '0',
+    remainingQty: '0.0002',
+    cancelledQty: '0',
+    reduceOnly: false,
+    ...overrides,
+  };
+}
 
 function options(overrides = {}) {
   return {
@@ -83,6 +132,7 @@ function fakeDependencies(overrides = {}) {
           balances: [{ balance: '100.00' }],
         };
       },
+      async findUniqueOrderByClientId() { throw notFound(); },
     },
     readRpc: {
       async verifyChain() { calls.push('read:chain'); return 2184n; },
@@ -307,24 +357,131 @@ test('resume clears a BROADCAST journal only after the recorded placement receip
   assert.ok(!deps.calls.includes('write:create'));
 });
 
-test('resume keeps an unresolved BROADCAST journal without an authoritative failed receipt', async () => {
-  for (const receipt of [null, { transactionHash: PLACE_TX_HASH, status: '0x1' }]) {
-    const deps = fakeDependencies();
-    deps.journal.record = {
-      stage: 'BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
-      clientOrderId: CLIENT_ORDER_ID, orderId: null, placeTxHash: PLACE_TX_HASH,
-    };
-    deps.readRpc.getReceipt = async () => receipt;
+test('resume never clears a failed receipt when REST still reports the client order ID', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: null, placeTxHash: PLACE_TX_HASH,
+  };
+  deps.readRpc.getReceipt = async () => ({ transactionHash: PLACE_TX_HASH, status: '0x0' });
+  deps.accountClient.findUniqueOrderByClientId = async () => restProbeOrder();
 
-    const result = await runProbe(
-      options({ resume: true, symbol: null, side: null, price: null, qty: null }),
-      deps,
-    );
+  await assert.rejects(
+    runProbe(options({ resume: true, symbol: null, side: null, price: null, qty: null }), deps),
+    /失败下单回执与订单查询事实冲突/,
+  );
+  assert.equal(deps.journal.record.stage, 'BROADCAST');
+  assert.ok(!deps.calls.some((call) => call.startsWith('journal:clear-reverted:')));
+});
 
-    assert.equal(result.status, 'order-fact-unresolved');
-    assert.equal(deps.journal.record.stage, 'BROADCAST');
-    assert.ok(!deps.calls.some((call) => call.startsWith('journal:clear-reverted:')));
-  }
+test('resume keeps an unresolved BROADCAST journal without a transaction receipt', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: null, placeTxHash: PLACE_TX_HASH,
+  };
+  deps.readRpc.getReceipt = async () => null;
+
+  const result = await runProbe(
+    options({ resume: true, symbol: null, side: null, price: null, qty: null }),
+    deps,
+  );
+
+  assert.equal(result.status, 'order-fact-unresolved');
+  assert.equal(deps.journal.record.stage, 'BROADCAST');
+  assert.ok(!deps.calls.some((call) => call.startsWith('journal:clear-reverted:')));
+});
+
+test('resume rejects a malformed successful placement receipt instead of hiding it', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: null, placeTxHash: PLACE_TX_HASH,
+  };
+  deps.readRpc.getReceipt = async () => ({ transactionHash: PLACE_TX_HASH, status: '0x1' });
+
+  await assert.rejects(
+    runProbe(options({ resume: true, symbol: null, side: null, price: null, qty: null }), deps),
+    /OrderCreate.*logs.*数组/,
+  );
+  assert.equal(deps.journal.record.stage, 'BROADCAST');
+});
+
+test('resume uses a successful OrderCreate receipt plus REST when precompile order pages are empty', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: null, placeTxHash: PLACE_TX_HASH,
+  };
+  deps.readRpc.getReceipt = async () => successfulPlacementReceipt();
+  deps.accountClient.findUniqueOrderByClientId = async (account, symbol, clientOrderId) => {
+    assert.equal(account, MAIN_ACCOUNT);
+    assert.equal(symbol, 'BTCUSDT');
+    assert.equal(clientOrderId, CLIENT_ORDER_ID);
+    return restProbeOrder();
+  };
+
+  const result = await runProbe(
+    options({ resume: true, symbol: null, side: null, price: null, qty: null }),
+    deps,
+  );
+
+  assert.equal(result.status, 'active-manual-cancel-required');
+  assert.equal(result.orderId, ORDER_ID);
+  assert.equal(result.source, 'receipt+REST');
+  assert.equal(deps.journal.record.stage, 'BROADCAST');
+  assert.ok(!deps.calls.includes('journal:clear'));
+});
+
+test('resume clears a successful placement only after REST proves zero-fill cancellation', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: null, placeTxHash: PLACE_TX_HASH,
+  };
+  deps.readRpc.getReceipt = async () => successfulPlacementReceipt();
+  deps.accountClient.findUniqueOrderByClientId = async () => restProbeOrder({
+    status: 'Cancelled',
+    remainingQty: '0',
+    cancelledQty: '0.0002',
+  });
+
+  const result = await runProbe(
+    options({ resume: true, symbol: null, side: null, price: null, qty: null }),
+    deps,
+  );
+
+  assert.equal(result.status, 'completed-zero-fill-cleared');
+  assert.equal(result.source, 'receipt+REST');
+  assert.ok(deps.calls.includes(`journal:complete:${ORDER_ID}`));
+  assert.ok(deps.calls.includes('journal:clear'));
+  assert.equal(deps.journal.record, null);
+});
+
+test('resume preserves the journal when REST proves a fill after successful placement', async () => {
+  const deps = fakeDependencies();
+  deps.journal.record = {
+    stage: 'BROADCAST', symbol: 'BTCUSDT', side: 'buy', price: '60000', qty: '0.0002',
+    clientOrderId: CLIENT_ORDER_ID, orderId: null, placeTxHash: PLACE_TX_HASH,
+  };
+  deps.readRpc.getReceipt = async () => successfulPlacementReceipt();
+  deps.accountClient.findUniqueOrderByClientId = async () => restProbeOrder({
+    status: 'PartiallyFilledCancelled',
+    filledQty: '0.0001',
+    remainingQty: '0',
+    cancelledQty: '0.0001',
+  });
+
+  const result = await runProbe(
+    options({ resume: true, symbol: null, side: null, price: null, qty: null }),
+    deps,
+  );
+
+  assert.equal(result.status, 'filled-manual-position-required');
+  assert.equal(result.filledQtyWad, '100000000000000');
+  assert.equal(result.source, 'receipt+REST');
+  assert.equal(deps.journal.record.stage, 'BROADCAST');
+  assert.ok(!deps.calls.includes('journal:clear'));
 });
 
 test('resume preserves the journal and requires manual position handling after any fill', async () => {

@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { keccak256, Transaction, Wallet } from 'ethers';
+import { decodeBytes32String, keccak256, Transaction, Wallet } from 'ethers';
 import {
   POPDEX_ORDER_INTERFACE,
   prepareProbeOrder,
 } from '../src/exchange/px/order-codec.js';
 import { PopdexTradingClient } from '../src/exchange/px/trading-client.js';
+import { POPDEX_ORDER_EVENT_INTERFACE } from '../src/exchange/px/receipt-events.js';
 
 const MAIN_ACCOUNT = '0x1111111111111111111111111111111111111111';
 const AGENT_PRIVATE_KEY = `0x${'22'.repeat(32)}`;
@@ -52,6 +53,97 @@ function terminalOrder(orderPlan = plan(), overrides = {}) {
   });
 }
 
+function restOrder(orderPlan = plan(), overrides = {}) {
+  return {
+    walletId: MAIN_ACCOUNT,
+    orderId: '90071992547409931234',
+    clientOid: decodeBytes32String(orderPlan.clientOrderId),
+    symbolId: orderPlan.symbolId,
+    symbol: orderPlan.symbol,
+    side: 'Buy',
+    status: 'NewAccept',
+    price: orderPlan.price,
+    qty: orderPlan.qty,
+    filledQty: '0',
+    remainingQty: orderPlan.qty,
+    cancelledQty: '0',
+    reduceOnly: false,
+    ...overrides,
+  };
+}
+
+function createReceipt(orderPlan = plan(), txHash = `0x${'34'.repeat(32)}`) {
+  const event = POPDEX_ORDER_EVENT_INTERFACE.encodeEventLog(
+    POPDEX_ORDER_EVENT_INTERFACE.getEvent('OrderCreate'),
+    [
+      MAIN_ACCOUNT,
+      orderPlan.symbolId,
+      '90071992547409931234',
+      orderPlan.clientOrderId,
+      orderPlan.priceWad,
+      orderPlan.qtyWad,
+      '0',
+      2,
+      true,
+      0,
+    ],
+  );
+  return {
+    transactionHash: txHash,
+    status: '0x1',
+    logs: [{
+      address: '0x0000000000000000000000000000000000001000',
+      data: event.data,
+      topics: event.topics,
+    }],
+  };
+}
+
+function receiptFromTransaction(hash, raw) {
+  const transaction = Transaction.from(raw);
+  const parsed = POPDEX_ORDER_INTERFACE.parseTransaction({ data: transaction.data });
+  if (parsed.name === 'placeOrder') {
+    const event = POPDEX_ORDER_EVENT_INTERFACE.encodeEventLog(
+      POPDEX_ORDER_EVENT_INTERFACE.getEvent('OrderCreate'),
+      [
+        parsed.args.account,
+        parsed.args.symbolId,
+        '90071992547409931234',
+        parsed.args.clientOrderId,
+        parsed.args.price,
+        parsed.args.qty,
+        0,
+        2,
+        true,
+        0,
+      ],
+    );
+    return {
+      transactionHash: hash,
+      status: '0x1',
+      logs: [{ address: transaction.to, data: event.data, topics: event.topics }],
+    };
+  }
+  if (parsed.name === 'cancelOrder') {
+    const event = POPDEX_ORDER_EVENT_INTERFACE.encodeEventLog(
+      POPDEX_ORDER_EVENT_INTERFACE.getEvent('OrderCancel'),
+      [
+        parsed.args.account,
+        parsed.args.orderId,
+        parsed.args.clientOrderId,
+        true,
+        0,
+      ],
+    );
+    return {
+      transactionHash: hash,
+      status: '0x1',
+      logs: [{ address: transaction.to, data: event.data, topics: event.topics }],
+    };
+  }
+  throw new Error(`unexpected transaction ${parsed.name}`);
+}
+
 function activeAgent(overrides = {}) {
   return {
     exists: true,
@@ -82,7 +174,14 @@ function fakeJournal(initialStage = 'PREPARED') {
   };
 }
 
-function dependencies({ agentInfo = activeAgent(), findOrder, simulate, broadcast } = {}) {
+function dependencies({
+  agentInfo = activeAgent(),
+  findOrder,
+  findRestOrder,
+  simulate,
+  broadcast,
+  waitReceipt,
+} = {}) {
   const calls = [];
   const serialized = [];
   return {
@@ -94,6 +193,13 @@ function dependencies({ agentInfo = activeAgent(), findOrder, simulate, broadcas
       async findUniqueOrderByClientId(account, clientOrderId, options) {
         calls.push(`read:order:${options?.completed === true ? 'completed' : 'active'}`);
         return findOrder(account, clientOrderId, options);
+      },
+    },
+    accountClient: {
+      async findUniqueOrderByClientId(account, symbol, clientOrderId) {
+        calls.push('rest:order');
+        if (findRestOrder) return findRestOrder(account, symbol, clientOrderId);
+        return restOrder();
       },
     },
     writeRpc: {
@@ -111,7 +217,8 @@ function dependencies({ agentInfo = activeAgent(), findOrder, simulate, broadcas
       },
       async waitForReceipt(hash) {
         calls.push(`write:receipt:${hash}`);
-        return { transactionHash: hash, status: '0x1' };
+        if (waitReceipt) return waitReceipt(hash, serialized.at(-1));
+        return receiptFromTransaction(hash, serialized.at(-1));
       },
     },
   };
@@ -122,6 +229,7 @@ function createClient(deps, overrides = {}) {
     mainAccount: MAIN_ACCOUNT,
     agentPrivateKey: AGENT_PRIVATE_KEY,
     readRpc: deps.readRpc,
+    accountClient: deps.accountClient,
     writeRpc: deps.writeRpc,
     now: () => NOW,
     sleep: async () => {},
@@ -133,22 +241,8 @@ function createClient(deps, overrides = {}) {
 
 test('placeAndConfirm signs one exact Agent legacy transaction and confirms the official order', async () => {
   const orderPlan = plan();
-  let activeReads = 0;
   const deps = dependencies({
-    findOrder: async (_account, _clientOrderId, options) => {
-      if (options?.completed === true) {
-        const error = new Error('not completed');
-        error.code = 'POPDEX_ORDER_NOT_FOUND';
-        throw error;
-      }
-      activeReads += 1;
-      if (activeReads === 1) {
-        const error = new Error('not found yet');
-        error.code = 'POPDEX_ORDER_NOT_FOUND';
-        throw error;
-      }
-      return openOrder(orderPlan);
-    },
+    findRestOrder: async () => restOrder(orderPlan),
   });
   const journal = fakeJournal();
   const result = await createClient(deps).placeAndConfirm(orderPlan, journal);
@@ -169,21 +263,14 @@ test('placeAndConfirm signs one exact Agent legacy transaction and confirms the 
     'BROADCAST', 'OPEN_CONFIRMED',
   ]);
   assert.equal(journal.advances[0].fields.placeTxHash, keccak256(deps.serialized[0]));
-  assert.equal(activeReads, 2);
+  assert.ok(deps.calls.includes('rest:order'));
 });
 
 test('placeAndConfirm accepts the empty eth_call result returned by the Mainnet Order precompile', async () => {
   const orderPlan = plan();
   const deps = dependencies({
     simulate: async () => '0x',
-    findOrder: async (_account, _clientOrderId, options) => {
-      if (options?.completed === true) {
-        const error = new Error('not completed');
-        error.code = 'POPDEX_ORDER_NOT_FOUND';
-        throw error;
-      }
-      return openOrder(orderPlan);
-    },
+    findRestOrder: async () => restOrder(orderPlan),
   });
   const journal = fakeJournal();
 
@@ -194,16 +281,62 @@ test('placeAndConfirm accepts the empty eth_call result returned by the Mainnet 
   assert.equal(journal.stage, 'OPEN_CONFIRMED');
 });
 
+test('placeAndConfirm uses OrderCreate receipt plus official REST when order precompile pages stay empty', async () => {
+  const orderPlan = plan();
+  const deps = dependencies({
+    findOrder: async () => {
+      const error = new Error('precompile page is empty');
+      error.code = 'POPDEX_ORDER_NOT_FOUND';
+      throw error;
+    },
+    waitReceipt: async (hash) => createReceipt(orderPlan, hash),
+  });
+  const accountClient = {
+    async findUniqueOrderByClientId(account, symbol, clientOrderId) {
+      deps.calls.push('rest:order');
+      assert.equal(account, MAIN_ACCOUNT);
+      assert.equal(symbol, 'BTCUSDT');
+      assert.equal(clientOrderId, orderPlan.clientOrderId);
+      return restOrder(orderPlan);
+    },
+  };
+  const journal = fakeJournal();
+
+  const result = await createClient(deps, { accountClient }).placeAndConfirm(orderPlan, journal);
+
+  assert.equal(result.orderId, '90071992547409931234');
+  assert.ok(deps.calls.includes('rest:order'));
+  assert.equal(deps.calls.some((call) => call.startsWith('read:order:')), false);
+  assert.equal(journal.stage, 'OPEN_CONFIRMED');
+});
+
+test('place confirmation waits through official pending states until NewAccept', async () => {
+  const orderPlan = plan();
+  let reads = 0;
+  const deps = dependencies({
+    findRestOrder: async () => {
+      reads += 1;
+      return restOrder(orderPlan, { status: reads === 1 ? 'PendingNew' : 'NewAccept' });
+    },
+  });
+  const journal = fakeJournal();
+
+  const result = await createClient(deps).placeAndConfirm(orderPlan, journal);
+
+  assert.equal(result.orderId, '90071992547409931234');
+  assert.equal(reads, 2);
+  assert.equal(journal.stage, 'OPEN_CONFIRMED');
+});
+
 test('cancelAndConfirm uses the next monotonic nonce and confirms zero-fill terminal state', async () => {
   const orderPlan = plan();
   const open = openOrder(orderPlan);
   const deps = dependencies({
-    findOrder: async (_account, _clientOrderId, options) => {
-      if (options?.completed === true) return terminalOrder(orderPlan);
-      const error = new Error('active order gone');
-      error.code = 'POPDEX_ORDER_NOT_FOUND';
-      throw error;
-    },
+    findRestOrder: async () => restOrder(orderPlan, {
+      status: 'Cancelled',
+      remainingQty: '0',
+      cancelledQty: orderPlan.qty,
+    }),
   });
   const journal = fakeJournal('OPEN_CONFIRMED');
   const client = createClient(deps);
@@ -218,6 +351,30 @@ test('cancelAndConfirm uses the next monotonic nonce and confirms zero-fill term
   assert.deepEqual(journal.advances.map((entry) => entry.next), [
     'CANCEL_BROADCAST', 'CANCEL_CONFIRMED',
   ]);
+});
+
+test('cancelAndConfirm uses OrderCancel receipt plus REST terminal state when precompile pages stay empty', async () => {
+  const orderPlan = plan();
+  const deps = dependencies({
+    findOrder: async () => {
+      const error = new Error('precompile page is empty');
+      error.code = 'POPDEX_ORDER_NOT_FOUND';
+      throw error;
+    },
+    findRestOrder: async () => restOrder(orderPlan, {
+      status: 'Cancelled',
+      remainingQty: '0',
+      cancelledQty: orderPlan.qty,
+    }),
+  });
+  const journal = fakeJournal('OPEN_CONFIRMED');
+
+  const result = await createClient(deps).cancelAndConfirm(openOrder(orderPlan), journal);
+
+  assert.equal(result.cancelledQtyWad, orderPlan.qtyWad);
+  assert.ok(deps.calls.includes('rest:order'));
+  assert.equal(deps.calls.some((call) => call.startsWith('read:order:')), false);
+  assert.equal(journal.stage, 'CANCEL_CONFIRMED');
 });
 
 test('preflight rejects missing, expired, global and conflicting Agent authorization', async () => {
@@ -264,7 +421,7 @@ test('uncertain broadcast records deterministic txHash and never retries', async
 test('place confirmation rejects an official order with conflicting immutable fields', async () => {
   const orderPlan = plan();
   const deps = dependencies({
-    findOrder: async () => openOrder(orderPlan, { priceWad: '1' }),
+    findRestOrder: async () => restOrder(orderPlan, { price: '1' }),
   });
   const journal = fakeJournal();
   await assert.rejects(
@@ -278,24 +435,18 @@ test('place confirmation rejects an official order with conflicting immutable fi
 test('place confirmation immediately stops when the order already completed with a fill', async () => {
   const orderPlan = plan();
   const deps = dependencies({
-    findOrder: async (_account, _clientOrderId, options) => {
-      if (options?.completed !== true) {
-        const error = new Error('not active');
-        error.code = 'POPDEX_ORDER_NOT_FOUND';
-        throw error;
-      }
-      return terminalOrder(orderPlan, {
-        filledQtyWad: orderPlan.qtyWad,
-        cancelledQtyWad: '0',
-      });
-    },
+    findRestOrder: async () => restOrder(orderPlan, {
+      status: 'FullyFilled',
+      filledQty: orderPlan.qty,
+      remainingQty: '0',
+    }),
   });
   const journal = fakeJournal();
   await assert.rejects(
     createClient(deps).placeAndConfirm(orderPlan, journal),
-    /OPEN_CONFIRMED.*发生成交.*人工处理仓位/,
+    /OPEN_CONFIRMED REST.*filledQtyWad.*不匹配/,
   );
-  assert.ok(deps.calls.includes('read:order:completed'));
+  assert.ok(deps.calls.includes('rest:order'));
   assert.equal(journal.stage, 'BROADCAST');
 });
 
@@ -310,20 +461,26 @@ test('cancel rejects an open order owned by another account before simulation', 
   assert.equal(journal.stage, 'OPEN_CONFIRMED');
 });
 
+test('cancel rejects an unknown symbol ID before simulation', async () => {
+  const deps = dependencies();
+  const journal = fakeJournal('OPEN_CONFIRMED');
+  await assert.rejects(
+    createClient(deps).cancelAndConfirm(openOrder(plan(), { symbolId: '99999' }), journal),
+    /symbolId 99999.*不在白名单/,
+  );
+  assert.ok(!deps.calls.includes('write:simulate'));
+  assert.equal(journal.stage, 'OPEN_CONFIRMED');
+});
+
 test('cancel confirmation stops on any fill and keeps recovery state', async () => {
   const orderPlan = plan();
   const deps = dependencies({
-    findOrder: async (_account, _clientOrderId, options) => {
-      if (options?.completed !== true) {
-        const error = new Error('gone');
-        error.code = 'POPDEX_ORDER_NOT_FOUND';
-        throw error;
-      }
-      return terminalOrder(orderPlan, {
-        filledQtyWad: '100000000000000',
-        cancelledQtyWad: '100000000000000',
-      });
-    },
+    findRestOrder: async () => restOrder(orderPlan, {
+      status: 'PartiallyFilledCancelled',
+      filledQty: '0.0001',
+      remainingQty: '0',
+      cancelledQty: '0.0001',
+    }),
   });
   const journal = fakeJournal('OPEN_CONFIRMED');
   await assert.rejects(

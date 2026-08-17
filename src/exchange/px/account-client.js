@@ -1,3 +1,4 @@
+import { decodeBytes32String } from 'ethers';
 import { POPDEX_API_BASE, POPDEX_EXPECTED_MARKETS, POPDEX_WEB_BASE } from './constants.js';
 import {
   normalizeFill,
@@ -25,6 +26,28 @@ function targetSymbol(symbol) {
     throw new Error(`PopDEX symbol ${String(symbol)} 不在白名单。`);
   }
   return symbol;
+}
+
+function clientOidFromBytes32(value) {
+  if (typeof value !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(value)) {
+    throw new Error('PopDEX clientOrderId 必须是 bytes32 十六进制字符串。');
+  }
+  let decoded;
+  try {
+    decoded = decodeBytes32String(value);
+  } catch (cause) {
+    throw new Error(`PopDEX clientOrderId 不是规范 UTF-8 bytes32：${sanitizedCause(cause)}`, { cause });
+  }
+  if (!/^dw-[be][bs]-[0-9a-f]{24}$/.test(decoded)) {
+    throw new Error(`PopDEX clientOrderId 标签格式无效：${decoded}。`);
+  }
+  return decoded;
+}
+
+function orderNotFound(clientOrderId) {
+  const error = new Error(`PopDEX clientOrderId ${clientOrderId} 在 REST 订单中未找到。`);
+  error.code = 'POPDEX_ORDER_NOT_FOUND';
+  return error;
 }
 
 function listFrom(payload, keys, label) {
@@ -154,6 +177,27 @@ export class PopdexAccountClient {
 
   async getOrderHistory(account, symbol, cursor = null) {
     return this.#orders(account, symbol, cursor);
+  }
+
+  async findUniqueOrderByClientId(account, symbol, clientOrderId, { maxPages = 10 } = {}) {
+    const wallet = strictAddress(account, 'account');
+    const target = targetSymbol(symbol);
+    const clientOid = clientOidFromBytes32(clientOrderId);
+    if (!Number.isSafeInteger(maxPages) || maxPages <= 0 || maxPages > 100) {
+      throw new Error('PopDEX REST maxPages 必须是 1-100 的安全整数。');
+    }
+    let cursor = null;
+    for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
+      const orders = await this.#orders(wallet, target, cursor);
+      const matches = orders.filter((order) => order.clientOid === clientOid);
+      if (matches.length > 1) {
+        throw new Error(`PopDEX clientOid ${clientOid} 在 REST 订单中重复。`);
+      }
+      if (matches.length === 1) return matches[0];
+      if (orders.cursor === undefined) throw orderNotFound(clientOrderId);
+      cursor = orders.cursor;
+    }
+    throw new Error(`PopDEX REST 订单分页超过 maxPages=${maxPages}，拒绝继续。`);
   }
 
   async getFills(account, symbol, cursor = null) {
