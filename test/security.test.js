@@ -215,6 +215,15 @@ test('Chart.js 固定为本地生产依赖和唯一 vendor 路由', () => {
   assert.doesNotMatch(server, /startsWith\(['"]\/node_modules/);
 });
 
+test('Ethers 浏览器包固定为本地依赖和单一 vendor 路由', () => {
+  const pkg = JSON.parse(readProject('package.json'));
+  const server = readProject('src/server.js');
+  assert.equal(pkg.dependencies.ethers, '6.13.5');
+  assert.match(server, /p === '\/vendor\/ethers\.js'/);
+  assert.match(server, /path\.join\(ROOT, 'node_modules', 'ethers', 'dist', 'ethers\.min\.js'\)/);
+  assert.doesNotMatch(server, /startsWith\(['"]\/node_modules/);
+});
+
 test('服务端入口统一调用安全边界、严格请求体和有界 SSE', () => {
   const server = readProject('src/server.js');
   assert.match(server, /enforceRequestSecurity\(request, res, cfg\)/);

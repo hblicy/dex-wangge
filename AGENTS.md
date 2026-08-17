@@ -5,7 +5,10 @@
 ## 当前产品边界
 
 - Decibel、Extended 与 RISEx 支持 `paper` 和 `live`；RISEx live 只允许 mainnet 的 BTC-PERP / ETH-PERP。
-- PopDEX 仍处于只读协议验证阶段，尚未注册为可运行交易所；目标市场仅限 BTCUSDT / ETHUSDT。PopDEX `/overview` 只用于账户概览，持仓事实必须从订单预编译合约 `0x0000000000000000000000000000000000001000` 的只读方法 `getOpenPositionsByAccount` 获取，禁止猜测 overview 内含 `positions`。
+- PopDEX 处于“只读验证 + 独立临时 Agent 授权”阶段，尚未注册为可运行交易所，也不开放 PopDEX 下单或实盘；目标市场仅限 BTCUSDT / ETHUSDT。
+- PopDEX 主钱包私钥禁止进入前端、后端、配置或日志。临时 Agent 私钥只能由浏览器内存生成，链上授权回验成功且用户明确确认后才能写入 `.env`；撤销必须先确认链上 Agent 已失效，再清除本地私钥。
+- PopDEX Agent API 必须独立于 exchange registry、GridBot、`.state.json`、AI、Decibel 和 RISEx；本阶段禁止新增 PopDEX start/stop/order/cancel/leverage/close 路由。
+- PopDEX `/overview` 只用于账户概览，持仓事实必须从订单预编译合约 `0x0000000000000000000000000000000000001000` 的只读方法 `getOpenPositionsByAccount` 获取，禁止猜测 overview 内含 `positions`。
 - RISEx 私有 Orders/Fills WebSocket 与 REST 对账共同构成订单、成交和持仓的事实来源。
 - RISEx Orders WebSocket、订单历史和单笔订单接口的价量字段按当前主网人类可读十进制字符串解析；开放订单仍按 ticks/steps，仓位仍按已验证的 WAD 结构，禁止按字符串长度猜单位。
 - RISEx Orders/Fills WebSocket 游标优先使用 `block_timestamp`，其次使用服务端 `timestamp`；顶层时间缺失或为空时才使用订单 `created_at` / 成交 `time`，所有候选缺失或非法必须进入 `HALTED`，禁止填 `0` 或本地时间。

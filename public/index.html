@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>网格交易总控台</title>
 <script src="/vendor/chart.js"></script>
+<script src="/vendor/ethers.js"></script>
 <style>
 :root {
   --bg: #0a0e17;
@@ -322,6 +323,7 @@ th { color: var(--mut2); font-weight: 600; font-size: 10px; text-transform: uppe
   <button class="tab-btn" onclick="switchTab('de')"><span class="dot-de">●</span> Decibel</button>
   <button class="tab-btn" onclick="switchTab('ex')"><span class="dot-ex">●</span> Extended</button>
   <button class="tab-btn" onclick="switchTab('rs')"><span class="dot-rs">●</span> RISEx</button>
+  <button class="tab-btn" onclick="switchTab('px-agent')">🔐 PopDEX Agent</button>
   <button class="tab-btn" onclick="switchTab('ai')">🤖 AI助手</button>
   <button class="tab-btn" onclick="switchTab('settings')">⚙ IP配置</button>
 </div>
@@ -831,6 +833,37 @@ th { color: var(--mut2); font-weight: 600; font-size: 10px; text-transform: uppe
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
+<!-- TAB: PopDEX Agent 授权 -->
+<div id="tab-px-agent" class="tab-panel">
+<div class="wrap" style="max-width:860px">
+  <div class="panel" style="margin-top:4px">
+    <div class="panel-title">🔐 PopDEX 临时 Agent 授权</div>
+    <div class="warn-box" style="margin-bottom:14px">
+      本页仅用于生成、授权和撤销临时 Agent，当前阶段不开放 PopDEX 下单。<br>
+      主钱包私钥不会进入本程序；授权交易必须由浏览器钱包确认。
+    </div>
+    <div class="gridcfg" style="font-size:12px">
+      <div><b>授权状态：</b><span id="px-agent-status">正在读取…</span></div>
+      <div><b>主账户：</b><span id="px-agent-main">—</span></div>
+      <div><b>Agent 地址：</b><span id="px-agent-address">—</span></div>
+      <div><b>临时 Agent 私钥：</b><span id="px-agent-private">尚未生成</span></div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:12px">
+      <button id="px-agent-generate" class="btn btn-smart" style="margin:0">1. 生成临时 Agent</button>
+      <button id="px-agent-copy" class="btn btn-ghost" style="margin:0" disabled>复制私钥（保存前备份）</button>
+      <button id="px-agent-authorize" class="btn btn-start" style="margin:0" disabled>2. 连接钱包并授权</button>
+      <button id="px-agent-save" class="btn btn-smart" style="margin:0" disabled>3. 验证并保存到 VPS</button>
+      <button id="px-agent-refresh" class="btn btn-ghost" style="margin:0">刷新链上状态</button>
+      <button id="px-agent-revoke" class="btn btn-stop" style="margin:0" disabled>撤销 Agent 并清除本地私钥</button>
+    </div>
+    <p class="muted" style="margin-top:12px;line-height:1.6">
+      授权交易成功后再保存私钥。若授权后页面报错，请先保留私钥并刷新状态，不要重复授权。
+    </p>
+  </div>
+</div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
 <!-- TAB: IP配置 -->
 <!-- ═══════════════════════════════════════════════════════════ -->
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -1027,7 +1060,8 @@ function switchTab(name) {
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   $('tab-' + name).classList.add('active');
-  document.querySelectorAll('.tab-btn')[['overview','de','ex','rs','ai','settings'].indexOf(name)].classList.add('active');
+  document.querySelectorAll('.tab-btn')[['overview','de','ex','rs','px-agent','ai','settings'].indexOf(name)].classList.add('active');
+  if (name === 'px-agent') window.refreshPopdexAgentStatus?.();
   if (name === 'ai') aiRefreshStatus();
 }
 
@@ -2090,5 +2124,6 @@ async function aiSaveIntervals(btn) {
 aiRefreshStatus();
 setInterval(aiRefreshStatus, 30000);
 </script>
+<script src="/popdex-agent.js"></script>
 </body>
 </html>

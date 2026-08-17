@@ -171,10 +171,13 @@ test('account verification loads the project env before reading POPDEX_MAIN_ACCO
   }
 });
 
-test('.env.example documents only the public PopDEX read-only account setting', () => {
+test('.env.example documents the isolated Agent authorization settings without a main wallet key', () => {
   const example = readFileSync(new URL('../.env.example', import.meta.url), 'utf8');
   assert.match(example, /^POPDEX_MAIN_ACCOUNT=$/m);
-  assert.doesNotMatch(example, /^POPDEX_AGENT_PRIVATE_KEY=/m);
+  assert.match(example, /^POPDEX_AGENT_PRIVATE_KEY=$/m);
+  assert.match(example, /主钱包私钥.*(?:禁止|不要|绝不)/);
+  assert.match(example, /尚未.*(?:下单|实盘)/);
+  assert.doesNotMatch(example, /^POPDEX_(?:MAIN_)?PRIVATE_KEY=/m);
 });
 
 test('main rejects every trading or private-key flag before constructing clients', async () => {

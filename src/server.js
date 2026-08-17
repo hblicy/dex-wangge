@@ -11,6 +11,8 @@ import { getConfig, ROOT } from './config.js';
 import { createExchange as createDeExchange } from './exchange/de/index.js';
 import { createExchange as createExExchange } from './exchange/ex/index.js';
 import { createExchange as createRsExchange } from './exchange/rs/index.js';
+import { PopdexAgentService } from './exchange/px/agent-service.js';
+import { PopdexRpcClient } from './exchange/px/rpc-client.js';
 import { GridBot } from './bot.js';
 import { analyzeTrend } from './trend.js';
 import { setupProxies, checkProxy } from './proxy.js';
@@ -24,6 +26,10 @@ import { writeEnvFile } from './envfile.js';
 
 // ── 启动配置 ─────────────────────────────────────────────────────────────────
 const cfg = getConfig();
+const popdexAgentService = new PopdexAgentService({
+  rpcClient: new PopdexRpcClient(),
+  envFile: path.join(ROOT, '.env'),
+});
 
 // ── 实盘凭据预检查：缺什么直接列出来，不甩堆栈吓人 ─────────────────────────────
 {
@@ -118,6 +124,7 @@ const MIME = {
   '.woff2': 'font/woff2',
 };
 const CHART_JS_FILE = path.join(ROOT, 'node_modules', 'chart.js', 'dist', 'chart.umd.js');
+const ETHERS_JS_FILE = path.join(ROOT, 'node_modules', 'ethers', 'dist', 'ethers.min.js');
 
 function send(res, code, obj) {
   const body = JSON.stringify(obj, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
@@ -320,6 +327,46 @@ const server = http.createServer(async (request, res) => {
       } catch (e) { return send(res, errorStatus(e, 500), { error: e?.message || String(e) }); }
     }
 
+    // ── PopDEX Agent 授权 API（不注册交易所、不创建 Bot、不发送交易）──────────
+    if (p === '/api/px/agent/status' && request.method === 'GET') {
+      try { return send(res, 200, await popdexAgentService.status()); }
+      catch (e) { return send(res, 500, { error: e?.message || String(e) }); }
+    }
+    if (p === '/api/px/agent/prepare-approval' && request.method === 'POST') {
+      try {
+        return send(res, 200, await popdexAgentService.prepareApproval(
+          await readJsonBody(request, 4096),
+        ));
+      } catch (e) { return send(res, errorStatus(e, 400), { error: e?.message || String(e) }); }
+    }
+    if (p === '/api/px/agent/verify' && request.method === 'POST') {
+      try {
+        return send(res, 200, await popdexAgentService.verifyAuthorization(
+          await readJsonBody(request, 4096),
+        ));
+      } catch (e) { return send(res, errorStatus(e, 400), { error: e?.message || String(e) }); }
+    }
+    if (p === '/api/px/agent/save' && request.method === 'POST') {
+      try {
+        return send(res, 200, await popdexAgentService.save(
+          await readJsonBody(request, 4096),
+        ));
+      } catch (e) { return send(res, errorStatus(e, 400), { error: e?.message || String(e) }); }
+    }
+    if (p === '/api/px/agent/prepare-revoke' && request.method === 'POST') {
+      try {
+        return send(res, 200, await popdexAgentService.prepareRevoke(
+          await readJsonBody(request, 4096),
+        ));
+      } catch (e) { return send(res, errorStatus(e, 400), { error: e?.message || String(e) }); }
+    }
+    if (p === '/api/px/agent/clear' && request.method === 'POST') {
+      try {
+        await readJsonBody(request, 4096);
+        return send(res, 200, await popdexAgentService.clear());
+      } catch (e) { return send(res, errorStatus(e, 400), { error: e?.message || String(e) }); }
+    }
+
     // ── 代理配置 API ──────────────────────────────────────────────────────
     if (p === '/api/proxy-check') {
       const result = await checkProxy();
@@ -402,6 +449,13 @@ const server = http.createServer(async (request, res) => {
       }
       res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' });
       return fs.createReadStream(CHART_JS_FILE).pipe(res);
+    }
+    if (p === '/vendor/ethers.js') {
+      if (!fs.existsSync(ETHERS_JS_FILE)) {
+        return send(res, 500, { error: 'Ethers is not installed; run npm install' });
+      }
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' });
+      return fs.createReadStream(ETHERS_JS_FILE).pipe(res);
     }
 
     // ── 静态文件 ──────────────────────────────────────────────────────────

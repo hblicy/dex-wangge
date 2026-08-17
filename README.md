@@ -56,6 +56,7 @@
   4. **对话操控**：用自然语言问状态、下指令（如"把 Extended 上边界调到 66000"，AI 只提议，你点确认才执行）
   5. **出区间建议**：价格冲出网格区间时，AI 给出处置建议
 - 📱 **通知推送**：Telegram 机器人 + 通用 Webhook，成交异常 / 哨兵告警 / 日报自动推送
+- 🔐 **PopDEX Agent 页**：独立完成临时 Agent 的生成、钱包授权、链上回验、保存和撤销；当前尚未开放 PopDEX 下单或实盘运行
 
 ### 安全设计
 
@@ -66,6 +67,7 @@
 - 所有控制类 POST 请求都校验 JSON、自定义请求头和 Origin，页面不再运行时加载第三方 CDN 脚本
 - 服务默认只监听 `127.0.0.1`，远程访问使用 SSH 隧道或 Tailscale Serve
 - Linux/macOS 启动时强制检查 `.env` 为 `0600`，防止同机其他用户读取私钥
+- PopDEX 主钱包私钥不会进入本程序；临时 Agent 授权交易只由浏览器钱包确认
 
 ---
 
@@ -169,7 +171,7 @@ tailscale serve status
 
 ## 五、仪表盘使用教程
 
-启动后浏览器打开 `http://localhost:8080`，顶部有五个页签：**📊 总览**、三个交易所控制台、**⚙ IP配置**、**🤖 AI助手**。
+启动后浏览器打开 `http://localhost:8080`，顶部有总览、三个交易所控制台、PopDEX Agent、AI 助手和 IP 配置页签。
 
 ### 5.1 总览页
 
@@ -228,7 +230,20 @@ tailscale serve status
 
 格式见[第八节](#八代理--ip-配置)。
 
-### 5.4 🤖 AI 助手页
+### 5.4 🔐 PopDEX 临时 Agent 授权页
+
+这一页与 Decibel、Extended、RISEx 的机器人运行完全隔离，当前只做授权准备，尚未开放 PopDEX 下单或实盘运行。主钱包私钥不要填写到 `.env`、网页或任何程序输入框；主钱包只在浏览器钱包弹窗中确认链上授权交易。
+
+操作顺序：
+
+1. 点“生成临时 Agent”，立即离线备份页面显示的一次性私钥。
+2. 点“连接钱包并授权”，确认当前钱包是 `POPDEX_MAIN_ACCOUNT` 对应主账户，并在钱包中确认交易。
+3. 页面完成链上回验后，点“验证并保存到 VPS”。只有这一步会把 Agent 私钥写入 `.env`，保存后页面立即清除内存中的私钥。
+4. 不再使用时点“撤销 Agent 并清除本地私钥”。程序会先等待链上撤销回验成功，再清除 VPS 中的 Agent 私钥。
+
+如果钱包提示未知网络，不要手填来历不明的 RPC 参数；先在 PopDEX 官方页面连接钱包并添加 PopDEX Mainnet，再回来重试。如果授权交易已成功但页面回验失败，保留已备份的 Agent 私钥并刷新状态，不要重复授权。
+
+### 5.5 🤖 AI 助手页
 
 见[第九节](#九ai-助手配置)。
 
@@ -475,6 +490,8 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 | `EXTENDED_STARK_PRIVATE_KEY` / `EXTENDED_STARK_PUBLIC_KEY` | 空 | Extended：Stark 密钥对 |
 | `EXTENDED_MAX_FEE` | `0.0005` | Extended 最大手续费率 |
 | `EXTENDED_API_URL` | 官方默认 | 自定义 API 地址 |
+| `POPDEX_MAIN_ACCOUNT` | 空 | PopDEX 公开主账户地址；用于只读验证和 Agent 授权回验 |
+| `POPDEX_AGENT_PRIVATE_KEY` | 空 | 仅保存临时 Agent 私钥；建议由仪表盘授权页回验后写入，绝不是主钱包私钥 |
 | `RISEX_ACCOUNT` | 空 | RISEx live 独立账户的 EVM 地址 |
 | `RISEX_SIGNER_KEY` | 空 | RISEx live 已注册 session signer 的私钥 |
 | `RISEX_API_URL` | `https://api.rise.trade` | RISEx 官方 REST 地址；live 不可替换 |
@@ -522,6 +539,7 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 | POST | `/api/{ex}/start-recovery` | 启动只减仓回收阶梯 |
 | POST | `/api/{ex}/reset` | 重置统计 |
 | POST | `/api/{ex}/reconnect` | 重连交易所 |
+| GET/POST | `/api/px/agent/status`, `/api/px/agent/prepare-approval`, `/api/px/agent/verify`, `/api/px/agent/save`, `/api/px/agent/prepare-revoke`, `/api/px/agent/clear` | PopDEX 临时 Agent 独立授权流程；不提供交易操作 |
 | GET/POST | `/api/ai/status`, `/api/ai/test`, `/api/ai/chat`, `/api/ai/analyze`, `/api/ai/report`, `/api/ai/sentinel-run`, `/api/ai/market-run` | AI 助手相关 |
 | GET | `/api/proxy-check`, `/api/proxy-config` | 代理检测 / 查询 |
 | POST | `/api/env` | 写入白名单内的 .env 配置（代理 / AI / 通知类，交易密钥不允许通过此接口修改） |
@@ -582,9 +600,10 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 │   ├── persist.js        # 状态快照持久化
 │   ├── ai/               # AI 助手（provider 适配 + 服务）
 │   └── exchange/
-│       ├── de/           # Decibel 接入（live + paper）
-│       ├── ex/           # Extended 接入（live + paper + Stark 签名）
-│       └── rs/           # RISEx 接入（live + paper + 私有 WS / 订单状态机）
+    │       ├── de/           # Decibel 接入（live + paper）
+    │       ├── ex/           # Extended 接入（live + paper + Stark 签名）
+    │       ├── px/           # PopDEX 只读验证 + 独立临时 Agent 授权（无交易运行）
+    │       └── rs/           # RISEx 接入（live + paper + 私有 WS / 订单状态机）
 └── test/
     └── grid.test.js      # 网格逻辑单元测试
 ```
