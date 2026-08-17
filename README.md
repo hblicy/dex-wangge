@@ -56,7 +56,7 @@
   4. **对话操控**：用自然语言问状态、下指令（如"把 Extended 上边界调到 66000"，AI 只提议，你点确认才执行）
   5. **出区间建议**：价格冲出网格区间时，AI 给出处置建议
 - 📱 **通知推送**：Telegram 机器人 + 通用 Webhook，成交异常 / 哨兵告警 / 日报自动推送
-- 🔐 **PopDEX Agent 页**：独立完成临时 Agent 的生成、钱包授权、链上回验、保存和撤销；当前尚未开放 PopDEX 下单或实盘运行
+- 🔐 **PopDEX Agent 页**：独立完成临时 Agent 的生成、钱包授权、链上回验、保存和撤销；另提供必须显式确认的 CLI 单笔下单—撤单探针，尚未开放 PopDEX 自动网格或网页交易
 
 ### 安全设计
 
@@ -68,6 +68,7 @@
 - 服务默认只监听 `127.0.0.1`，远程访问使用 SSH 隧道或 Tailscale Serve
 - Linux/macOS 启动时强制检查 `.env` 为 `0600`，防止同机其他用户读取私钥
 - PopDEX 主钱包私钥不会进入本程序；临时 Agent 授权交易只由浏览器钱包确认
+- PopDEX 真实写入只允许由独立 CLI 的 `--confirm-mainnet-write` 显式触发；服务器、网页和 `GridBot` 均不能调用该写入边界
 
 ---
 
@@ -232,7 +233,7 @@ tailscale serve status
 
 ### 5.4 🔐 PopDEX 临时 Agent 授权页
 
-这一页与 Decibel、Extended、RISEx 的机器人运行完全隔离，当前只做授权准备，尚未开放 PopDEX 下单或实盘运行。主钱包私钥不要填写到 `.env`、网页或任何程序输入框；主钱包只在浏览器钱包弹窗中确认链上授权交易。
+这一页与 Decibel、Extended、RISEx 的机器人运行完全隔离，只负责 Agent 授权，不提供 PopDEX 下单按钮。主钱包私钥不要填写到 `.env`、网页或任何程序输入框；主钱包只在浏览器钱包弹窗中确认链上授权交易。
 
 操作顺序：
 
@@ -242,6 +243,38 @@ tailscale serve status
 4. 不再使用时点“撤销 Agent 并清除本地私钥”。程序会先等待链上撤销回验成功，再清除 VPS 中的 Agent 私钥。
 
 如果钱包提示未知网络，不要手填来历不明的 RPC 参数；先在 PopDEX 官方页面连接钱包并添加 PopDEX Mainnet，再回来重试。如果授权交易已成功但页面回验失败，保留已备份的 Agent 私钥并刷新状态，不要重复授权。
+
+完成授权后，可在项目目录运行独立的单笔写入探针。它只支持 BTCUSDT / ETHUSDT，默认只做只读校验和交易编码，不发送交易：
+
+```bash
+npm run popdex:verify
+npm run popdex:verify -- --account-env POPDEX_MAIN_ACCOUNT
+npm run popdex:write-probe -- --symbol BTCUSDT --side buy --price <盘口外价格> --qty <满足10_USDT最小名义价值的数量>
+```
+
+dry-run 会额外显示 `availableMargin`。确认 `POPDEX_MAIN_ACCOUNT` 正是已入金的 PopDEX 主账户、可用保证金至少覆盖本次订单的完整名义金额，并确认网页没有未知挂单或持仓后，才可用同一组最小金额参数显式执行一次真实下单—撤单验收：
+
+```bash
+npm run popdex:write-probe -- --symbol BTCUSDT --side buy --price <同一价格> --qty <同一数量> --confirm-mainnet-write
+```
+
+最后一条命令会先读取官方账户概览；可用保证金不足时会在签名和广播前拒绝。通过后才向 PopDEX Mainnet 发送真实限价单，解析同一交易回执的 `OrderCreate` 事件，并用官方 REST 精确核对 `clientOid`、订单状态与数量，确认挂单后才自动尝试撤单。撤单必须先取得精确匹配的 `OrderCancel` 回执；若 REST 已移除该订单，还必须确认活动订单不存在、该 `orderId` 没有成交且目标市场没有持仓。任何阶段失败都不要重复执行实盘命令；先到 PopDEX 网页核对挂单和持仓，再运行只读恢复检查：
+
+```bash
+npm run popdex:write-probe -- --resume
+```
+
+`--resume` 不会发送交易。成功下单回执与 REST 都表明订单仍活动时，它会输出 `active-manual-cancel-required`。若恢复记录已经是 `CANCEL_BROADCAST`，程序会核验已记录撤单交易的精确 `OrderCancel` 回执；官方 REST 会在撤单后移除活动订单，因此只有同时确认 REST 活动订单不存在、该 `orderId` 的全部成交分页为零、目标市场全部链上持仓分页为空，才会输出 `completed-zero-fill-cleared` 并清除恢复记录。若发现成交或持仓则保留记录并要求人工处理。若下单回执明确失败，则还必须确认 REST 和预编译活动/完成查询都不存在该订单，才会输出 `reverted-placement-cleared`。回执缺失、格式不一致或查询冲突都会保留记录。
+
+如果 PopDEX 网页无法连接钱包撤销探针遗留订单，可在普通 `--resume` 已确认 `source=receipt+REST`、REST 状态精确为 `NewAccept` 且成交量为零后，显式授权临时 Agent 只撤销恢复记录中唯一那一单：
+
+```bash
+npm run popdex:write-probe -- --resume --confirm-mainnet-cancel
+```
+
+这条命令会发送一笔 PopDEX Mainnet 撤单交易，但不会创建新订单。它会再次校验 Agent 授权、订单身份和零成交事实，只广播一次撤单；撤单后若 REST 不再返回该活动订单，则按上一段的回执、成交和持仓证据完成确认。若日志阶段已经是 `CANCEL_BROADCAST`，严禁再次执行该命令，只运行普通 `--resume` 查询既有撤单结果。任何成交、待发送/待确认/待撤状态、订单身份冲突或证据不完整都会保留恢复记录。
+
+建议先用 BTCUSDT 最小金额完成闭环，再单独验收 ETHUSDT。本阶段尚未开放 PopDEX 自动网格、服务器交易路由或网页交易；该探针不能替代实盘网格验收。
 
 ### 5.5 🤖 AI 助手页
 
@@ -602,7 +635,7 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 │   └── exchange/
     │       ├── de/           # Decibel 接入（live + paper）
     │       ├── ex/           # Extended 接入（live + paper + Stark 签名）
-    │       ├── px/           # PopDEX 只读验证 + 独立临时 Agent 授权（无交易运行）
+    │       ├── px/           # PopDEX 只读 + Agent 授权 + 独立 CLI 单笔下单撤单探针
     │       └── rs/           # RISEx 接入（live + paper + 私有 WS / 订单状态机）
 └── test/
     └── grid.test.js      # 网格逻辑单元测试
@@ -621,7 +654,8 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 7. **VPS 使用独立服务用户**，并执行 `chmod 600 .env`；程序会拒绝读取权限过宽的密钥文件。
 8. **RISEx 使用独立小资金账户**：不得与人工交易或其他机器人共享；私有日志保存在本机终端/进程管理器日志中，排障时不要公开 `.env`、签名或账户敏感信息。
 9. **RISEx 实盘先完成人工七步验收**：程序不会自动发送真实验证订单；任何 `HALTED` 都应先到交易所网页核对挂单和持仓。
-10. 本程序没有远程服务器、不上传任何数据，所有状态都在你本机。
+10. **PopDEX 探针不是网格机器人**：只用最小金额人工执行一次；看到失败或 `.popdex-write-probe.json` 时禁止重新下单，先核对网页并运行只读 `--resume`。仅当网页无法撤单且只读恢复严格确认 `NewAccept` 零成交时，才可显式执行 `--resume --confirm-mainnet-cancel` 撤销恢复记录中的唯一订单。
+11. 本程序没有远程服务器、不上传任何数据，所有状态都在你本机。
 
 ---
 

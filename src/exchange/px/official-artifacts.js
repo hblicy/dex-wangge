@@ -1,4 +1,8 @@
 import { createHash } from 'node:crypto';
+import {
+  POPDEX_ACCOUNT_PRECOMPILE,
+  POPDEX_ORDER_PRECOMPILE,
+} from './constants.js';
 
 const OFFICIAL_ORIGIN = 'https://app.popdex.xyz';
 const MAX_ARTIFACT_BYTES = 20 * 1024 * 1024;
@@ -9,11 +13,13 @@ export const POPDEX_REQUIRED_PROTOCOL_TOKENS = Object.freeze([
   'revokeAgent',
   'placeOrder',
   'cancelOrder',
+  'getActiveOrdersByAccount',
+  'getCompletedOrdersByAccount',
   'updateLeverage',
   'placeReverseOrder',
   'clientOrderId',
-  '0x0000000000000000000000000000000000001000',
-  '0x0000000000000000000000000000000000001008',
+  POPDEX_ORDER_PRECOMPILE,
+  POPDEX_ACCOUNT_PRECOMPILE,
 ]);
 
 export const POPDEX_PROTOCOL_TOKENS = Object.freeze([

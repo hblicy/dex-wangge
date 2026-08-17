@@ -1,4 +1,4 @@
-import { Interface, ZeroAddress } from 'ethers';
+import { getAddress, Interface, isAddress, ZeroAddress } from 'ethers';
 import { POPDEX_ACCOUNT_INTERFACE } from './agent.js';
 import {
   POPDEX_ACCOUNT_PRECOMPILE,
@@ -11,6 +11,23 @@ import { strictAddress } from './normalize.js';
 const OPEN_POSITIONS_INTERFACE = new Interface([
   'function getOpenPositionsByAccount(address account,uint32 offset,uint32 limit) view returns ((tuple(address walletId,uint128 positionId,uint16 symbolId,uint8 side,uint256 holdSize,uint256 avgOpenPrice,uint256 closeSize,uint256 lockedSize,int256 realizedPnl,uint64 createdTime,uint64 updatedTime)[] positions,bool hasMore) page)',
 ]);
+
+const ORDER_PAGE_INTERFACE = new Interface([
+  'function getActiveOrdersByAccount(address account,uint32 offset,uint32 limit) view returns ((tuple(address walletId,uint8 category,uint8 source,uint128 orderId,bytes32 clientOrderId,uint16 symbolId,uint8 side,bool isReduceOnly,uint8 orderType,uint8 timeInForce,uint8 stpMode,address stpKey,uint8 status,uint256 price,tuple(uint256 qty,uint256 filledQty,uint256 remainingQty,uint256 cancelledQty,uint256 quoteQty,uint256 filledQuoteQty,uint256 remainingQuoteQty,uint256 cancelledQuoteQty) quantities,uint256 averagePrice,uint64 nonce,uint64 createdAt,uint64 updatedAt,uint256 makerFeeRate,uint256 takerFeeRate)[] orders,bool hasMore) page)',
+  'function getCompletedOrdersByAccount(address account,uint32 offset,uint32 limit) view returns ((tuple(address walletId,uint8 category,uint8 source,uint128 orderId,bytes32 clientOrderId,uint16 symbolId,uint8 side,bool isReduceOnly,uint8 orderType,uint8 timeInForce,uint8 stpMode,address stpKey,uint8 status,uint256 price,tuple(uint256 qty,uint256 filledQty,uint256 remainingQty,uint256 cancelledQty,uint256 quoteQty,uint256 filledQuoteQty,uint256 remainingQuoteQty,uint256 cancelledQuoteQty) quantities,uint256 averagePrice,uint64 nonce,uint64 createdAt,uint64 updatedAt,uint256 makerFeeRate,uint256 takerFeeRate)[] orders,bool hasMore) page)',
+]);
+
+const TARGET_SYMBOL_IDS = new Set(['20000', '20001']);
+const ORDER_PAGE_SIZE = 100;
+
+export class PopdexOrderNotFoundError extends Error {
+  constructor(clientOrderId) {
+    super(`PopDEX clientOrderId ${clientOrderId} 在链上订单中未找到。`);
+    this.name = 'PopdexOrderNotFoundError';
+    this.code = 'POPDEX_ORDER_NOT_FOUND';
+    this.clientOrderId = clientOrderId;
+  }
+}
 
 const READ_ONLY_METHODS = new Set([
   'eth_chainId',
@@ -77,7 +94,75 @@ function bytes32(value, field) {
   if (typeof value !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(value)) {
     throw new Error(`PopDEX ${field} 必须是 bytes32 十六进制字符串。`);
   }
-  return value;
+  return value.toLowerCase();
+}
+
+function addressAllowZero(value, field) {
+  if (typeof value !== 'string' || !isAddress(value)) {
+    throw new Error(`PopDEX ${field} 必须是有效 EVM 地址字符串。`);
+  }
+  return getAddress(value);
+}
+
+function exactOrder(value, expectedWallet, index) {
+  const field = `order[${index}]`;
+  const walletId = strictAddress(value.walletId, `${field}.walletId`);
+  if (walletId.toLowerCase() !== expectedWallet.toLowerCase()) {
+    throw new Error(`PopDEX ${field}.walletId 与请求 account 不匹配。`);
+  }
+  const symbolId = value.symbolId.toString();
+  if (!TARGET_SYMBOL_IDS.has(symbolId)) {
+    throw new Error(`PopDEX ${field}.symbolId ${symbolId} 不在白名单。`);
+  }
+  const quantities = value.quantities;
+  const qty = BigInt(quantities.qty);
+  const filledQty = BigInt(quantities.filledQty);
+  const remainingQty = BigInt(quantities.remainingQty);
+  const cancelledQty = BigInt(quantities.cancelledQty);
+  if (qty !== filledQty + remainingQty + cancelledQty) {
+    throw new Error(
+      `PopDEX ${field} qty 必须等于 filledQty + remainingQty + cancelledQty。`,
+    );
+  }
+  const quoteQty = BigInt(quantities.quoteQty);
+  const filledQuoteQty = BigInt(quantities.filledQuoteQty);
+  const remainingQuoteQty = BigInt(quantities.remainingQuoteQty);
+  const cancelledQuoteQty = BigInt(quantities.cancelledQuoteQty);
+  if (quoteQty !== filledQuoteQty + remainingQuoteQty + cancelledQuoteQty) {
+    throw new Error(
+      `PopDEX ${field} quoteQty 必须等于 filledQuoteQty + remainingQuoteQty + cancelledQuoteQty。`,
+    );
+  }
+  return {
+    walletId,
+    category: value.category.toString(),
+    source: value.source.toString(),
+    orderId: value.orderId.toString(),
+    clientOrderId: bytes32(value.clientOrderId, `${field}.clientOrderId`),
+    symbolId,
+    side: value.side.toString(),
+    isReduceOnly: value.isReduceOnly,
+    orderType: value.orderType.toString(),
+    timeInForce: value.timeInForce.toString(),
+    stpMode: value.stpMode.toString(),
+    stpKey: addressAllowZero(value.stpKey, `${field}.stpKey`),
+    status: value.status.toString(),
+    priceWad: value.price.toString(),
+    qtyWad: qty.toString(),
+    filledQtyWad: filledQty.toString(),
+    remainingQtyWad: remainingQty.toString(),
+    cancelledQtyWad: cancelledQty.toString(),
+    quoteQtyWad: quoteQty.toString(),
+    filledQuoteQtyWad: filledQuoteQty.toString(),
+    remainingQuoteQtyWad: remainingQuoteQty.toString(),
+    cancelledQuoteQtyWad: cancelledQuoteQty.toString(),
+    averagePriceWad: value.averagePrice.toString(),
+    nonce: value.nonce.toString(),
+    createdAt: value.createdAt.toString(),
+    updatedAt: value.updatedAt.toString(),
+    makerFeeRateWad: value.makerFeeRate.toString(),
+    takerFeeRateWad: value.takerFeeRate.toString(),
+  };
 }
 
 export class PopdexRpcClient {
@@ -189,6 +274,77 @@ export class PopdexRpcClient {
       positions: decoded.positions.map(exactPosition),
       hasMore: decoded.hasMore,
     };
+  }
+
+  async #getOrderPage(functionName, account, offset, limit) {
+    const wallet = strictAddress(account, 'account');
+    const exactOffset = uint32(offset, 'order offset');
+    const exactLimit = uint32(limit, 'order limit', { allowZero: false });
+    const data = ORDER_PAGE_INTERFACE.encodeFunctionData(
+      functionName,
+      [wallet, exactOffset, exactLimit],
+    );
+    const raw = await this.call('eth_call', [{ to: POPDEX_ORDER_PRECOMPILE, data }, 'latest']);
+    let decoded;
+    try {
+      [decoded] = ORDER_PAGE_INTERFACE.decodeFunctionResult(functionName, raw);
+    } catch (error) {
+      throw new Error(
+        `PopDEX RPC ${functionName} 解码失败：${sanitizedCause(error)}`,
+        { cause: error },
+      );
+    }
+    if (typeof decoded.hasMore !== 'boolean') {
+      throw new Error(`PopDEX RPC ${functionName} hasMore 必须是布尔值。`);
+    }
+    return {
+      orders: decoded.orders.map((order, index) => exactOrder(order, wallet, index)),
+      hasMore: decoded.hasMore,
+    };
+  }
+
+  async getActiveOrders(account, offset = 0, limit = ORDER_PAGE_SIZE) {
+    return this.#getOrderPage('getActiveOrdersByAccount', account, offset, limit);
+  }
+
+  async getCompletedOrders(account, offset = 0, limit = ORDER_PAGE_SIZE) {
+    return this.#getOrderPage('getCompletedOrdersByAccount', account, offset, limit);
+  }
+
+  async findUniqueOrderByClientId(
+    account,
+    clientOrderId,
+    { completed = false, maxPages = 10 } = {},
+  ) {
+    const wallet = strictAddress(account, 'account');
+    const wanted = bytes32(clientOrderId, 'clientOrderId');
+    if (typeof completed !== 'boolean') {
+      throw new Error('PopDEX completed 必须是布尔值。');
+    }
+    if (!Number.isSafeInteger(maxPages) || maxPages <= 0 || maxPages > 100) {
+      throw new Error('PopDEX maxPages 必须是 1-100 的安全整数。');
+    }
+
+    const matches = [];
+    for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
+      const offset = pageIndex * ORDER_PAGE_SIZE;
+      const page = completed
+        ? await this.getCompletedOrders(wallet, offset, ORDER_PAGE_SIZE)
+        : await this.getActiveOrders(wallet, offset, ORDER_PAGE_SIZE);
+      for (const order of page.orders) {
+        if (order.clientOrderId === wanted) matches.push(order);
+      }
+      if (matches.length > 1) {
+        throw new Error(`PopDEX clientOrderId ${wanted} 在链上订单中重复。`);
+      }
+      if (!page.hasMore) {
+        if (matches.length === 0) {
+          throw new PopdexOrderNotFoundError(wanted);
+        }
+        return matches[0];
+      }
+    }
+    throw new Error(`PopDEX 订单分页超过 maxPages=${maxPages}，拒绝继续。`);
   }
 
   async getAgentInfo(agentAddress) {
