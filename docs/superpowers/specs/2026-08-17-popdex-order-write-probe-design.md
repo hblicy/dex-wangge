@@ -15,6 +15,7 @@
 - Mainnet `chainId=2184`（`0x888`）。
 - Order 预编译地址为 `0x0000000000000000000000000000000000001000`。
 - `placeOrder`、`cancelOrder` 的官方 ABI，以及调用方提供的 `clientOrderId`。
+- `getActiveOrdersByAccount`、`getCompletedOrdersByAccount` 的官方 ABI；返回值包含完整 `clientOrderId`、官方 `orderId`、状态及成交/剩余/撤销量。
 - 真实主账户的 Agent 已能按 Account 预编译状态完成授权回验。
 - BTCUSDT/ETHUSDT 的官方市场身份、精度和最低名义金额。
 
@@ -36,7 +37,7 @@
 
 - `src/exchange/px/order-codec.js`：纯函数形式验证订单输入、生成 `clientOrderId`、编码 `orderParams`、`placeOrder` 和 `cancelOrder` calldata。
 - `src/exchange/px/trading-client.js`：验证链和 Agent 授权，构造并签署 legacy 交易，广播、等待回执并读取失败原因。只接受注入的 RPC、账户客户端和时钟，便于无网络测试。
-- `src/exchange/px/account-client.js`：补充有界分页和按 `clientOrderId` 查找订单的严格接口；所有订单 ID 保持字符串。
+- `src/exchange/px/rpc-client.js`：补充有界分页的链上活动/完成订单读取和按 `clientOrderId` 唯一匹配；所有订单 ID 和 WAD 数量保持字符串。现有 REST `account-client.js` 只作为交叉检查，不承担订单终态事实来源。
 - `src/exchange/px/write-probe.js`：解析命令行参数，执行 dry-run 或一次下单—撤单闭环，并维护安全恢复记录。
 - `test/popdex-order-codec.test.js`、`test/popdex-trading-client.test.js`、`test/popdex-write-probe.test.js`：覆盖纯编码、写入边界和命令编排。
 
@@ -70,7 +71,7 @@ npm run popdex:write-probe -- --symbol BTCUSDT --side buy --price 60000 --qty 0.
 5. 在广播前执行只读模拟；模拟失败时不广播。
 6. Agent 签名并广播一次，不对不确定结果自动重试。
 7. 保存脱敏后的 `txHash` 和阶段 `BROADCAST`，等待成功回执。
-8. 有界轮询账户订单接口，按完整 `clientOrderId` 找到唯一官方订单。
+8. 有界轮询 Order 预编译的 `getActiveOrdersByAccount`，按完整 `clientOrderId` 找到唯一官方订单。
 9. 严格核对主账户、市场、方向、价格、数量和官方字符串 `orderId`，然后记录 `OPEN_CONFIRMED`。
 
 交易哈希只表示链上交易，不得作为订单 ID。成功回执后如果找不到唯一官方订单，探针保留恢复记录并非零退出，禁止再次下单。
@@ -80,10 +81,10 @@ npm run popdex:write-probe -- --symbol BTCUSDT --side buy --price 60000 --qty 0.
 1. 使用确认过的官方 `orderId` 和原始 `clientOrderId` 编码 `cancelOrder`。
 2. 广播前模拟，Agent 签名后只广播一次。
 3. 等待成功回执并记录 `CANCEL_BROADCAST`。
-4. 有界轮询开放订单和订单历史，确认该订单进入官方取消终态且最终成交数量为零。
+4. 有界轮询 Order 预编译的活动订单和完成订单，确认该订单离开活动集合、进入完成集合，且 `filledQty=0`、`cancelledQty=qty`、`remainingQty=0`。
 5. 记录 `CANCEL_CONFIRMED`，随后删除恢复文件。
 
-如果开放订单消失但没有可验证终态，不能视为撤单成功。如果出现任何成交数量，探针立即停止、保留记录并要求用户人工处理仓位；本阶段不自动平仓。
+如果订单从活动集合消失但没有出现在完成集合，不能视为撤单成功。如果完成订单出现任何成交数量，探针立即停止、保留记录并要求用户人工处理仓位；本阶段不自动平仓。
 
 ## nonce、gas 与广播规则
 
@@ -133,7 +134,7 @@ npm run popdex:write-probe -- --symbol BTCUSDT --side buy --price 60000 --qty 0.
 - `placeOrder`/`cancelOrder` 的固定 ABI 向量与 `orderParams` 字节向量。
 - Agent 与主账户关系、授权过期、delegator 冲突和 global 授权拒绝。
 - 模拟、广播、回执失败与超时。
-- 成功回执后的唯一订单映射，以及零个/多个/字段冲突的拒绝。
+- 成功回执后通过链上活动订单分页完成唯一订单映射，以及零个/多个/字段冲突的拒绝。
 - 撤单终态、订单消失但无终态、部分成交和完整成交。
 - 恢复文件权限、原子写入、未完成记录阻止新订单。
 - 日志不包含私钥、签名和原始交易。
