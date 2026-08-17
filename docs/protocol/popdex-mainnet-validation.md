@@ -95,7 +95,7 @@ No transaction was signed, simulated as a write, or broadcast during this valida
 
 ## Order identity
 
-The Order precompile ABI proves that placement accepts a caller-provided `bytes32 clientOrderId`; cancellation requires both `uint128 orderId` and `bytes32 clientOrderId`; on-chain order getters expose both fields. All verifier parsers preserve IDs and cursors as strings.
+The Order precompile ABI proves that placement accepts a caller-provided `bytes32 clientOrderId`; cancellation requires both `uint128 orderId` and `bytes32 clientOrderId`; on-chain order getters expose both fields. Mainnet preflight evidence also proves that the precompile parses this field as UTF-8: an arbitrary Keccak digest was rejected with `invalid UTF-8 in client order ID`. The reference implementation uses `encodeBytes32String` with a printable label. New probe IDs therefore use a canonical printable label of at most 31 UTF-8 bytes with bytes32 zero padding, never an arbitrary 32-byte hash. All verifier parsers preserve IDs and cursors as strings.
 
 The current hashed artifact `/perp-static/client/js/98039.36abf38e738893c0cb67.chunk.js` also exposes both authoritative order-page reads:
 
