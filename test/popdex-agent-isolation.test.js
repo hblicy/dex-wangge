@@ -41,17 +41,19 @@ test('PopDEX Agent modules do not import Bot, persistence, AI, Decibel or RISEx'
   }
 });
 
-test('PopDEX write probe stays CLI-only and is not exposed as a grid or server route', () => {
+test('PopDEX write probes stay CLI-only and are not exposed as server routes', () => {
   const server = readProject('src/server.js');
   const readme = readProject('README.md');
   const agents = readProject('AGENTS.md');
   const packageJson = readProject('package.json');
   assert.match(packageJson, /"popdex:write-probe"/);
+  assert.match(packageJson, /"popdex:grid-probe"/);
   assert.match(readme, /popdex:write-probe/);
   assert.match(readme, /--confirm-mainnet-write/);
   assert.match(readme, /尚未.*PopDEX.*网格/s);
   assert.match(agents, /单笔.*下单.*撤单.*探针/s);
-  assert.match(agents, /尚未.*自动网格/s);
+  assert.match(agents, /Stage 7 小网格.*popdex:grid-probe/s);
+  assert.match(agents, /正式服务器、网页和 Agent API 禁止触发 PopDEX 交易/s);
   assert.doesNotMatch(server, /createPxExchange|new GridBot\([^\n]*px/i);
   assert.doesNotMatch(server, /\/api\/px\/(?:start|stop|orders|cancel|leverage|close)/i);
 });
@@ -90,11 +92,11 @@ test('PopDEX Stage 6 factory remains absent from application entry points', () =
   }
 });
 
-test('living documentation records Stage 6 boundary and Stage 7 gate', () => {
+test('living documentation records the Stage 7 CLI boundary and Stage 8 gate', () => {
   const agents = readProject('AGENTS.md');
   const readme = readProject('README.md');
-  assert.match(agents, /Stage 6.*IExchange.*Paper/s);
-  assert.match(agents, /Stage 7.*成交补单.*恢复/s);
+  assert.match(agents, /Stage 7.*成交补单.*恢复.*Paper.*独立 BTC 小网格验收命令/s);
+  assert.match(agents, /正式迁移属于 Stage 8/s);
   assert.match(readme, /PopDEX 网格尚未开放/);
   assert.doesNotMatch(readme, /PopDEX.*可上实盘网格/);
 });

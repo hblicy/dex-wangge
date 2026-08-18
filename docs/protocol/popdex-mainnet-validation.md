@@ -133,6 +133,34 @@ The 2026-08-18 Mainnet fill response was observed to expose its exact decimal-st
 
 Automated tests cover the state machine, but mocked reverse-close success is not Mainnet protocol evidence. Mainnet has now validated the leverage write, marketable fill schema and non-empty position schema; it has rejected the assumed reverse-close parameter. A failed close record can be cleared after an external/manual close only when read-only facts prove the account is flat, without broadcasting another transaction.
 
+## Stage 7 recovery and grid acceptance tooling
+
+Stage 7 now has automated coverage for exact owned-order reconciliation, paginated order/fill reads, terminal-event deduplication, deterministic replacement intent, restart adoption, offline fill replay, disconnect recovery, bulk-cancel suppression, durable Bot acknowledgement, and Paper/live interface parity. The implementation permits only BTCUSDT long, 1x, three-grid acceptance. A long fill is replenished with exactly one `Limit + GTC + ReduceOnly + OneWay/Net` sell order tied to the persisted parent `fillEventId`.
+
+The isolated command is `npm run popdex:grid-probe`. It uses independent state, ownership, operation and lock files and is not registered in the server, API, configuration registry or frontend. Its default invocation performs official read-only preflight and reports `writes=0`. Automated tests and dry-run success are not Mainnet acceptance evidence; the user must run the explicitly gated Mainnet command on the VPS and preserve official order/fill/position evidence.
+
+VPS read-only preflight:
+
+```bash
+cd ~/dex-wangge
+npm run popdex:verify -- --account-env POPDEX_MAIN_ACCOUNT
+npm run popdex:grid-probe
+```
+
+Only after the PopDEX web page independently shows BTCUSDT open orders `0` and positions `0`, start the bounded acceptance in the foreground:
+
+```bash
+npm run popdex:grid-probe -- --confirm-mainnet-grid
+```
+
+The command accepts only `status`, `reconnect`, and `stop` while running. `SIGINT` and `SIGTERM` persist state and exit without sending cancellation or close writes; the only permitted continuation is:
+
+```bash
+npm run popdex:grid-probe -- --resume
+```
+
+The `stop` command must confirm zero owned open orders, zero pending terminal events and a flat BTCUSDT position before clearing the isolated probe files. Any identity conflict, unresolved terminal fact, replacement failure or persistence failure stops acceptance and retains recovery facts.
+
 ## Required write probes
 
 The first bounded probe is complete: a newly authorized Agent was verified on chain, one non-marketable minimum-value BTCUSDT order was signed and broadcast by that Agent, the exact `OrderCreate` receipt mapped the deterministic `clientOrderId` to the official `orderId`, REST and the web UI confirmed the live order, and a single Agent cancellation produced the exact `OrderCancel` receipt. The official UI close transaction has also supplied the exact final-close calldata described above. The corrected Stage 5 Agent implementation has passed offline state-machine and regression tests only. The remaining separately approved probes are:
@@ -155,4 +183,4 @@ BLOCKED
 | Complete order, fill and position schema and pagination | Partially validated: real empty and non-empty BTCUSDT facts were observed, including `execId` and a OneWay long position. Pagination beyond the bounded rows remains blocked. |
 | Maximum open orders and rate limits | Blocked: no authoritative value was present in the read-only evidence. |
 
-The next protocol action is one separately approved, bounded Bot-Agent validation of the corrected Stage 5 close. The official UI transaction already proves the close primitive and final flat state; the remaining validation must prove the local Agent implementation's exact close order and fill identities without adding server routes or automatic grid trading. PopDEX automatic grid trading remains disabled until Stage 5 is accepted and the later `IExchange` stage is separately designed and implemented.
+The next protocol action is the separately approved, bounded Stage 7 BTCUSDT three-grid Mainnet acceptance. The formal server/API/frontend PopDEX grid remains disabled. Stage 7 exposes only the isolated `popdex:grid-probe`; Stage 8 replacement of Extended is forbidden until the complete BTC acceptance evidence is recorded.
