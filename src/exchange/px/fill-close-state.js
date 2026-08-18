@@ -60,8 +60,9 @@ export function exactBtcLeverage(config) {
     throw new Error('PopDEX 账户必须是 OneWay positionMode=0。');
   }
   const matches = config.symbolLeverages.filter((item) => item?.symbolId === BTC_SYMBOL_ID);
-  if (matches.length !== 1) {
-    throw new Error(`PopDEX BTCUSDT 杠杆记录必须唯一，实际 ${matches.length}。`);
+  if (matches.length === 0) return null;
+  if (matches.length > 1) {
+    throw new Error(`PopDEX BTCUSDT 杠杆记录重复，实际 ${matches.length}。`);
   }
   const leverage = integerWad(matches[0].leverage, 'BTC leverage');
   if (leverage < 1n || leverage > 255n) {
