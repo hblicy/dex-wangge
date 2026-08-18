@@ -1,9 +1,11 @@
 import { PopdexAccountClient } from './account-client.js';
 import { PopdexOperationJournal } from './operation-journal.js';
+import { PopdexOwnershipStore } from './ownership-store.js';
 import { PopdexPaperExchange } from './paper.js';
 import { PopdexExchange } from './popdex.js';
 import { PopdexPublicClient } from './public-client.js';
 import { PopdexRpcClient } from './rpc-client.js';
+import { PopdexReconciler } from './reconciler.js';
 import { PopdexTradingClient } from './trading-client.js';
 import { PopdexWriteRpcClient } from './write-rpc-client.js';
 
@@ -18,6 +20,7 @@ export function createLiveExchange(cfg = {}, deps = {}) {
   const mainAccount = requiredText(cfg.mainAccount, 'mainAccount');
   const agentPrivateKey = requiredText(cfg.agentPrivateKey, 'agentPrivateKey');
   const journalFile = requiredText(cfg.journalFile, 'journalFile');
+  const ownershipFile = requiredText(cfg.ownershipFile, 'ownershipFile');
   const publicClient = deps.publicClient ?? new PopdexPublicClient();
   const accountClient = deps.accountClient ?? new PopdexAccountClient();
   const readRpc = deps.readRpc ?? new PopdexRpcClient();
@@ -30,6 +33,16 @@ export function createLiveExchange(cfg = {}, deps = {}) {
     writeRpc,
   });
   const journal = deps.journal ?? new PopdexOperationJournal({ file: journalFile });
+  const ownershipStore = deps.ownershipStore ?? new PopdexOwnershipStore({
+    file: ownershipFile,
+    mainAccount,
+  });
+  const reconciler = deps.reconciler ?? new PopdexReconciler({
+    mainAccount,
+    accountClient,
+    readRpc,
+    ownershipStore,
+  });
   return new PopdexExchange({
     mainAccount,
     publicClient,
@@ -37,6 +50,8 @@ export function createLiveExchange(cfg = {}, deps = {}) {
     readRpc,
     tradingClient,
     journal,
+    ownershipStore,
+    reconciler,
     ...(cfg.pollMs === undefined ? {} : { pollMs: cfg.pollMs }),
     ...(cfg.staleMs === undefined ? {} : { staleMs: cfg.staleMs }),
   });

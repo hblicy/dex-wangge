@@ -15,6 +15,8 @@ function injectedLiveDependencies() {
     writeRpc: {},
     tradingClient: {},
     journal: {},
+    ownershipStore: {},
+    reconciler: {},
   };
 }
 
@@ -29,6 +31,7 @@ test('PopDEX factory creates only explicit paper or live adapters', () => {
     mainAccount: ACCOUNT,
     agentPrivateKey: AGENT_KEY,
     journalFile: '.popdex-operation.json',
+    ownershipFile: '.popdex-ownership.json',
   }, injectedLiveDependencies());
   assert.ok(live instanceof PopdexExchange);
   assert.throws(() => createExchange({ mode: 'unknown' }), /mode.*paper.*live/);
@@ -37,14 +40,25 @@ test('PopDEX factory creates only explicit paper or live adapters', () => {
 test('live factory requires all explicit secret and recovery configuration', () => {
   const deps = injectedLiveDependencies();
   assert.throws(() => createLiveExchange({
-    agentPrivateKey: AGENT_KEY, journalFile: '.popdex-operation.json',
+    agentPrivateKey: AGENT_KEY,
+    journalFile: '.popdex-operation.json',
+    ownershipFile: '.popdex-ownership.json',
   }, deps), /mainAccount/);
   assert.throws(() => createLiveExchange({
-    mainAccount: ACCOUNT, journalFile: '.popdex-operation.json',
+    mainAccount: ACCOUNT,
+    journalFile: '.popdex-operation.json',
+    ownershipFile: '.popdex-ownership.json',
   }, deps), /agentPrivateKey/);
   assert.throws(() => createLiveExchange({
-    mainAccount: ACCOUNT, agentPrivateKey: AGENT_KEY,
+    mainAccount: ACCOUNT,
+    agentPrivateKey: AGENT_KEY,
+    ownershipFile: '.popdex-ownership.json',
   }, deps), /journalFile/);
+  assert.throws(() => createLiveExchange({
+    mainAccount: ACCOUNT,
+    agentPrivateKey: AGENT_KEY,
+    journalFile: '.popdex-operation.json',
+  }, deps), /ownershipFile/);
 });
 
 test('injected dependencies remain isolated and are passed through unchanged', () => {
@@ -53,10 +67,13 @@ test('injected dependencies remain isolated and are passed through unchanged', (
     mainAccount: ACCOUNT,
     agentPrivateKey: AGENT_KEY,
     journalFile: '.popdex-operation.json',
+    ownershipFile: '.popdex-ownership.json',
   }, deps);
   assert.equal(exchange.publicClient, deps.publicClient);
   assert.equal(exchange.accountClient, deps.accountClient);
   assert.equal(exchange.readRpc, deps.readRpc);
   assert.equal(exchange.tradingClient, deps.tradingClient);
   assert.equal(exchange.journal, deps.journal);
+  assert.equal(exchange.ownershipStore, deps.ownershipStore);
+  assert.equal(exchange.reconciler, deps.reconciler);
 });

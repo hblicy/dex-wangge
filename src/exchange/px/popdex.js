@@ -227,8 +227,8 @@ function exactOpenOrder(value, symbol, mainAccount, index) {
   if (!ACTIVE_ORDER_STATUSES.has(value.status)) {
     throw new Error(`PopDEX ${symbol} order[${index}].status ${String(value.status)} 不是活动状态。`);
   }
-  if (value.reduceOnly !== false) {
-    throw new Error(`PopDEX ${symbol} order[${index}].reduceOnly 必须是 false。`);
+  if (typeof value.reduceOnly !== 'boolean') {
+    throw new Error(`PopDEX ${symbol} order[${index}].reduceOnly 必须是布尔值。`);
   }
   const priceWad = decimalWad(value.price, `${symbol} order[${index}].price`);
   const qtyWad = decimalWad(value.qty, `${symbol} order[${index}].qty`);
@@ -250,13 +250,13 @@ function exactOpenOrder(value, symbol, mainAccount, index) {
     sizeBase: Number(formatUnits(qtyWad, 18)),
     filledSizeBase: Number(formatUnits(filledQtyWad, 18)),
     remainingSizeBase: Number(formatUnits(remainingQtyWad, 18)),
-    reduceOnly: false,
+    reduceOnly: value.reduceOnly,
     status: value.status,
     clientOid,
     clientOrderId: encodedClientOrderId(clientOid),
     walletId,
     symbolId: String(MARKET_IDS[symbol]),
-    isReduceOnly: false,
+    isReduceOnly: value.reduceOnly,
     priceWad: priceWad.toString(),
     qtyWad: qtyWad.toString(),
     filledQtyWad: filledQtyWad.toString(),
@@ -352,6 +352,79 @@ function emptySnapshot() {
   };
 }
 
+function exactGridIntent({ side, reduceOnly, levelIndex, opening, intentId, parentFillEventId }) {
+  if (!Number.isSafeInteger(levelIndex) || levelIndex < 0) {
+    throw new Error('PopDEX levelIndex 必须是非负安全整数。');
+  }
+  if (typeof intentId !== 'string' || intentId.length === 0 || intentId.length > 300
+      || /[\r\n]/.test(intentId)) {
+    throw new Error('PopDEX intentId 必须是 1-300 字符的单行字符串。');
+  }
+  if (typeof opening !== 'boolean' || typeof reduceOnly !== 'boolean'
+      || opening === reduceOnly) {
+    throw new Error('PopDEX opening 与 reduceOnly 必须是互斥布尔值。');
+  }
+  if ((opening && side !== 'buy') || (reduceOnly && side !== 'sell')) {
+    throw new Error('PopDEX long-only 网格只允许 buy opening 或 sell reduce-only。');
+  }
+  if (parentFillEventId !== null
+      && (typeof parentFillEventId !== 'string'
+        || !/^px-fill-[0-9a-f]{64}$/.test(parentFillEventId))) {
+    throw new Error('PopDEX parentFillEventId 无效。');
+  }
+  if (reduceOnly && parentFillEventId === null) {
+    throw new Error('PopDEX reduce-only 补单必须包含 parentFillEventId。');
+  }
+  return { levelIndex, opening, intentId, reduceOnly, parentFillEventId };
+}
+
+function durableOrderMetadata(order) {
+  return {
+    orderId: order.orderId,
+    clientOrderId: order.clientOrderId,
+    marketId: order.marketId,
+    side: order.side,
+    price: wadNumber(order.priceWad, 'ownership.priceWad'),
+    sizeBase: wadNumber(order.qtyWad, 'ownership.qtyWad'),
+    reduceOnly: order.reduceOnly,
+    levelIndex: order.levelIndex,
+    opening: order.opening,
+    parentFillEventId: order.parentFillEventId,
+  };
+}
+
+function durableOrderFromPlacement(plan, order, intent) {
+  return {
+    orderId: String(order.orderId),
+    clientOrderId: plan.clientOrderId,
+    marketId: MARKET_IDS.BTCUSDT,
+    levelIndex: intent.levelIndex,
+    side: plan.side,
+    priceWad: plan.priceWad,
+    qtyWad: plan.qtyWad,
+    opening: intent.opening,
+    reduceOnly: intent.reduceOnly,
+    parentFillEventId: intent.parentFillEventId,
+    state: 'OPEN',
+    filledQtyWad: '0',
+    fillIds: [],
+    terminalEvent: null,
+  };
+}
+
+function sameDurablePlacement(left, right) {
+  return left.orderId === right.orderId
+    && left.clientOrderId === right.clientOrderId
+    && left.marketId === right.marketId
+    && left.levelIndex === right.levelIndex
+    && left.side === right.side
+    && left.priceWad === right.priceWad
+    && left.qtyWad === right.qtyWad
+    && left.opening === right.opening
+    && left.reduceOnly === right.reduceOnly
+    && left.parentFillEventId === right.parentFillEventId;
+}
+
 export class PopdexExchange extends EventEmitter {
   constructor({
     mainAccount,
@@ -360,6 +433,8 @@ export class PopdexExchange extends EventEmitter {
     readRpc,
     tradingClient,
     journal,
+    ownershipStore,
+    reconciler,
     now = () => Date.now(),
     setIntervalImpl = setInterval,
     clearIntervalImpl = clearInterval,
@@ -370,7 +445,7 @@ export class PopdexExchange extends EventEmitter {
     this.mode = 'live';
     this.mainAccount = strictAddress(mainAccount, 'mainAccount');
     for (const [name, dependency] of Object.entries({
-      publicClient, accountClient, readRpc, tradingClient, journal,
+      publicClient, accountClient, readRpc, tradingClient, journal, ownershipStore, reconciler,
     })) {
       if (!dependency || typeof dependency !== 'object') {
         throw new Error(`PopDEX ${name} 必须是对象。`);
@@ -386,6 +461,11 @@ export class PopdexExchange extends EventEmitter {
     this.readRpc = readRpc;
     this.tradingClient = tradingClient;
     this.journal = journal;
+    this.ownershipStore = ownershipStore;
+    this.reconciler = reconciler;
+    this.strictOrderRecovery = true;
+    this.requiresDurableFillAck = true;
+    this.releasedFillEvents = new Set();
     this.now = now;
     this.setIntervalImpl = setIntervalImpl;
     this.clearIntervalImpl = clearIntervalImpl;
@@ -534,10 +614,23 @@ export class PopdexExchange extends EventEmitter {
     await this.tradingClient.cancelAdapterOrder({
       ...official,
       side: official.side === 'buy' ? '0' : '1',
-      isReduceOnly: false,
+      isReduceOnly: official.reduceOnly,
     }, this.journal);
+    try {
+      await this.refresh();
+    } catch (error) {
+      throw stageError('write-cancel-refresh', '撤单后官方快照刷新', error);
+    }
+    const reconciliation = await this.#reconcileOwned({
+      marketId: MARKET_IDS.BTCUSDT,
+      reason: `cancel:${official.orderId}`,
+      suppressRequote: true,
+    });
+    if (reconciliation.activeOrders.some((order) => order.orderId === official.orderId)) {
+      throw new Error(`PopDEX 订单 ${official.orderId} 撤单后仍为活动状态。`);
+    }
     this.ownedOrders.delete(official.orderId);
-    await this.#refreshAndClearConfirmed('cancel');
+    this.journal.clearConfirmed();
   }
 
   async #buildSnapshot() {
@@ -655,9 +748,23 @@ export class PopdexExchange extends EventEmitter {
     if (official.orderId !== order.orderId
         || official.clientOrderId !== record.clientOrderId
         || official.side !== record.side
+        || official.reduceOnly !== (record.reduceOnly ?? false)
         || official.priceWad !== decimalWad(record.price, 'recovery.place.price').toString()
         || official.qtyWad !== decimalWad(record.qty, 'recovery.place.qty').toString()) {
       throw new Error('PopDEX BROADCAST place 官方订单身份冲突。');
+    }
+    if (record.intentId !== null) {
+      this.ownershipStore.upsertOrder(durableOrderFromPlacement({
+        side: record.side,
+        clientOrderId: record.clientOrderId,
+        priceWad: decimalWad(record.price, 'recovery.place.price').toString(),
+        qtyWad: decimalWad(record.qty, 'recovery.place.qty').toString(),
+      }, order, {
+        levelIndex: record.levelIndex,
+        opening: record.opening,
+        reduceOnly: record.reduceOnly,
+        parentFillEventId: record.parentFillEventId,
+      }));
     }
     this.journal.advance('BROADCAST', 'CONFIRMED', { orderId: order.orderId });
   }
@@ -897,11 +1004,21 @@ export class PopdexExchange extends EventEmitter {
     });
   }
 
-  async placeLimitOrder({ marketId, side, price, sizeBase, reduceOnly = false } = {}) {
+  async placeLimitOrder({
+    marketId,
+    side,
+    price,
+    sizeBase,
+    reduceOnly = false,
+    levelIndex,
+    opening,
+    intentId,
+    parentFillEventId = null,
+  } = {}) {
     this.#assertLiveWriteMarket(marketId, '限价下单');
-    if (reduceOnly !== false) {
-      throw new Error('PopDEX 限价单 reduce-only 实盘写操作尚未开放。');
-    }
+    const intent = exactGridIntent({
+      side, reduceOnly, levelIndex, opening, intentId, parentFillEventId,
+    });
     const ticker = this.snapshot.tickers.get(MARKET_IDS.BTCUSDT);
     const plan = prepareLimitOrder({
       mainAccount: this.mainAccount,
@@ -913,27 +1030,57 @@ export class PopdexExchange extends EventEmitter {
       ask: String(ticker.ask),
       randomBytesImpl: randomBytes,
       nowMs: exactNow(this.now),
+      reduceOnly,
+      positionSide: '0',
+      intentId,
     });
+
+    if (reduceOnly) {
+      const position = this.snapshot.positions.get(MARKET_IDS.BTCUSDT);
+      if (!position || position.side !== 'long' || position.sizeBase <= 0) {
+        throw new Error('PopDEX reduce-only sell 必须有已验证 BTCUSDT 多仓。');
+      }
+      if (BigInt(plan.qtyWad) > BigInt(position.holdSizeWad)) {
+        throw new Error('PopDEX reduce-only sell 数量超过已验证 BTCUSDT 多仓。');
+      }
+    }
+
+    const existing = this.ownershipStore.listOrders()
+      .find((order) => order.clientOrderId === plan.clientOrderId);
+    if (existing) {
+      const expected = durableOrderFromPlacement(plan, { orderId: existing.orderId }, intent);
+      if (!sameDurablePlacement(existing, expected)) {
+        const error = new Error(`PopDEX intentId ${intentId} 与已有所有权事实冲突。`);
+        this.haltFromBot(error);
+        throw error;
+      }
+      return durableOrderMetadata(existing);
+    }
+
     return this.#enqueueWrite('place-limit-order', async () => {
       this.journal.create(this.#writeIdentity('place', {
         side: plan.side,
         price: plan.price,
         qty: plan.qty,
         clientOrderId: plan.clientOrderId,
+        intentId,
+        levelIndex,
+        opening,
+        reduceOnly,
+        parentFillEventId,
       }));
       const order = await this.tradingClient.placeAdapterOrder(plan, this.journal);
-      const owned = {
-        orderId: String(order.orderId),
-        marketId: MARKET_IDS.BTCUSDT,
-        clientOrderId: plan.clientOrderId,
-        side: plan.side,
-        price: Number(plan.price),
-        sizeBase: Number(plan.qty),
-        levelIndex: null,
-      };
+      if (Boolean(order.isReduceOnly) !== reduceOnly
+          || String(order.priceWad) !== plan.priceWad
+          || String(order.qtyWad) !== plan.qtyWad) {
+        throw new Error('PopDEX 下单回执与网格意图不匹配。');
+      }
+      const durable = durableOrderFromPlacement(plan, order, intent);
+      this.ownershipStore.upsertOrder(durable);
+      const owned = durableOrderMetadata(durable);
       this.ownedOrders.set(owned.orderId, owned);
       await this.#refreshAndClearConfirmed('place-limit-order');
-      return { orderId: owned.orderId };
+      return { ...owned };
     });
   }
 
@@ -1059,6 +1206,90 @@ export class PopdexExchange extends EventEmitter {
       }
       return true;
     });
+  }
+
+  async #reconcileOwned(options) {
+    const marketId = this.#assertLiveWriteMarket(options?.marketId, '订单对账');
+    const reason = options?.reason;
+    const suppressRequote = options?.suppressRequote ?? false;
+    if (typeof reason !== 'string' || reason.length === 0) {
+      throw new Error('PopDEX owned reconcile reason 必须是非空字符串。');
+    }
+    try {
+      const result = await this.reconciler.reconcile({ reason, suppressRequote });
+      for (const order of result.activeOrders) {
+        const metadata = durableOrderMetadata(order);
+        this.ownedOrders.set(metadata.orderId, metadata);
+      }
+      this.#setState(result.status, `owned reconcile ${reason}`);
+      return {
+        ...result,
+        marketId,
+        activeOrders: result.activeOrders.map(durableOrderMetadata),
+        pendingEvents: structuredClone(result.pendingEvents),
+      };
+    } catch (error) {
+      if (isTransient(error)) {
+        this.lastErrorStage = 'owned-reconcile';
+        this.lastErrorMessage = sanitizeError(error);
+        this.#setState('RECONCILING', this.lastErrorMessage);
+      } else {
+        this.haltFromBot(error);
+      }
+      throw error;
+    }
+  }
+
+  recoverOwnedOrders(options) {
+    return this.#reconcileOwned(options);
+  }
+
+  reconcileOwnedOrders(options) {
+    return this.#reconcileOwned(options);
+  }
+
+  pendingFillEvents() {
+    return this.ownershipStore.pendingEvents();
+  }
+
+  releaseRecoveredEvents() {
+    for (const event of this.pendingFillEvents()) {
+      if (event.stage !== 'EVENT_PENDING' || this.releasedFillEvents.has(event.fillEventId)) continue;
+      this.releasedFillEvents.add(event.fillEventId);
+      this.emit('fill', {
+        ...structuredClone(event),
+        price: wadNumber(event.priceWad, 'fillEvent.priceWad'),
+        sizeBase: wadNumber(event.filledQtyWad, 'fillEvent.filledQtyWad'),
+      });
+    }
+  }
+
+  acknowledgeFillEvent(fillEventId, replacementOrderId) {
+    const event = this.pendingFillEvents()
+      .find((candidate) => candidate.fillEventId === fillEventId);
+    if (!event) throw new Error(`PopDEX 成交事件 ${String(fillEventId)} 不存在。`);
+    if (event.suppressRequote) {
+      if (replacementOrderId !== null) {
+        throw new Error('PopDEX suppression 事件不允许 replacementOrderId。');
+      }
+      this.ownershipStore.completeSuppressedEvent(fillEventId);
+      return;
+    }
+    const replacement = this.ownershipStore.listOrders()
+      .find((order) => order.orderId === String(replacementOrderId));
+    if (!replacement || replacement.parentFillEventId !== fillEventId) {
+      throw new Error('PopDEX 补单身份不匹配。');
+    }
+    this.ownershipStore.markReplacementConfirmed(fillEventId, replacement.orderId);
+    this.ownershipStore.completeEvent(fillEventId);
+  }
+
+  haltFromBot(error) {
+    if (this.state === 'HALTED' && this.lastErrorMessage !== null) return;
+    this.lastErrorStage = 'bot';
+    this.lastErrorMessage = sanitizeError(error);
+    this.#setState('HALTED', this.lastErrorMessage);
+    this.emit('fault', error);
   }
 
   start() {

@@ -17,6 +17,11 @@ const RECORD_KEYS = Object.freeze([
   'qty',
   'leverage',
   'clientOrderId',
+  'intentId',
+  'levelIndex',
+  'opening',
+  'reduceOnly',
+  'parentFillEventId',
   'closeClientOrderId',
   'orderId',
   'closeOrderId',
@@ -37,12 +42,18 @@ const CREATE_KEYS = new Set([
   'qty',
   'leverage',
   'clientOrderId',
+  'intentId',
+  'levelIndex',
+  'opening',
+  'reduceOnly',
+  'parentFillEventId',
   'closeClientOrderId',
   'orderId',
   'positionId',
 ]);
 const ADVANCE_KEYS = new Set(['txHash', 'orderId', 'closeOrderId']);
 const UINT128_MAX = (1n << 128n) - 1n;
+const FILL_EVENT_ID = /^px-fill-[0-9a-f]{64}$/;
 
 function rejectUnknownKeys(value, allowed, context) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -113,7 +124,8 @@ function validateKind(record) {
     }
     for (const field of [
       'side', 'price', 'qty', 'clientOrderId', 'closeClientOrderId',
-      'orderId', 'closeOrderId', 'positionId',
+      'orderId', 'closeOrderId', 'positionId', 'intentId', 'levelIndex',
+      'opening', 'reduceOnly', 'parentFillEventId',
     ]) assertNull(record[field], field, record.kind);
     return;
   }
@@ -126,6 +138,33 @@ function validateKind(record) {
     record.price = positiveDecimal(record.price, 'price');
     record.qty = positiveDecimal(record.qty, 'qty');
     record.clientOrderId = hex32(record.clientOrderId, 'clientOrderId');
+    const legacy = record.intentId === null;
+    if (legacy) {
+      for (const field of ['levelIndex', 'opening', 'reduceOnly', 'parentFillEventId']) {
+        assertNull(record[field], field, 'legacy-place');
+      }
+    } else {
+      if (typeof record.intentId !== 'string' || record.intentId.length === 0
+          || record.intentId.length > 300 || /[\r\n]/.test(record.intentId)) {
+        throw new Error('PopDEX operation journal place intentId 必须是 1-300 字符的单行字符串。');
+      }
+      if (!Number.isSafeInteger(record.levelIndex) || record.levelIndex < 0) {
+        throw new Error('PopDEX operation journal place levelIndex 必须是非负安全整数。');
+      }
+      if (typeof record.opening !== 'boolean' || typeof record.reduceOnly !== 'boolean'
+          || record.opening === record.reduceOnly) {
+        throw new Error('PopDEX operation journal place opening 与 reduceOnly 必须是互斥布尔值。');
+      }
+      if ((record.opening && record.side !== 'buy')
+          || (record.reduceOnly && record.side !== 'sell')) {
+        throw new Error('PopDEX operation journal place 只允许 buy opening 或 sell reduceOnly。');
+      }
+      if (record.parentFillEventId !== null
+          && (typeof record.parentFillEventId !== 'string'
+            || !FILL_EVENT_ID.test(record.parentFillEventId))) {
+        throw new Error('PopDEX operation journal place parentFillEventId 无效。');
+      }
+    }
     for (const field of ['closeClientOrderId', 'closeOrderId', 'positionId']) {
       assertNull(record[field], field, record.kind);
     }
@@ -138,6 +177,9 @@ function validateKind(record) {
 
   assertNull(record.side, 'side', record.kind);
   assertNull(record.price, 'price', record.kind);
+  for (const field of ['intentId', 'levelIndex', 'opening', 'reduceOnly', 'parentFillEventId']) {
+    assertNull(record[field], field, record.kind);
+  }
   if (record.kind === 'cancel') {
     assertNull(record.qty, 'qty', record.kind);
     record.orderId = positiveUint128(record.orderId, 'orderId');
@@ -168,7 +210,7 @@ function validateRecord(value) {
       throw new Error(`PopDEX operation journal record 缺少字段 ${key}。`);
     }
   }
-  if (value.version !== 1) throw new Error('PopDEX operation journal version 必须是 1。');
+  if (value.version !== 2) throw new Error('PopDEX operation journal version 必须是 2。');
   if (!KINDS.has(value.kind)) {
     throw new Error(`PopDEX operation journal kind 无效：${String(value.kind)}。`);
   }
@@ -292,6 +334,17 @@ export class PopdexOperationJournal {
         { cause },
       );
     }
+    if (parsed?.version === 1) {
+      parsed = {
+        ...parsed,
+        version: 2,
+        intentId: null,
+        levelIndex: null,
+        opening: null,
+        reduceOnly: null,
+        parentFillEventId: null,
+      };
+    }
     return validateRecord(parsed);
   }
 
@@ -301,7 +354,7 @@ export class PopdexOperationJournal {
       throw new Error(`PopDEX 已有未完成操作 ${this.file}，拒绝覆盖。`);
     }
     return this.#persist({
-      version: 1,
+      version: 2,
       kind: facts.kind,
       stage: 'PREPARED',
       mainAccount: facts.mainAccount,
@@ -313,6 +366,11 @@ export class PopdexOperationJournal {
       qty: facts.qty ?? null,
       leverage: facts.leverage ?? null,
       clientOrderId: facts.clientOrderId ?? null,
+      intentId: facts.intentId ?? null,
+      levelIndex: facts.levelIndex ?? null,
+      opening: facts.opening ?? null,
+      reduceOnly: facts.reduceOnly ?? null,
+      parentFillEventId: facts.parentFillEventId ?? null,
       closeClientOrderId: facts.closeClientOrderId ?? null,
       orderId: facts.orderId ?? null,
       closeOrderId: null,

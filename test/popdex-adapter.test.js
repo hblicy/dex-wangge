@@ -106,6 +106,45 @@ function memoryJournal(initial = null) {
   };
 }
 
+function memoryOwnership(initialOrders = [], initialEvents = []) {
+  let orders = structuredClone(initialOrders);
+  let events = structuredClone(initialEvents);
+  const calls = [];
+  return {
+    calls,
+    listOrders() { calls.push('list'); return structuredClone(orders); },
+    upsertOrder(order) {
+      calls.push(`upsert:${order.orderId}`);
+      const existing = orders.find((candidate) => candidate.orderId === order.orderId);
+      if (existing && JSON.stringify(existing) !== JSON.stringify(order)) {
+        throw new Error('ownership identity conflict');
+      }
+      if (!existing) orders.push(structuredClone(order));
+    },
+    pendingEvents() { calls.push('pending'); return structuredClone(events); },
+    markReplacementConfirmed(eventId, replacementOrderId) {
+      calls.push(`mark:${eventId}:${replacementOrderId}`);
+      const event = events.find((candidate) => candidate.fillEventId === eventId);
+      const replacement = orders.find((candidate) => candidate.orderId === replacementOrderId);
+      if (!event || replacement?.parentFillEventId !== eventId) {
+        throw new Error('补单身份不匹配');
+      }
+      event.stage = 'REPLACEMENT_CONFIRMED';
+      event.replacementOrderId = replacementOrderId;
+    },
+    completeEvent(eventId) {
+      calls.push(`complete:${eventId}`);
+      events = events.filter((event) => event.fillEventId !== eventId);
+    },
+    completeSuppressedEvent(eventId) {
+      calls.push(`complete-suppressed:${eventId}`);
+      const event = events.find((candidate) => candidate.fillEventId === eventId);
+      if (!event?.suppressRequote) throw new Error('事件不是 suppression');
+      events = events.filter((candidate) => candidate.fillEventId !== eventId);
+    },
+  };
+}
+
 function dependencies(overrides = {}) {
   const calls = [];
   let btcOrders = overrides.btcOrders ?? [];
@@ -117,6 +156,8 @@ function dependencies(overrides = {}) {
   };
   let positions = overrides.positions ?? [];
   const journal = overrides.journal ?? memoryJournal();
+  const ownershipStore = overrides.ownershipStore
+    ?? memoryOwnership(overrides.ownershipOrders, overrides.pendingEvents);
   let receipt = overrides.receipt ?? null;
   let activeWrites = 0;
   let maxConcurrentWrites = 0;
@@ -192,6 +233,7 @@ function dependencies(overrides = {}) {
         price: plan.price,
         qty: plan.qty,
         remainingQty: plan.qty,
+        reduceOnly: plan.reduceOnly,
       }));
       activeWrites -= 1;
       return {
@@ -200,7 +242,7 @@ function dependencies(overrides = {}) {
         walletId: ACCOUNT,
         symbolId: '20000',
         side: plan.side === 'buy' ? '0' : '1',
-        isReduceOnly: false,
+        isReduceOnly: plan.reduceOnly,
         priceWad: plan.priceWad,
         qtyWad: plan.qtyWad,
         filledQtyWad: '0',
@@ -225,6 +267,20 @@ function dependencies(overrides = {}) {
       return { closeOrderId: '99', positionQtyWad: '0' };
     },
   };
+  const reconciler = overrides.reconciler ?? {
+    async reconcile(options) {
+      calls.push(`reconciler:${options.reason}:${String(options.suppressRequote)}`);
+      return overrides.reconcileResult ?? {
+        status: 'READY',
+        activeOrders: options.suppressRequote
+          ? []
+          : ownershipStore.listOrders().filter((order) => ['OPEN', 'PARTIAL'].includes(order.state)),
+        pendingEvents: ownershipStore.pendingEvents(),
+        positions: structuredClone(positions),
+        diagnostics: { reason: options.reason },
+      };
+    },
+  };
   return {
     calls,
     publicClient,
@@ -232,6 +288,8 @@ function dependencies(overrides = {}) {
     readRpc,
     tradingClient,
     journal,
+    ownershipStore,
+    reconciler,
     get maxConcurrentWrites() { return maxConcurrentWrites; },
     get broadcastCalls() { return broadcastCalls; },
     setBtcOrders(value) { btcOrders = value; },
@@ -250,6 +308,8 @@ function createLiveAdapter(deps = dependencies(), overrides = {}) {
     readRpc: deps.readRpc,
     tradingClient: deps.tradingClient,
     journal: deps.journal,
+    ownershipStore: deps.ownershipStore,
+    reconciler: deps.reconciler,
     now: () => 1786946400000,
     setIntervalImpl: () => ({ unref() {} }),
     clearIntervalImpl() {},
@@ -423,19 +483,113 @@ test('live writes are serialized through one operation journal', async () => {
 
   const first = ex.placeLimitOrder({
     marketId: 20000, side: 'buy', price: 60000, sizeBase: 0.0002, reduceOnly: false,
+    levelIndex: 0, opening: true, intentId: 'seed-0',
   });
   const second = ex.placeLimitOrder({
-    marketId: 20000, side: 'sell', price: 64000, sizeBase: 0.0002, reduceOnly: false,
+    marketId: 20000, side: 'buy', price: 59000, sizeBase: 0.0002, reduceOnly: false,
+    levelIndex: 1, opening: true, intentId: 'seed-1',
   });
   const results = await Promise.all([first, second]);
 
   assert.equal(typeof results[0].orderId, 'string');
   assert.deepEqual(deps.calls.filter((entry) => entry.startsWith('trade:place:')), [
     'trade:place:buy',
-    'trade:place:sell',
+    'trade:place:buy',
   ]);
   assert.equal(deps.maxConcurrentWrites, 1);
   assert.equal(deps.journal.load(), null);
+});
+
+test('placeLimitOrder persists full ownership before clearing journal and is idempotent by intent', async () => {
+  const deps = dependencies();
+  const orderOfFacts = [];
+  const originalUpsert = deps.ownershipStore.upsertOrder;
+  deps.ownershipStore.upsertOrder = (order) => {
+    orderOfFacts.push('ownership');
+    return originalUpsert.call(deps.ownershipStore, order);
+  };
+  const originalClear = deps.journal.clearConfirmed;
+  deps.journal.clearConfirmed = () => {
+    orderOfFacts.push('journal-clear');
+    return originalClear.call(deps.journal);
+  };
+  const ex = createLiveAdapter(deps);
+  await ex.init();
+
+  const input = {
+    marketId: 20000,
+    side: 'buy',
+    price: 60000,
+    sizeBase: 0.0002,
+    reduceOnly: false,
+    levelIndex: 0,
+    opening: true,
+    intentId: 'seed-0',
+  };
+  const placed = await ex.placeLimitOrder(input);
+  assert.deepEqual(placed, {
+    orderId: placed.orderId,
+    clientOrderId: placed.clientOrderId,
+    marketId: 20000,
+    side: 'buy',
+    price: 60000,
+    sizeBase: 0.0002,
+    reduceOnly: false,
+    levelIndex: 0,
+    opening: true,
+    parentFillEventId: null,
+  });
+  assert.match(placed.clientOrderId, /^0x[0-9a-f]{64}$/);
+  assert.deepEqual(orderOfFacts, ['ownership', 'journal-clear']);
+  assert.equal(deps.ownershipStore.listOrders()[0].orderId, placed.orderId);
+
+  assert.deepEqual(await ex.placeLimitOrder(input), placed);
+  assert.equal(deps.calls.filter((entry) => entry === 'trade:place:buy').length, 1);
+});
+
+test('placeLimitOrder permits only a verified BTC long reduce-only sell', async () => {
+  const deps = dependencies({ positions: [longPosition()] });
+  const ex = createLiveAdapter(deps);
+  await ex.init();
+  const order = await ex.placeLimitOrder({
+    marketId: 20000,
+    side: 'sell',
+    price: 64000,
+    sizeBase: 0.0002,
+    reduceOnly: true,
+    levelIndex: 1,
+    opening: false,
+    intentId: 'replacement:event-1',
+    parentFillEventId: `px-fill-${'a'.repeat(64)}`,
+  });
+  assert.equal(order.reduceOnly, true);
+  assert.equal(order.opening, false);
+  assert.equal(deps.ownershipStore.listOrders()[0].reduceOnly, true);
+
+  const reopening = await ex.placeLimitOrder({
+    marketId: 20000,
+    side: 'buy',
+    price: 60000,
+    sizeBase: 0.0002,
+    reduceOnly: false,
+    levelIndex: 0,
+    opening: true,
+    intentId: 'replacement:event-2',
+    parentFillEventId: `px-fill-${'d'.repeat(64)}`,
+  });
+  assert.equal(reopening.opening, true);
+  assert.equal(reopening.parentFillEventId, `px-fill-${'d'.repeat(64)}`);
+
+  await assert.rejects(ex.placeLimitOrder({
+    marketId: 20000,
+    side: 'buy',
+    price: 60000,
+    sizeBase: 0.0002,
+    reduceOnly: true,
+    levelIndex: 2,
+    opening: false,
+    intentId: 'bad-close',
+  }), /sell.*reduce-only|long-only/);
 });
 
 test('setLeverage allows only BTCUSDT exact 1x and rejects non-READY writes', async () => {
@@ -451,7 +605,7 @@ test('setLeverage allows only BTCUSDT exact 1x and rejects non-READY writes', as
   await assert.rejects(ex.setLeverage(20000, 1), /RECONCILING/);
 });
 
-test('placeLimitOrder rejects ETH precision min-notional and reduce-only before journal creation', async () => {
+test('placeLimitOrder rejects ETH precision min-notional and invalid grid intent before journal creation', async () => {
   const deps = dependencies();
   const ex = createLiveAdapter(deps);
   await ex.init();
@@ -462,13 +616,15 @@ test('placeLimitOrder rejects ETH precision min-notional and reduce-only before 
   }), /ETHUSDT.*实盘写操作/);
   await assert.rejects(ex.placeLimitOrder({
     marketId: 20000, side: 'buy', price: 60000.5, sizeBase: 0.0002,
+    reduceOnly: false, levelIndex: 0, opening: true, intentId: 'invalid-tick',
   }), /tickSize/);
   await assert.rejects(ex.placeLimitOrder({
     marketId: 20000, side: 'buy', price: 100, sizeBase: 0.0001,
+    reduceOnly: false, levelIndex: 0, opening: true, intentId: 'invalid-notional',
   }), /minNotional/);
   await assert.rejects(ex.placeLimitOrder({
-    marketId: 20000, side: 'buy', price: 60000, sizeBase: 0.0002, reduceOnly: true,
-  }), /reduce-only.*未开放/);
+    marketId: 20000, side: 'buy', price: 60000, sizeBase: 0.0002, reduceOnly: false,
+  }), /levelIndex|intentId|opening/);
   assert.equal(
     deps.journal.calls.filter((entry) => entry.startsWith('create:')).length,
     before,
@@ -501,8 +657,43 @@ test('cancelAll cancels only adopted PopDEX orders and preserves manual orders',
     deps.calls.filter((entry) => entry.startsWith('trade:cancel:')),
     [`trade:cancel:${robot.orderId}`],
   );
+  assert.ok(deps.calls.includes(`reconciler:cancel:${robot.orderId}:true`));
   assert.equal(ex.getOpenOrders(20000).some((order) => order.orderId === manual.orderId), true);
   await assert.rejects(ex.cancelOrder(20000, manual.orderId), /不属于适配器/);
+});
+
+test('cancelAll does not clear recovery facts while a target remains active after reconciliation', async () => {
+  const robot = openOrder();
+  const durable = {
+    orderId: robot.orderId,
+    clientOrderId: encodeBytes32String(robot.clientOid).toLowerCase(),
+    marketId: 20000,
+    levelIndex: 0,
+    side: 'buy',
+    priceWad: parseUnits(robot.price, 18).toString(),
+    qtyWad: parseUnits(robot.qty, 18).toString(),
+    opening: true,
+    reduceOnly: false,
+    parentFillEventId: null,
+    state: 'OPEN',
+    filledQtyWad: '0',
+    fillIds: [],
+    terminalEvent: null,
+  };
+  const deps = dependencies({
+    btcOrders: [robot],
+    ownershipOrders: [durable],
+    reconcileResult: {
+      status: 'READY', activeOrders: [durable], pendingEvents: [], positions: [], diagnostics: {},
+    },
+  });
+  const ex = createLiveAdapter(deps);
+  await ex.init();
+  await ex.recoverOwnedOrders({ marketId: 20000, reason: 'startup' });
+
+  await assert.rejects(ex.cancelAll(20000), /撤单后仍为活动状态/);
+  assert.equal(deps.journal.load().stage, 'CONFIRMED');
+  assert.equal(ex.getHealth().state, 'HALTED');
 });
 
 test('adoptOrder rejects incomplete or conflicting ownership metadata', async () => {
@@ -547,6 +738,11 @@ function broadcastPlaceRecord(overrides = {}) {
     price: '60000',
     qty: '0.0002',
     clientOrderId: encodeBytes32String('dw-bb-0102030405060708090a0b0c').toLowerCase(),
+    intentId: 'seed-0',
+    levelIndex: 0,
+    opening: true,
+    reduceOnly: false,
+    parentFillEventId: null,
     orderId: null,
     closeOrderId: null,
     positionId: null,
@@ -599,7 +795,105 @@ test('BROADCAST place recovery confirms official facts and never broadcasts agai
   assert.equal(deps.broadcastCalls, 0);
   assert.equal(ex.getHealth().state, 'READY');
   assert.equal(journal.load(), null);
+  assert.equal(deps.ownershipStore.listOrders()[0].clientOrderId, record.clientOrderId);
   assert.ok(journal.calls.includes('advance:BROADCAST:CONFIRMED'));
+});
+
+test('strict recovery delegates exact owned orders and releases each pending event once', async () => {
+  const eventId = `px-fill-${'b'.repeat(64)}`;
+  const replacementOrderId = '90071992547409939999';
+  const pending = {
+    fillEventId: eventId,
+    stage: 'EVENT_PENDING',
+    terminalState: 'FILLED',
+    filledQtyWad: '200000000000000',
+    priceWad: '60000000000000000000000',
+    fillIds: ['7'],
+    suppressRequote: false,
+    replacementOrderId: null,
+    orderId: '90071992547409931234',
+    clientOrderId: encodeBytes32String('dw-bb-0102030405060708090a0b0c').toLowerCase(),
+    marketId: 20000,
+    levelIndex: 0,
+    side: 'buy',
+    opening: true,
+    reduceOnly: false,
+    parentFillEventId: null,
+  };
+  const active = {
+    orderId: replacementOrderId,
+    clientOrderId: encodeBytes32String('dw-bb-111111111111111111111111').toLowerCase(),
+    marketId: 20000,
+    levelIndex: 1,
+    side: 'buy',
+    priceWad: '59000000000000000000000',
+    qtyWad: '200000000000000',
+    opening: true,
+    reduceOnly: false,
+    parentFillEventId: eventId,
+    state: 'OPEN',
+    filledQtyWad: '0',
+    fillIds: [],
+    terminalEvent: null,
+  };
+  const deps = dependencies({
+    ownershipOrders: [active],
+    pendingEvents: [pending],
+    reconcileResult: {
+      status: 'READY', activeOrders: [active], pendingEvents: [pending], positions: [], diagnostics: {},
+    },
+  });
+  const ex = createLiveAdapter(deps);
+  const received = [];
+  ex.on('fill', (event) => received.push(event));
+  await ex.init();
+
+  const recovered = await ex.recoverOwnedOrders({ marketId: 20000, reason: 'startup' });
+  assert.equal(recovered.activeOrders[0].clientOrderId, active.clientOrderId);
+  assert.equal(recovered.pendingEvents[0].fillEventId, eventId);
+  assert.equal(ex.strictOrderRecovery, true);
+  assert.equal(ex.requiresDurableFillAck, true);
+  ex.releaseRecoveredEvents();
+  ex.releaseRecoveredEvents();
+  assert.equal(received.length, 1);
+  assert.equal(received[0].fillEventId, eventId);
+  assert.equal(received[0].price, 60000);
+  assert.equal(received[0].sizeBase, 0.0002);
+
+  assert.throws(() => ex.acknowledgeFillEvent(eventId, 'wrong'), /补单身份不匹配/);
+  ex.acknowledgeFillEvent(eventId, replacementOrderId);
+  assert.deepEqual(ex.pendingFillEvents(), []);
+});
+
+test('suppressed fill acknowledges without replacement and bot halt preserves first root cause', () => {
+  const eventId = `px-fill-${'c'.repeat(64)}`;
+  const pending = {
+    fillEventId: eventId,
+    stage: 'EVENT_PENDING',
+    terminalState: 'CANCELLED',
+    filledQtyWad: '100000000000000',
+    priceWad: '60000000000000000000000',
+    fillIds: ['8'],
+    suppressRequote: true,
+    replacementOrderId: null,
+    orderId: '90071992547409931234',
+    clientOrderId: encodeBytes32String('dw-bb-0102030405060708090a0b0c').toLowerCase(),
+    marketId: 20000,
+    levelIndex: 0,
+    side: 'buy',
+    opening: true,
+    reduceOnly: false,
+    parentFillEventId: null,
+  };
+  const deps = dependencies({ pendingEvents: [pending] });
+  const ex = createLiveAdapter(deps);
+  ex.acknowledgeFillEvent(eventId, null);
+  assert.deepEqual(ex.pendingFillEvents(), []);
+  ex.haltFromBot(new Error('write failed'));
+  ex.haltFromBot(new Error('later error'));
+  assert.equal(ex.getHealth().state, 'HALTED');
+  assert.match(ex.getHealth().lastErrorMessage, /write failed/);
+  assert.doesNotMatch(ex.getHealth().lastErrorMessage, /later error/);
 });
 
 test('BROADCAST place recovery compares price and quantity as exact WAD facts', async () => {
@@ -656,6 +950,7 @@ test('post-confirmation refresh failure retains CONFIRMED journal for reconnect'
 
   await assert.rejects(ex.placeLimitOrder({
     marketId: 20000, side: 'buy', price: 60000, sizeBase: 0.0002,
+    reduceOnly: false, levelIndex: 0, opening: true, intentId: 'refresh-failure',
   }), /fetch failed/);
   assert.equal(ex.getHealth().state, 'HALTED');
   assert.equal(journal.load().stage, 'CONFIRMED');

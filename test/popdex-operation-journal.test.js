@@ -74,6 +74,11 @@ function placeFacts(overrides = {}) {
     price: '60000',
     qty: '0.0002',
     clientOrderId: CLIENT_ID,
+    intentId: 'grid:run-1:20000:0:buy:open',
+    levelIndex: 0,
+    opening: true,
+    reduceOnly: false,
+    parentFillEventId: null,
     ...overrides,
   });
 }
@@ -82,6 +87,9 @@ test('operation journal atomically persists one strict place lifecycle', () => {
   const fsImpl = memoryFs();
   const journal = createJournal(fsImpl);
   const prepared = journal.create(placeFacts());
+  assert.equal(prepared.version, 2);
+  assert.equal(prepared.intentId, 'grid:run-1:20000:0:buy:open');
+  assert.equal(prepared.levelIndex, 0);
   assert.equal(prepared.stage, 'PREPARED');
   assert.equal(prepared.updatedAt, '2026-08-17T06:00:00.000Z');
   journal.advance('PREPARED', 'BROADCAST', { txHash: TX_HASH });
@@ -191,6 +199,12 @@ test('operation journal rejects unknown fields unsafe IDs malformed bytes32 and 
   })), /18 位小数/);
   assert.throws(() => createJournal().create(baseFacts({ kind: 'leverage', leverage: '2' })), /leverage/);
   assert.throws(() => createJournal().create(placeFacts({ symbol: 'ETHUSDT', symbolId: '20001' })), /只允许 BTCUSDT/);
+  assert.throws(() => createJournal().create(placeFacts({ intentId: '' })), /intentId/);
+  assert.throws(() => createJournal().create(placeFacts({ levelIndex: -1 })), /levelIndex/);
+  assert.throws(() => createJournal().create(placeFacts({ opening: false, reduceOnly: false })), /opening.*reduceOnly/);
+  assert.throws(() => createJournal().create(baseFacts({
+    kind: 'leverage', leverage: '1', intentId: 'not-allowed',
+  })), /不允许字段 intentId/);
 });
 
 test('operation journal records a bounded single-line error without changing stage', () => {
