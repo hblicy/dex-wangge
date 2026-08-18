@@ -1076,6 +1076,27 @@ export class GridBot {
       this._lastVanishAlertAt = now;
       this._alert(`⚠️ 挂单对账：交易所返回 0 单但本地跟踪 ${this.active.size} 单，疑似接口异常快照，本轮不清理（等待下轮复核）。`);
     }
+    const confirmAcceptedCancels = this.ex.requiresCancelConfirmation === true;
+    let confirmedCancelled = 0;
+    if (confirmAcceptedCancels && !massVanish) {
+      for (const [orderId, pending] of this._pendingCancelOrders) {
+        if (pending.marketId !== Number(this.config.marketId)) continue;
+        if (realIds.has(orderId)) {
+          pending.goneRecon = 0;
+          continue;
+        }
+        pending.goneRecon++;
+        if (pending.goneRecon === 1) {
+          this._alert(`挂单对账：订单 ${orderId} 第一次从交易所快照消失，等待连续确认。`);
+        }
+        if (pending.goneRecon < 2) continue;
+        this._pendingCancelOrders.delete(orderId);
+        this.active.delete(orderId);
+        this.ex.forgetOrder?.(orderId);
+        confirmedCancelled++;
+        this._alert(`挂单对账：订单 ${orderId} 已连续确认撤销，清除本地跟踪。`);
+      }
+    }
     let pruned = 0;
     if (!massVanish) {
       for (const [oid, info] of [...this.active]) {
@@ -1095,20 +1116,22 @@ export class GridBot {
     const occupied = new Set();
     let trimmed = 0, adopted = 0;
     for (const o of real) {
+      const orderId = String(o.orderId);
+      if (confirmAcceptedCancels && this._pendingCancelOrders.has(orderId)) continue;
       const px = Number(o.price);
       if (!Number.isFinite(px) || !(sp > 0)) continue;
       const idx = Math.round((px - lvl0) / sp);
       if (!(idx >= idxLo && idx < idxHi)) continue;
       if (!occupied.has(idx)) {
         occupied.add(idx);
-        if (!this.active.has(String(o.orderId))
+        if (!this.active.has(orderId)
             && ![...this.active.values()].some((a) => a.levelIndex === idx)) { // level truly unclaimed
           const side = o.side === 'buy' ? 'buy' : 'sell';
           // opening/closing heuristic (mirrors _handleFill's fallback): in short
           // mode buys close, otherwise sells close.
           const closing = recovery ? true : ((this.config.mode === 'short') ? side === 'buy' : side === 'sell');
           this.ex.adoptOrder?.({ orderId: o.orderId, marketId: this.config.marketId, levelIndex: idx, side, price: px, sizeBase: this.config.sizeBase });
-          this.active.set(String(o.orderId), { levelIndex: idx, side, price: px, opening: !closing, recovery, placedAt: now });
+          this.active.set(orderId, { levelIndex: idx, side, price: px, opening: !closing, recovery, placedAt: now });
           adopted++;
         }
         continue;
@@ -1116,7 +1139,14 @@ export class GridBot {
       try {
         const cancelled = await this.ex.cancelOrder(this.config.marketId, o.orderId);
         if (cancelled !== true) throw new Error(`重复挂单撤销未确认：${o.orderId}`);
-        this.active.delete(String(o.orderId));
+        if (confirmAcceptedCancels) {
+          this._pendingCancelOrders.set(orderId, {
+            marketId: Number(this.config.marketId), requestedAt: now, goneRecon: 0,
+          });
+          this._alert(`挂单对账：订单 ${orderId} 撤单请求已接受，等待交易所快照确认。`);
+        } else {
+          this.active.delete(orderId);
+        }
         trimmed++;
       } catch (error) {
         // Keep tracking and make the failed cleanup visible; the next cycle retries.
@@ -1132,8 +1162,8 @@ export class GridBot {
     // The grid is now maintained ONLY by the normal fill -> opposite-leg
     // replacement chain. Reconcile just keeps tracking accurate (prune) and
     // enforces one-order-per-level (trim). It never opens new positions.
-    if (pruned || trimmed || adopted) {
-      this._alert(`挂单对账：交易所实际 ${real.length} 单；清理失效 ${pruned}，撤除重复 ${trimmed}${adopted ? `，接管 ${adopted}` : ''}。`);
+    if (pruned || trimmed || adopted || confirmedCancelled) {
+      this._alert(`挂单对账：交易所实际 ${real.length} 单；清理失效 ${pruned}，提交重复单撤单 ${trimmed}，确认撤销 ${confirmedCancelled}${adopted ? `，接管 ${adopted}` : ''}。`);
       this._changed();
     }
   }

@@ -583,3 +583,33 @@ test('adapter health fields pass through while generic bot counters remain', () 
   assert.equal(health.placeFails, 0);
   assert.equal(Object.hasOwn(health, 'exchangeOpenOrders'), true);
 });
+
+test('reconcile does not resend an accepted Decibel duplicate cancellation', async () => {
+  const exchange = new FakeExchange();
+  exchange.requiresCancelConfirmation = true;
+  exchange.orders = new Map([
+    ['survivor', { price: 95, side: 'buy' }],
+    ['duplicate', { price: 95, side: 'buy' }],
+  ]);
+  let cancelCalls = 0;
+  exchange.cancelOrder = async () => { cancelCalls++; return true; };
+  const forgotten = [];
+  exchange.forgetOrder = (orderId) => forgotten.push(String(orderId));
+  const bot = new GridBot(exchange);
+  bot.running = true;
+  bot.config = { ...config };
+  bot.grid = { levels: [90, 95, 100, 105], spacing: 5, count: 4 };
+
+  await bot.reconcileOpenOrders();
+  await bot.reconcileOpenOrders();
+
+  assert.equal(cancelCalls, 1);
+  assert.equal(bot._pendingCancelOrders.has('duplicate'), true);
+
+  exchange.orders.delete('duplicate');
+  await bot.reconcileOpenOrders();
+  await bot.reconcileOpenOrders();
+
+  assert.deepEqual(forgotten, ['duplicate']);
+  assert.equal(bot._pendingCancelOrders.size, 0);
+});
