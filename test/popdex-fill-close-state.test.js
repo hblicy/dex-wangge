@@ -94,10 +94,10 @@ test('BTC leverage requires OneWay mode and one exact bounded entry', () => {
     positionMode: '1',
     symbolLeverages: [{ symbolId: '20000', leverage: '1' }],
   }), /OneWay.*0/);
-  assert.throws(() => exactBtcLeverage({
+  assert.equal(exactBtcLeverage({
     positionMode: '0',
     symbolLeverages: [],
-  }), /必须唯一/);
+  }), null);
   assert.throws(() => exactBtcLeverage({
     positionMode: '0',
     symbolLeverages: [{ symbolId: '20000', leverage: '0' }],

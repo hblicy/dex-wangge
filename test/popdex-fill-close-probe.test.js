@@ -77,7 +77,9 @@ function dependencies({
           vipLevel: '0',
           positionMode,
           bizPermissionCode: '0',
-          symbolLeverages: [{ symbolId: '20000', leverage }],
+          symbolLeverages: leverage === null
+            ? []
+            : [{ symbolId: '20000', leverage }],
           tokenLeverages: [],
         };
       },
@@ -148,6 +150,16 @@ test('fill-close dry-run verifies all facts and never signs broadcasts or writes
     'read:positions',
     'account:overview',
   ]);
+});
+
+test('fill-close dry-run treats a missing BTC leverage record as unconfigured', async () => {
+  const deps = dependencies({ leverage: null });
+  const result = await runProbe({ mode: 'dry-run' }, deps);
+  assert.equal(result.status, 'dry-run-ready');
+  assert.equal(result.currentLeverage, 'unset');
+  assert.equal(result.targetLeverage, '1');
+  assert.equal(deps.broadcasts, 0);
+  assert.equal(deps.calls.filter((call) => call.startsWith('write:simulate:')).length, 3);
 });
 
 test('fill-close dry-run fails before simulation on unsafe account facts', async () => {
