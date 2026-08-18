@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Wallet } from 'ethers';
 import {
+  main,
   parseArgs,
   runProbe,
 } from '../src/exchange/px/fill-close-probe.js';
@@ -401,4 +402,254 @@ test('fill-close live orchestration retains recovery state and never retries wri
   );
   assert.equal(residual.counts.closeCalls, 1);
   assert.equal(residual.journal.load().stage, 'CLOSE_BROADCAST');
+});
+
+function recoveryRecord(stage, overrides = {}) {
+  return {
+    stage,
+    mainAccount: MAIN_ACCOUNT,
+    agentAddress: AGENT,
+    symbol: 'BTCUSDT',
+    symbolId: '20000',
+    positionMode: '0',
+    leverage: '1',
+    priceWad: '63189000000000000000000',
+    qtyWad: '200000000000000',
+    clientOrderId: '0x64772d62622d3031303230333034303530363037303830393061306230630000',
+    orderId: ['PREPARED', 'LEVERAGE_BROADCAST', 'LEVERAGE_CONFIRMED', 'ENTRY_BROADCAST']
+      .includes(stage) ? null : '9',
+    positionId: ['POSITION_CONFIRMED', 'CLOSE_BROADCAST'].includes(stage) ? '7' : null,
+    leverageTxHash: stage === 'LEVERAGE_BROADCAST' ? `0x${'11'.repeat(32)}` : null,
+    entryTxHash: ['ENTRY_BROADCAST', 'ENTRY_SETTLING', 'REMAINDER_CANCEL_BROADCAST', 'POSITION_CONFIRMED', 'CLOSE_BROADCAST']
+      .includes(stage) ? `0x${'22'.repeat(32)}` : null,
+    cancelTxHash: stage === 'REMAINDER_CANCEL_BROADCAST' ? `0x${'33'.repeat(32)}` : null,
+    closeTxHash: stage === 'CLOSE_BROADCAST' ? `0x${'44'.repeat(32)}` : null,
+    filledQtyWad: ['POSITION_CONFIRMED', 'CLOSE_BROADCAST'].includes(stage)
+      ? '100000000000000' : null,
+    remainingQtyWad: ['POSITION_CONFIRMED', 'CLOSE_BROADCAST'].includes(stage) ? '0' : null,
+    positionQtyWad: ['POSITION_CONFIRMED', 'CLOSE_BROADCAST'].includes(stage)
+      ? '100000000000000' : null,
+    outcome: null,
+    lastError: null,
+    ...overrides,
+  };
+}
+
+function recoveryJournal(initial, flow) {
+  let record = structuredClone(initial);
+  return {
+    load() { return record; },
+    advance(expected, next, fields = {}) {
+      assert.equal(record.stage, expected);
+      record = { ...record, ...fields, stage: next };
+      flow.push(`journal:${next}`);
+      return record;
+    },
+    completeFailedEntry(hash) {
+      assert.equal(record.stage, 'ENTRY_BROADCAST');
+      assert.equal(record.entryTxHash, hash);
+      record = { ...record, stage: 'COMPLETED', outcome: 'safe-no-exposure' };
+      flow.push('journal:COMPLETED');
+      return record;
+    },
+    recordError(expected, error) {
+      assert.equal(record.stage, expected);
+      record = { ...record, lastError: String(error?.message ?? error) };
+      return record;
+    },
+    clearCompleted() {
+      assert.equal(record.stage, 'COMPLETED');
+      record = null;
+      flow.push('journal:clear');
+    },
+  };
+}
+
+function recoveryOrder({ filled = '0', remaining = '0.0002', cancelled = '0' } = {}) {
+  return {
+    walletId: MAIN_ACCOUNT,
+    orderId: '9',
+    clientOid: 'dw-bb-0102030405060708090a0b0c',
+    symbolId: '20000',
+    symbol: 'BTCUSDT',
+    side: 'Buy',
+    status: remaining === '0' ? (filled === '0' ? 'Cancelled' : 'PartiallyFilledCancelled') : 'NewAccept',
+    price: '63189',
+    qty: '0.0002',
+    filledQty: filled,
+    remainingQty: remaining,
+    cancelledQty: cancelled,
+    reduceOnly: false,
+  };
+}
+
+function recoveryDependencies(stage, {
+  receiptStatus = null,
+  order = null,
+  fills = [],
+  openOrders = [],
+  positions = [],
+  recordOverrides = {},
+} = {}) {
+  const flow = [];
+  const journal = recoveryJournal(recoveryRecord(stage, recordOverrides), flow);
+  let cancelCalls = 0;
+  let closeCalls = 0;
+  const deps = {
+    mainAccount: MAIN_ACCOUNT,
+    agentAddress: AGENT,
+    journal,
+    readRpc: {
+      async verifyChain() { flow.push('read:chain'); return 2184n; },
+      async getReceipt() {
+        return receiptStatus === null ? null : {
+          transactionHash: stage === 'CLOSE_BROADCAST' ? `0x${'44'.repeat(32)}`
+            : stage === 'REMAINDER_CANCEL_BROADCAST' ? `0x${'33'.repeat(32)}`
+              : stage === 'LEVERAGE_BROADCAST' ? `0x${'11'.repeat(32)}`
+                : `0x${'22'.repeat(32)}`,
+          status: receiptStatus,
+          logs: [],
+        };
+      },
+      async getAllOpenPositions() { return positions; },
+    },
+    accountClient: {
+      async findUniqueOrderByClientId() {
+        if (order) return order;
+        const error = new Error('not found');
+        error.code = 'POPDEX_ORDER_NOT_FOUND';
+        throw error;
+      },
+      async getAllFills() { return fills; },
+      async getAllOpenOrders() { return openOrders; },
+    },
+    trading: {
+      async cancelFillCloseRemainder(_plan, _order, targetJournal) {
+        cancelCalls += 1;
+        targetJournal.advance('ENTRY_SETTLING', 'REMAINDER_CANCEL_BROADCAST', {
+          cancelTxHash: `0x${'33'.repeat(32)}`,
+        });
+      },
+      async closeFillCloseLong(_plan, targetJournal) {
+        closeCalls += 1;
+        targetJournal.advance('POSITION_CONFIRMED', 'CLOSE_BROADCAST', {
+          closeTxHash: `0x${'44'.repeat(32)}`,
+        });
+      },
+    },
+  };
+  return {
+    deps,
+    journal,
+    flow,
+    get cancelCalls() { return cancelCalls; },
+    get closeCalls() { return closeCalls; },
+  };
+}
+
+test('plain recovery inspects every broadcast stage without invoking a write method', async () => {
+  const active = recoveryOrder();
+  const long = [{
+    walletId: MAIN_ACCOUNT,
+    positionId: '7',
+    symbolId: '20000',
+    side: '1',
+    holdSizeWad: '100000000000000',
+  }];
+  const cases = [
+    ['LEVERAGE_BROADCAST', {}],
+    ['ENTRY_BROADCAST', {}],
+    ['ENTRY_SETTLING', { order: active, openOrders: [active] }],
+    ['REMAINDER_CANCEL_BROADCAST', {}],
+    ['POSITION_CONFIRMED', { positions: long }],
+    ['CLOSE_BROADCAST', { positions: long }],
+  ];
+  for (const [stage, facts] of cases) {
+    const scenario = recoveryDependencies(stage, facts);
+    const result = await runProbe({ mode: 'resume' }, scenario.deps);
+    assert.ok(result.status);
+    assert.equal(scenario.cancelCalls, 0, stage);
+    assert.equal(scenario.closeCalls, 0, stage);
+  }
+});
+
+test('plain recovery safely clears pre-entry and exact failed-entry records only', async () => {
+  const prepared = recoveryDependencies('PREPARED');
+  assert.equal((await runProbe({ mode: 'resume' }, prepared.deps)).status, 'safe-no-exposure');
+  assert.equal(prepared.journal.load(), null);
+
+  const failedEntry = recoveryDependencies('ENTRY_BROADCAST', { receiptStatus: '0x0' });
+  assert.equal((await runProbe({ mode: 'resume' }, failedEntry.deps)).status, 'safe-no-exposure');
+  assert.equal(failedEntry.journal.load(), null);
+});
+
+test('recovery cancel requires the exact active entry and refuses an existing cancel hash', async () => {
+  const active = recoveryOrder();
+  const scenario = recoveryDependencies('ENTRY_SETTLING', {
+    order: active,
+    openOrders: [active],
+  });
+  assert.equal((await runProbe({ mode: 'resume-cancel' }, scenario.deps)).status, 'cancel-broadcast');
+  assert.equal(scenario.cancelCalls, 1);
+  assert.equal(scenario.journal.load().stage, 'REMAINDER_CANCEL_BROADCAST');
+
+  const existing = recoveryDependencies('REMAINDER_CANCEL_BROADCAST', {
+    order: active,
+    openOrders: [active],
+  });
+  await assert.rejects(runProbe({ mode: 'resume-cancel' }, existing.deps), /已经广播|普通 --resume/);
+  assert.equal(existing.cancelCalls, 0);
+});
+
+test('recovery close requires one exact long and refuses an existing close hash', async () => {
+  const long = [{
+    walletId: MAIN_ACCOUNT,
+    positionId: '7',
+    symbolId: '20000',
+    side: '1',
+    holdSizeWad: '100000000000000',
+  }];
+  const scenario = recoveryDependencies('POSITION_CONFIRMED', { positions: long });
+  assert.equal((await runProbe({ mode: 'resume-close' }, scenario.deps)).status, 'close-broadcast');
+  assert.equal(scenario.closeCalls, 1);
+  assert.equal(scenario.journal.load().stage, 'CLOSE_BROADCAST');
+
+  const existing = recoveryDependencies('CLOSE_BROADCAST', { positions: long });
+  await assert.rejects(runProbe({ mode: 'resume-close' }, existing.deps), /已经广播|普通 --resume/);
+  assert.equal(existing.closeCalls, 0);
+});
+
+test('recovery write modes reject conflicting order and position facts before writing', async () => {
+  const wrongOrder = recoveryOrder();
+  wrongOrder.clientOid = 'dw-bb-ffffffffffffffffffffffff';
+  const cancel = recoveryDependencies('ENTRY_SETTLING', {
+    order: wrongOrder,
+    openOrders: [wrongOrder],
+  });
+  await assert.rejects(runProbe({ mode: 'resume-cancel' }, cancel.deps), /订单身份不匹配|不属于本探针/);
+  assert.equal(cancel.cancelCalls, 0);
+
+  const close = recoveryDependencies('POSITION_CONFIRMED', {
+    positions: [{
+      walletId: MAIN_ACCOUNT,
+      positionId: '7',
+      symbolId: '20000',
+      side: '2',
+      holdSizeWad: '100000000000000',
+    }],
+  });
+  await assert.rejects(runProbe({ mode: 'resume-close' }, close.deps), /Long=1/);
+  assert.equal(close.closeCalls, 0);
+});
+
+test('recovery CLI renders no-record without accessing dry-run-only fields', async () => {
+  const lines = [];
+  const result = await main(['--resume'], {
+    journal: { load: () => null },
+    log: (line) => lines.push(line),
+    error: (line) => lines.push(line),
+  });
+  assert.deepEqual(result, { mode: 'resume', status: 'no-record' });
+  assert.match(lines.join('\n'), /resume.*no-record/);
+  process.exitCode = 0;
 });

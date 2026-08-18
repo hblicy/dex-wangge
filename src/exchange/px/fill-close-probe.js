@@ -28,6 +28,7 @@ import { strictAddress, strictDecimalString } from './normalize.js';
 import { POPDEX_ORDER_INTERFACE } from './order-codec.js';
 import { PopdexPublicClient } from './public-client.js';
 import { PopdexRpcClient } from './rpc-client.js';
+import { parseOrderCancelReceipt, parseOrderCreateReceipt } from './receipt-events.js';
 import { PopdexTradingClient, validateAgentAuthorization } from './trading-client.js';
 import { PopdexWriteRpcClient } from './write-rpc-client.js';
 
@@ -459,12 +460,271 @@ async function runFillClose(deps) {
   }
 }
 
+function recoveryPlan(record) {
+  return Object.freeze({
+    mainAccount: strictAddress(record.mainAccount, 'journal.mainAccount'),
+    symbol: record.symbol,
+    symbolId: record.symbolId,
+    side: 'buy',
+    leverage: record.leverage,
+    positionMode: record.positionMode,
+    positionSide: '1',
+    category: '2',
+    priceWad: record.priceWad,
+    qtyWad: record.qtyWad,
+    clientOrderId: record.clientOrderId,
+    closeData: POPDEX_REVERSE_INTERFACE.encodeFunctionData('placeReverseOrder', [
+      record.mainAccount,
+      20000,
+      1,
+    ]),
+  });
+}
+
+function exactRecoveryAccount(record, environment) {
+  if (record.mainAccount.toLowerCase() !== environment.mainAccount.toLowerCase()
+      || record.agentAddress.toLowerCase() !== environment.agentAddress.toLowerCase()) {
+    throw new Error('PopDEX 恢复记录账户或 Agent 与当前环境不匹配。');
+  }
+}
+
+async function optionalRecoveryOrder(accountClient, record) {
+  if (record.orderId === null) return null;
+  try {
+    return await accountClient.findUniqueOrderByClientId(
+      record.mainAccount,
+      record.symbol,
+      record.clientOrderId,
+    );
+  } catch (error) {
+    if (error?.code === 'POPDEX_ORDER_NOT_FOUND') return null;
+    throw error;
+  }
+}
+
+async function recoveryFacts({ accountClient, readRpc, record, cancelConfirmed = false }) {
+  const [order, fills, openOrders, positions] = await Promise.all([
+    optionalRecoveryOrder(accountClient, record),
+    accountClient.getAllFills(record.mainAccount, record.symbol),
+    accountClient.getAllOpenOrders(record.mainAccount, record.symbol),
+    readRpc.getAllOpenPositions(record.mainAccount),
+  ]);
+  return {
+    orderId: record.orderId,
+    order,
+    fills,
+    openOrders,
+    positions,
+    cancelConfirmed,
+  };
+}
+
+async function exactSavedReceipt(readRpc, record, field) {
+  const hash = record[field];
+  if (hash === null) return null;
+  const receipt = await readRpc.getReceipt(hash);
+  if (receipt === null) return null;
+  if (!receipt || typeof receipt !== 'object') {
+    throw new Error(`PopDEX ${field} 回执必须是对象或 null。`);
+  }
+  if (String(receipt.transactionHash).toLowerCase() !== hash.toLowerCase()) {
+    throw new Error(`PopDEX ${field} 回执 transactionHash 不匹配。`);
+  }
+  if (receipt.status !== '0x0' && receipt.status !== '0x1') {
+    throw new Error(`PopDEX ${field} 回执 status 必须是 0x0 或 0x1。`);
+  }
+  return receipt;
+}
+
+async function inspectRecovery({ record, journal, readRpc, accountClient }) {
+  const plan = recoveryPlan(record);
+  if (['PREPARED', 'LEVERAGE_BROADCAST', 'LEVERAGE_CONFIRMED'].includes(record.stage)) {
+    const facts = await recoveryFacts({ accountClient, readRpc, record });
+    assertInitialFlat(facts);
+    journal.advance(record.stage, 'COMPLETED', { outcome: 'safe-no-exposure' });
+    journal.clearCompleted();
+    return { status: 'safe-no-exposure', stage: record.stage, action: null, plan, facts };
+  }
+
+  if (record.stage === 'ENTRY_BROADCAST') {
+    const receipt = await exactSavedReceipt(readRpc, record, 'entryTxHash');
+    if (receipt === null) {
+      return { status: 'entry-receipt-pending', stage: record.stage, action: null, plan };
+    }
+    const facts = await recoveryFacts({ accountClient, readRpc, record });
+    if (receipt.status === '0x0') {
+      assertInitialFlat(facts);
+      journal.completeFailedEntry(record.entryTxHash);
+      journal.clearCompleted();
+      return { status: 'safe-no-exposure', stage: record.stage, action: null, plan, facts };
+    }
+    const receiptOrder = parseOrderCreateReceipt(receipt, {
+      account: record.mainAccount,
+      symbolId: record.symbolId,
+      clientOrderId: record.clientOrderId,
+      priceWad: record.priceWad,
+      qtyWad: record.qtyWad,
+    });
+    journal.advance('ENTRY_BROADCAST', 'ENTRY_SETTLING', { orderId: receiptOrder.orderId });
+    record = journal.load();
+  }
+
+  if (record.stage === 'REMAINDER_CANCEL_BROADCAST') {
+    const receipt = await exactSavedReceipt(readRpc, record, 'cancelTxHash');
+    if (receipt === null) {
+      return { status: 'cancel-receipt-pending', stage: record.stage, action: null, plan };
+    }
+    if (receipt.status === '0x0') {
+      return { status: 'cancel-receipt-failed', stage: record.stage, action: null, plan };
+    }
+    parseOrderCancelReceipt(receipt, {
+      account: record.mainAccount,
+      orderId: record.orderId,
+      clientOrderId: record.clientOrderId,
+    });
+  }
+
+  if (record.stage === 'CLOSE_BROADCAST') {
+    const receipt = await exactSavedReceipt(readRpc, record, 'closeTxHash');
+    if (receipt === null) {
+      return { status: 'close-receipt-pending', stage: record.stage, action: null, plan };
+    }
+    if (receipt.status === '0x0') {
+      return { status: 'close-receipt-failed', stage: record.stage, action: null, plan };
+    }
+    const facts = await recoveryFacts({ accountClient, readRpc, record });
+    try {
+      assertCompletedFlat(facts);
+    } catch {
+      return { status: 'close-confirmed-not-flat', stage: record.stage, action: null, plan, facts };
+    }
+    journal.advance('CLOSE_BROADCAST', 'COMPLETED', {
+      outcome: 'completed-flat',
+      positionQtyWad: '0',
+    });
+    journal.clearCompleted();
+    return { status: 'completed-flat', stage: record.stage, action: null, plan, facts };
+  }
+
+  const cancelConfirmed = record.stage === 'REMAINDER_CANCEL_BROADCAST';
+  const facts = await recoveryFacts({ accountClient, readRpc, record, cancelConfirmed });
+  if (record.stage === 'POSITION_CONFIRMED') {
+    assertConfirmedLong(plan, facts, record.filledQtyWad);
+    return { status: 'close-required', stage: record.stage, action: 'close', plan, facts };
+  }
+  const entry = classifyEntry(plan, facts);
+  if (entry.kind === 'settling') {
+    return { status: 'entry-facts-settling', stage: record.stage, action: null, plan, facts, entry };
+  }
+  if (entry.remainingQtyWad !== '0') {
+    return { status: 'cancel-required', stage: record.stage, action: 'cancel', plan, facts, entry };
+  }
+  if (entry.filledQtyWad === '0') {
+    journal.advance(record.stage, 'COMPLETED', {
+      outcome: 'zero-fill-cleared',
+      filledQtyWad: '0',
+      remainingQtyWad: '0',
+    });
+    journal.clearCompleted();
+    return { status: 'zero-fill-cleared', stage: record.stage, action: null, plan, facts, entry };
+  }
+  const position = assertConfirmedLong(plan, facts, entry.filledQtyWad);
+  journal.advance(record.stage, 'POSITION_CONFIRMED', {
+    filledQtyWad: entry.filledQtyWad,
+    remainingQtyWad: '0',
+    positionId: position.positionId,
+    positionQtyWad: position.holdSizeWad,
+  });
+  return {
+    status: 'close-required',
+    stage: 'POSITION_CONFIRMED',
+    action: 'close',
+    plan,
+    facts,
+    entry,
+  };
+}
+
+function recoveryJournal(deps) {
+  return deps.journal ?? new PopdexFillCloseJournal({
+    file: deps.journalFile ?? JOURNAL_FILE,
+    fsImpl: deps.fsImpl,
+    platform: deps.platform,
+    now: deps.now,
+  });
+}
+
+function recoveryTrading(deps, environment, readRpc, accountClient) {
+  if (deps.trading) return deps.trading;
+  if (typeof environment.agentPrivateKey !== 'string' || environment.agentPrivateKey.length === 0) {
+    throw new Error('PopDEX 恢复写入缺少 POPDEX_AGENT_PRIVATE_KEY。');
+  }
+  const writeRpc = deps.writeRpc ?? new PopdexWriteRpcClient(deps.writeRpcOptions);
+  return new PopdexTradingClient({
+    mainAccount: environment.mainAccount,
+    agentPrivateKey: environment.agentPrivateKey,
+    readRpc,
+    accountClient,
+    writeRpc,
+    now: deps.now,
+    sleep: deps.sleep,
+  });
+}
+
+async function runRecovery(mode, deps) {
+  const journal = recoveryJournal(deps);
+  const record = journal.load();
+  if (record === null) return { mode, status: 'no-record' };
+  if (mode === 'resume-cancel' && record.cancelTxHash !== null) {
+    throw new Error('PopDEX 撤单已经广播，请继续运行普通 --resume。');
+  }
+  if (mode === 'resume-close' && record.closeTxHash !== null) {
+    throw new Error('PopDEX 平仓已经广播，请继续运行普通 --resume。');
+  }
+  const environment = exactEnvironment(deps);
+  exactRecoveryAccount(record, environment);
+  const readRpc = deps.readRpc ?? new PopdexRpcClient(deps.readRpcOptions);
+  const accountClient = deps.accountClient ?? new PopdexAccountClient(deps.accountOptions);
+  await readRpc.verifyChain();
+  const inspected = await inspectRecovery({ record, journal, readRpc, accountClient });
+  if (mode === 'resume') return { mode, ...inspected };
+  if (mode === 'resume-cancel') {
+    const current = journal.load();
+    if (inspected.action !== 'cancel' || current?.stage !== 'ENTRY_SETTLING'
+        || current.cancelTxHash !== null || !inspected.facts?.order
+        || inspected.entry?.remainingQtyWad === '0') {
+      throw new Error('PopDEX 当前恢复事实不满足精确撤单条件。');
+    }
+    const trading = recoveryTrading(deps, environment, readRpc, accountClient);
+    await trading.cancelFillCloseRemainder(inspected.plan, {
+      orderId: current.orderId,
+      clientOrderId: current.clientOrderId,
+    }, journal);
+    return { mode, status: 'cancel-broadcast', orderId: current.orderId };
+  }
+  if (mode === 'resume-close') {
+    const current = journal.load();
+    if (inspected.action !== 'close' || current?.stage !== 'POSITION_CONFIRMED'
+        || current.closeTxHash !== null) {
+      throw new Error('PopDEX 当前恢复事实不满足精确平仓条件。');
+    }
+    assertConfirmedLong(inspected.plan, inspected.facts, current.positionQtyWad);
+    const trading = recoveryTrading(deps, environment, readRpc, accountClient);
+    await trading.closeFillCloseLong(inspected.plan, journal);
+    return { mode, status: 'close-broadcast', positionId: current.positionId };
+  }
+  throw new Error(`PopDEX 恢复模式 ${mode} 无效。`);
+}
+
 export async function runProbe(options, deps = {}) {
   if (!options || typeof options !== 'object' || typeof options.mode !== 'string') {
     throw new Error('PopDEX fill-close-probe options 无效。');
   }
   if (options.mode === 'dry-run') return runDryProbe(deps);
   if (options.mode === 'fill-close') return runFillClose(deps);
+  if (['resume', 'resume-cancel', 'resume-close'].includes(options.mode)) {
+    return runRecovery(options.mode, deps);
+  }
   throw new Error(`PopDEX fill-close-probe ${options.mode} 模式尚未实现。`);
 }
 
@@ -473,6 +733,15 @@ function maskedAddress(value) {
 }
 
 function render(result) {
+  if (result.mode.startsWith('resume')) {
+    return [
+      `PopDEX ${result.mode} status=${result.status}`,
+      ...(result.stage ? [`stage=${result.stage}`] : []),
+      ...(result.action ? [`requiredAction=${result.action}`] : []),
+      ...(result.orderId ? [`orderId=${result.orderId}`] : []),
+      ...(result.positionId ? [`positionId=${result.positionId}`] : []),
+    ];
+  }
   return [
     `PopDEX fill-close ${result.status}`,
     `market=${result.symbol} leverage=${result.currentLeverage}->${result.targetLeverage}`,
