@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { formatUnits, keccak256, parseUnits } from 'ethers';
-import { loadEnv } from '../../config.js';
+import { loadEnv, ROOT } from '../../config.js';
 import { PopdexAccountClient } from './account-client.js';
 import { deriveAgentAddress } from './agent.js';
 import {
@@ -11,7 +11,14 @@ import {
   prepareFillClosePlan,
   verifyStage5Simulation,
 } from './fill-close-codec.js';
-import { assertInitialFlat, exactBtcLeverage } from './fill-close-state.js';
+import {
+  assertCompletedFlat,
+  assertConfirmedLong,
+  assertInitialFlat,
+  classifyEntry,
+  exactBtcLeverage,
+} from './fill-close-state.js';
+import { PopdexFillCloseJournal } from './fill-close-journal.js';
 import {
   POPDEX_EXPECTED_MARKETS,
   POPDEX_ORDER_PRECOMPILE,
@@ -21,7 +28,7 @@ import { strictAddress, strictDecimalString } from './normalize.js';
 import { POPDEX_ORDER_INTERFACE } from './order-codec.js';
 import { PopdexPublicClient } from './public-client.js';
 import { PopdexRpcClient } from './rpc-client.js';
-import { validateAgentAuthorization } from './trading-client.js';
+import { PopdexTradingClient, validateAgentAuthorization } from './trading-client.js';
 import { PopdexWriteRpcClient } from './write-rpc-client.js';
 
 const FLAGS = new Set([
@@ -30,6 +37,7 @@ const FLAGS = new Set([
   '--confirm-mainnet-cancel',
   '--confirm-mainnet-close',
 ]);
+const JOURNAL_FILE = path.join(ROOT, '.popdex-fill-close-probe.json');
 
 export function parseArgs(argv) {
   if (!Array.isArray(argv)) throw new Error('PopDEX fill-close-probe argv 必须是数组。');
@@ -72,6 +80,7 @@ function exactEnvironment(deps) {
     return {
       mainAccount: strictAddress(deps.mainAccount, 'mainAccount'),
       agentAddress: strictAddress(deps.agentAddress, 'agentAddress'),
+      agentPrivateKey: deps.agentPrivateKey ?? null,
     };
   }
   if (deps.env === undefined) (deps.loadEnv ?? loadEnv)();
@@ -84,6 +93,7 @@ function exactEnvironment(deps) {
   return {
     mainAccount,
     agentAddress: deriveAgentAddress(env.POPDEX_AGENT_PRIVATE_KEY),
+    agentPrivateKey: env.POPDEX_AGENT_PRIVATE_KEY,
   };
 }
 
@@ -123,8 +133,8 @@ function assertCapacity(margin, plan) {
   return formatUnits(notionalWad, 18);
 }
 
-async function runDryProbe(deps) {
-  const { mainAccount, agentAddress } = exactEnvironment(deps);
+async function prepareReadContext(deps) {
+  const { mainAccount, agentAddress, agentPrivateKey } = exactEnvironment(deps);
   const readRpc = deps.readRpc ?? new PopdexRpcClient(deps.readRpcOptions);
   const writeRpc = deps.writeRpc ?? new PopdexWriteRpcClient(deps.writeRpcOptions);
   const publicClient = deps.publicClient ?? new PopdexPublicClient(deps.publicOptions);
@@ -153,6 +163,59 @@ async function runDryProbe(deps) {
     randomBytesImpl: deps.randomBytesImpl ?? randomBytes,
   });
   const notional = assertCapacity(margin, plan);
+  return {
+    mainAccount,
+    agentAddress,
+    agentPrivateKey,
+    readRpc,
+    writeRpc,
+    publicClient,
+    accountClient,
+    currentLeverage,
+    authorization,
+    margin,
+    notional,
+    plan,
+  };
+}
+
+function safeResult(context, mode, status) {
+  const {
+    mainAccount,
+    agentAddress,
+    currentLeverage,
+    authorization,
+    margin,
+    notional,
+    plan,
+  } = context;
+  return {
+    mode,
+    status,
+    symbol: plan.symbol,
+    symbolId: plan.symbolId,
+    currentLeverage,
+    targetLeverage: plan.leverage,
+    price: plan.price,
+    qty: plan.qty,
+    ask: plan.ask,
+    availableMargin: margin,
+    notional,
+    mainAccount,
+    agentAddress,
+    agentExpiresAt: authorization.expiresAt,
+    clientOrderId: plan.clientOrderId,
+    calldataHashes: {
+      leverage: keccak256(plan.leverageData),
+      entry: keccak256(plan.entryData),
+      close: keccak256(plan.closeData),
+    },
+  };
+}
+
+async function runDryProbe(deps) {
+  const context = await prepareReadContext(deps);
+  const { agentAddress, writeRpc, plan } = context;
   const simulations = [
     {
       to: POPDEX_USER_CONFIG_PRECOMPILE,
@@ -182,28 +245,218 @@ async function runDryProbe(deps) {
     });
     verifyStage5Simulation(raw, simulation.iface, simulation.name);
   }
+  return safeResult(context, 'dry-run', 'dry-run-ready');
+}
+
+async function readFacts({ accountClient, readRpc, mainAccount, plan, orderId, cancelConfirmed }) {
+  let order = null;
+  try {
+    order = await accountClient.findUniqueOrderByClientId(
+      mainAccount,
+      plan.symbol,
+      plan.clientOrderId,
+    );
+  } catch (error) {
+    if (error?.code !== 'POPDEX_ORDER_NOT_FOUND') throw error;
+  }
+  const [fills, openOrders, positions] = await Promise.all([
+    accountClient.getAllFills(mainAccount, plan.symbol),
+    accountClient.getAllOpenOrders(mainAccount, plan.symbol),
+    readRpc.getAllOpenPositions(mainAccount),
+  ]);
   return {
-    mode: 'dry-run',
-    status: 'dry-run-ready',
-    symbol: plan.symbol,
-    symbolId: plan.symbolId,
-    currentLeverage,
-    targetLeverage: plan.leverage,
-    price: plan.price,
-    qty: plan.qty,
-    ask: plan.ask,
-    availableMargin: margin,
-    notional,
+    orderId,
+    order,
+    fills,
+    openOrders,
+    positions,
+    cancelConfirmed,
+  };
+}
+
+async function pollUntil({ read, done, now, sleep, timeoutMs, pollMs, label }) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0
+      || !Number.isSafeInteger(pollMs) || pollMs <= 0) {
+    throw new Error('PopDEX 轮询超时和间隔必须是正安全整数。');
+  }
+  const startedAt = now();
+  if (!Number.isSafeInteger(startedAt) || startedAt < 0
+      || !Number.isSafeInteger(startedAt + timeoutMs)) {
+    throw new Error('PopDEX 轮询时钟必须返回非负安全整数。');
+  }
+  const deadline = startedAt + timeoutMs;
+  for (;;) {
+    const value = await read();
+    if (done(value)) return value;
+    if (now() >= deadline) {
+      throw new Error(`PopDEX ${label} 超过 ${timeoutMs}ms。`);
+    }
+    await sleep(pollMs);
+  }
+}
+
+async function runFillClose(deps) {
+  const journal = deps.journal ?? new PopdexFillCloseJournal({
+    file: deps.journalFile ?? JOURNAL_FILE,
+    fsImpl: deps.fsImpl,
+    platform: deps.platform,
+    now: deps.now,
+  });
+  const existing = journal.load();
+  if (existing !== null) {
+    throw new Error(
+      `PopDEX 已有 ${existing.stage} 恢复记录，请先运行 --resume。`,
+    );
+  }
+  const context = await prepareReadContext(deps);
+  const {
     mainAccount,
     agentAddress,
-    agentExpiresAt: authorization.expiresAt,
+    agentPrivateKey,
+    readRpc,
+    writeRpc,
+    accountClient,
+    currentLeverage,
+    plan,
+  } = context;
+  const now = deps.now ?? (() => Date.now());
+  const sleep = deps.sleep ?? ((milliseconds) => new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  }));
+  const timeoutMs = deps.pollTimeoutMs ?? 30000;
+  const pollMs = deps.pollMs ?? 1000;
+  let trading = deps.trading;
+  if (!trading) {
+    if (typeof agentPrivateKey !== 'string' || agentPrivateKey.length === 0) {
+      throw new Error('PopDEX 实盘成交平仓缺少 POPDEX_AGENT_PRIVATE_KEY。');
+    }
+    trading = new PopdexTradingClient({
+      mainAccount,
+      agentPrivateKey,
+      readRpc,
+      accountClient,
+      writeRpc,
+      now,
+      sleep,
+    });
+  }
+  journal.create({
+    mainAccount,
+    agentAddress,
+    symbol: plan.symbol,
+    symbolId: plan.symbolId,
+    positionMode: plan.positionMode,
+    leverage: plan.leverage,
+    priceWad: plan.priceWad,
+    qtyWad: plan.qtyWad,
     clientOrderId: plan.clientOrderId,
-    calldataHashes: {
-      leverage: keccak256(plan.leverageData),
-      entry: keccak256(plan.entryData),
-      close: keccak256(plan.closeData),
-    },
-  };
+  });
+  try {
+    if (currentLeverage === '1') {
+      journal.advance('PREPARED', 'LEVERAGE_CONFIRMED');
+    } else {
+      await trading.setBtcLeverageOne(plan, journal);
+    }
+    const entryOrder = await trading.placeFillCloseEntry(plan, journal);
+    const orderId = entryOrder.orderId;
+    const entryFacts = await pollUntil({
+      read: () => readFacts({
+        accountClient,
+        readRpc,
+        mainAccount,
+        plan,
+        orderId,
+        cancelConfirmed: false,
+      }),
+      done: (facts) => classifyEntry(plan, facts).kind !== 'settling',
+      now,
+      sleep,
+      timeoutMs,
+      pollMs,
+      label: '入场成交确认',
+    });
+    const entry = classifyEntry(plan, entryFacts);
+    if (entry.remainingQtyWad !== '0') {
+      await trading.cancelFillCloseRemainder(plan, {
+        orderId,
+        clientOrderId: plan.clientOrderId,
+      }, journal);
+    }
+    const settledFacts = await pollUntil({
+      read: () => readFacts({
+        accountClient,
+        readRpc,
+        mainAccount,
+        plan,
+        orderId,
+        cancelConfirmed: journal.load().stage === 'REMAINDER_CANCEL_BROADCAST',
+      }),
+      done: (facts) => {
+        const state = classifyEntry(plan, facts);
+        return state.kind !== 'settling'
+          && state.remainingQtyWad === '0'
+          && !facts.openOrders.some((item) => String(item.orderId) === String(orderId));
+      },
+      now,
+      sleep,
+      timeoutMs,
+      pollMs,
+      label: '入场终态确认',
+    });
+    const settled = classifyEntry(plan, settledFacts);
+    if (settled.filledQtyWad === '0') {
+      const stage = journal.load().stage;
+      journal.advance(stage, 'COMPLETED', {
+        outcome: 'zero-fill-cleared',
+        filledQtyWad: '0',
+        remainingQtyWad: '0',
+      });
+      journal.clearCompleted();
+      return {
+        ...safeResult(context, 'fill-close', 'zero-fill-cleared'),
+        orderId,
+      };
+    }
+    const position = assertConfirmedLong(plan, settledFacts, settled.filledQtyWad);
+    journal.advance(journal.load().stage, 'POSITION_CONFIRMED', {
+      filledQtyWad: settled.filledQtyWad,
+      remainingQtyWad: settled.remainingQtyWad,
+      positionId: position.positionId,
+      positionQtyWad: position.holdSizeWad,
+    });
+    await trading.closeFillCloseLong(plan, journal);
+    const flat = await pollUntil({
+      read: async () => ({
+        openOrders: await accountClient.getAllOpenOrders(mainAccount, plan.symbol),
+        positions: await readRpc.getAllOpenPositions(mainAccount),
+      }),
+      done: (facts) => facts.openOrders.length === 0
+        && facts.positions.every((item) => String(item.symbolId) !== '20000'
+          || BigInt(item.holdSizeWad) === 0n),
+      now,
+      sleep,
+      timeoutMs,
+      pollMs,
+      label: '平仓终态确认',
+    });
+    assertCompletedFlat(flat);
+    journal.advance('CLOSE_BROADCAST', 'COMPLETED', {
+      outcome: 'completed-flat',
+      positionQtyWad: '0',
+    });
+    journal.clearCompleted();
+    return {
+      ...safeResult(context, 'fill-close', 'completed-flat'),
+      orderId,
+      filledQtyWad: settled.filledQtyWad,
+    };
+  } catch (error) {
+    const current = journal.load();
+    if (current !== null && current.stage !== 'COMPLETED') {
+      journal.recordError(current.stage, error);
+    }
+    throw error;
+  }
 }
 
 export async function runProbe(options, deps = {}) {
@@ -211,6 +464,7 @@ export async function runProbe(options, deps = {}) {
     throw new Error('PopDEX fill-close-probe options 无效。');
   }
   if (options.mode === 'dry-run') return runDryProbe(deps);
+  if (options.mode === 'fill-close') return runFillClose(deps);
   throw new Error(`PopDEX fill-close-probe ${options.mode} 模式尚未实现。`);
 }
 
