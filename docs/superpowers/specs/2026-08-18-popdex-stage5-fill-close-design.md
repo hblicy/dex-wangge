@@ -2,6 +2,8 @@
 
 日期：2026-08-18
 
+> 主网验收修正（2026-08-18）：本设计中把 `PositionSide.Long=1` 直接传给 `placeReverseOrder` 的假设已被真实交易否定。交易回执以 `[15200] Invalid position side` 失败，且仓位未平；`eth_call` 对候选方向值均返回空成功，不能作为业务成功证明。真实成交和平仓 CLI 写入口现已暂停，后续必须以官方网页成功平仓交易的 calldata 和最终空仓事实重新确定协议。
+
 ## 目标
 
 在 PopDEX Mainnet 上完成第 5 阶段剩余验收：BTCUSDT 杠杆设置与回读、最小买入成交、剩余委托撤销、仓位确认以及整仓平仓。
@@ -19,7 +21,7 @@
 - 账户配置通过 `getAccountConfig(account)` 读取，其中 `symbolLeverages` 包含 `symbolId:uint16` 和 `leverage:uint8`。
 - 杠杆写入接口为 `updateLeverage(account, request)`；BTC 合约请求固定使用 `newLeverage=1`、`symbolId=20000`、`category=Futures(2)` 和零地址 `tokenAddress`。官方枚举明确为 `Spot=0`、`Margin=1`、`Futures=2`；订单类别 `Regular=0` 是另一枚举，禁止混用。
 - `LeverageUpdated` 事件包含账户、市场、杠杆、`succeeded` 和 `code`，可用于回执核验。
-- 平仓接口为 `placeReverseOrder(account, symbolId, positionSide)`；`PositionSide.Long=1`、`PositionSide.Short=2`。
+- 官方 ABI 声明平仓接口为 `placeReverseOrder(account, symbolId, positionSide)`；枚举中存在 `Net=0`、`Long=1`、`Short=2`，但 OneWay 仓位应传哪个值尚未获得成功主网交易证明，禁止从持仓返回的 `side=1` 直接推断写入参数。
 - 官方仓位分页包含 `symbolId`、`side`、`holdSizeWad`、`closeSizeWad` 和 `lockedSizeWad`，所有大整数必须以字符串处理。
 - 已验收的 Agent 签名、写 RPC、订单回执、订单分页和恢复机制可以作为底层能力复用。
 

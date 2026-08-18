@@ -16,14 +16,18 @@ const NOW = 1787032800000;
 
 test('fill-close CLI accepts only explicit non-overlapping modes', () => {
   assert.deepEqual(parseArgs([]), { mode: 'dry-run' });
-  assert.deepEqual(parseArgs(['--confirm-mainnet-fill-close']), { mode: 'fill-close' });
   assert.deepEqual(parseArgs(['--resume']), { mode: 'resume' });
   assert.deepEqual(parseArgs(['--resume', '--confirm-mainnet-cancel']), {
     mode: 'resume-cancel',
   });
-  assert.deepEqual(parseArgs(['--resume', '--confirm-mainnet-close']), {
-    mode: 'resume-close',
-  });
+  assert.throws(
+    () => parseArgs(['--confirm-mainnet-fill-close']),
+    /主网平仓原语.*暂停/,
+  );
+  assert.throws(
+    () => parseArgs(['--resume', '--confirm-mainnet-close']),
+    /主网平仓原语.*暂停/,
+  );
   assert.throws(() => parseArgs(['--confirm-mainnet-write']), /不支持参数/);
   assert.throws(
     () => parseArgs(['--resume', '--confirm-mainnet-fill-close']),
@@ -601,6 +605,29 @@ test('plain recovery safely clears pre-entry and exact failed-entry records only
   const failedEntry = recoveryDependencies('ENTRY_BROADCAST', { receiptStatus: '0x0' });
   assert.equal((await runProbe({ mode: 'resume' }, failedEntry.deps)).status, 'safe-no-exposure');
   assert.equal(failedEntry.journal.load(), null);
+});
+
+test('failed close receipt clears the journal only after read-only facts prove manual flat', async () => {
+  const flat = recoveryDependencies('CLOSE_BROADCAST', { receiptStatus: '0x0' });
+  const result = await runProbe({ mode: 'resume' }, flat.deps);
+  assert.equal(result.status, 'completed-flat-manual');
+  assert.equal(flat.closeCalls, 0);
+  assert.equal(flat.journal.load(), null);
+
+  const long = recoveryDependencies('CLOSE_BROADCAST', {
+    receiptStatus: '0x0',
+    positions: [{
+      walletId: MAIN_ACCOUNT,
+      positionId: '7',
+      symbolId: '20000',
+      side: '1',
+      holdSizeWad: '100000000000000',
+    }],
+  });
+  const unresolved = await runProbe({ mode: 'resume' }, long.deps);
+  assert.equal(unresolved.status, 'close-receipt-failed');
+  assert.equal(long.closeCalls, 0);
+  assert.equal(long.journal.load().stage, 'CLOSE_BROADCAST');
 });
 
 test('leverage broadcast recovery waits for its receipt and verifies success before clearing', async () => {

@@ -69,12 +69,16 @@ export function parseArgs(argv) {
   if (fillClose && argv.length !== 1) {
     throw new Error('PopDEX --confirm-mainnet-fill-close 不能与其他参数组合。');
   }
+  if (fillClose || close) {
+    throw new Error(
+      'PopDEX 主网平仓原语尚未通过真实成交验证，相关写入已暂停；请勿继续自动开仓或自动平仓。',
+    );
+  }
   if (resume) {
     if (cancel) return { mode: 'resume-cancel' };
-    if (close) return { mode: 'resume-close' };
     return { mode: 'resume' };
   }
-  return { mode: fillClose ? 'fill-close' : 'dry-run' };
+  return { mode: 'dry-run' };
 }
 
 function exactEnvironment(deps) {
@@ -610,7 +614,31 @@ async function inspectRecovery({ record, journal, readRpc, accountClient }) {
       return { status: 'close-receipt-pending', stage: record.stage, action: null, plan };
     }
     if (receipt.status === '0x0') {
-      return { status: 'close-receipt-failed', stage: record.stage, action: null, plan };
+      const facts = await recoveryFacts({ accountClient, readRpc, record });
+      try {
+        assertCompletedFlat(facts);
+      } catch (cause) {
+        return {
+          status: 'close-receipt-failed',
+          stage: record.stage,
+          action: null,
+          plan,
+          facts,
+          reason: cause instanceof Error ? cause.message : String(cause),
+        };
+      }
+      journal.advance('CLOSE_BROADCAST', 'COMPLETED', {
+        outcome: 'completed-flat',
+        positionQtyWad: '0',
+      });
+      journal.clearCompleted();
+      return {
+        status: 'completed-flat-manual',
+        stage: record.stage,
+        action: null,
+        plan,
+        facts,
+      };
     }
     const facts = await recoveryFacts({ accountClient, readRpc, record });
     try {
@@ -760,6 +788,7 @@ function render(result) {
       ...(result.action ? [`requiredAction=${result.action}`] : []),
       ...(result.orderId ? [`orderId=${result.orderId}`] : []),
       ...(result.positionId ? [`positionId=${result.positionId}`] : []),
+      ...(result.reason ? [`reason=${result.reason}`] : []),
     ];
   }
   return [
