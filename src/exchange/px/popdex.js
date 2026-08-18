@@ -1,7 +1,15 @@
 import { EventEmitter } from 'node:events';
+import { randomBytes } from 'node:crypto';
 import { encodeBytes32String, formatUnits, parseUnits } from 'ethers';
 import { POPDEX_EXPECTED_MARKETS } from './constants.js';
+import {
+  createBtcCloseClientOrderId,
+  parseLeverageUpdatedReceipt,
+} from './fill-close-codec.js';
+import { classifyClose, exactBtcLeverage } from './fill-close-state.js';
 import { strictAddress, strictDecimalString, strictIntegerString } from './normalize.js';
+import { prepareLimitOrder } from './order-codec.js';
+import { parseOrderCancelReceipt, parseOrderCreateReceipt } from './receipt-events.js';
 
 const MARKET_IDS = Object.freeze({ BTCUSDT: 20000, ETHUSDT: 20001 });
 const SYMBOLS = Object.freeze(['BTCUSDT', 'ETHUSDT']);
@@ -398,6 +406,9 @@ export class PopdexExchange extends EventEmitter {
     this.realizedPnl = 0;
     this.refreshPromise = null;
     this.timer = null;
+    this.ownedOrders = new Map();
+    this.writeTail = Promise.resolve();
+    this.lastQueueError = null;
   }
 
   #setState(state, reason = null) {
@@ -416,17 +427,120 @@ export class PopdexExchange extends EventEmitter {
     return id;
   }
 
-  async #buildSnapshot(checkJournal) {
-    if (checkJournal) {
-      const recovery = await atStage('journal-recovery', '恢复日志检查', async () => this.journal.load());
-      if (recovery !== null) {
-        const error = new Error(
-          `发现未完成 ${String(recovery.kind)} 操作 stage=${String(recovery.stage)}，需要只读恢复。`,
-        );
-        error.stage = 'journal-recovery';
-        throw error;
-      }
+  #assertLiveWriteMarket(marketId, operation) {
+    const id = this.#assertMarket(marketId);
+    if (id === MARKET_IDS.ETHUSDT) {
+      throw new Error(`PopDEX ETHUSDT ${operation}实盘写操作尚未开放。`);
     }
+    if (id !== MARKET_IDS.BTCUSDT) {
+      throw new Error(`PopDEX market ${id} ${operation}实盘写操作不受支持。`);
+    }
+    return id;
+  }
+
+  #assertReadyForWrite(operation) {
+    const health = this.getHealth();
+    if (health.state !== 'READY' || health.status !== 'ok') {
+      throw new Error(
+        `PopDEX ${operation}被拒绝：当前状态 ${health.state}`
+        + `${health.stale ? '，官方快照已过期' : ''}。`,
+      );
+    }
+    if (!this.snapshot.authorization) {
+      throw new Error(`PopDEX ${operation}被拒绝：缺少已验证 Agent 授权。`);
+    }
+  }
+
+  #writeIdentity(kind, fields = {}) {
+    return {
+      kind,
+      mainAccount: this.mainAccount,
+      agentAddress: this.snapshot.authorization.agent,
+      symbol: 'BTCUSDT',
+      symbolId: '20000',
+      ...fields,
+    };
+  }
+
+  #haltWrite(operation, error) {
+    this.lastErrorStage = `write-${operation}`;
+    this.lastErrorMessage = sanitizeError(error);
+    this.#setState('HALTED', this.lastErrorMessage);
+    this.emit('fault', error);
+  }
+
+  #finishPreparedAfterFailure() {
+    const record = this.journal.load();
+    if (record?.stage !== 'PREPARED') return;
+    this.journal.completePreparedWithoutBroadcast('safe-no-broadcast');
+    this.journal.clearConfirmed();
+  }
+
+  #enqueueWrite(operation, task) {
+    const run = this.writeTail.then(async () => {
+      this.#assertReadyForWrite(operation);
+      this.writeInFlight = operation;
+      try {
+        const result = await task();
+        this.lastQueueError = null;
+        return result;
+      } catch (originalError) {
+        let error = originalError;
+        try {
+          this.#finishPreparedAfterFailure();
+        } catch (journalError) {
+          error = new AggregateError(
+            [originalError, journalError],
+            `PopDEX ${operation}失败，且 PREPARED 日志安全清理失败。`,
+          );
+        }
+        this.#haltWrite(operation, error);
+        throw error;
+      } finally {
+        this.writeInFlight = false;
+      }
+    });
+    this.writeTail = run.catch((error) => {
+      this.lastQueueError = sanitizeError(error);
+    });
+    return run;
+  }
+
+  async #refreshAndClearConfirmed(operation) {
+    try {
+      await this.refresh();
+    } catch (error) {
+      throw stageError(`write-${operation}-refresh`, '写后官方快照刷新', error);
+    }
+    this.journal.clearConfirmed();
+  }
+
+  #officialOrder(marketId, orderId) {
+    return this.snapshot.orders.get(marketId)?.get(String(orderId)) ?? null;
+  }
+
+  async #cancelOwnedOrder(owned) {
+    const official = this.#officialOrder(MARKET_IDS.BTCUSDT, owned.orderId);
+    if (official === null) {
+      throw new Error(`PopDEX 订单 ${owned.orderId} 不在当前官方活动订单中，拒绝盲目撤单。`);
+    }
+    if (official.clientOrderId !== owned.clientOrderId) {
+      throw new Error(`PopDEX 订单 ${owned.orderId} clientOrderId 与所有权记录冲突。`);
+    }
+    this.journal.create(this.#writeIdentity('cancel', {
+      orderId: official.orderId,
+      clientOrderId: official.clientOrderId,
+    }));
+    await this.tradingClient.cancelAdapterOrder({
+      ...official,
+      side: official.side === 'buy' ? '0' : '1',
+      isReduceOnly: false,
+    }, this.journal);
+    this.ownedOrders.delete(official.orderId);
+    await this.#refreshAndClearConfirmed('cancel');
+  }
+
+  async #buildSnapshot() {
     const marketList = await atStage(
       'public-refresh',
       '公共市场刷新',
@@ -489,6 +603,165 @@ export class PopdexExchange extends EventEmitter {
     };
   }
 
+  #validateRecoveryIdentity(record, authorization) {
+    if (!record || typeof record !== 'object') {
+      throw new Error('PopDEX 恢复记录必须是对象。');
+    }
+    const mainAccount = strictAddress(record.mainAccount, 'recovery.mainAccount');
+    const agentAddress = strictAddress(record.agentAddress, 'recovery.agentAddress');
+    if (!sameAddress(mainAccount, this.mainAccount)
+        || !sameAddress(agentAddress, authorization.agent)) {
+      throw new Error('PopDEX 恢复记录账户或 Agent 身份与当前授权不匹配。');
+    }
+    if (record.symbol !== 'BTCUSDT' || record.symbolId !== '20000') {
+      throw new Error('PopDEX 恢复记录只允许 BTCUSDT symbolId=20000。');
+    }
+  }
+
+  async #exactRecoveryReceipt(record) {
+    const receipt = await this.readRpc.getReceipt(record.txHash);
+    if (receipt === null) {
+      throw new Error(`PopDEX BROADCAST ${record.kind} 回执不可用：txHash=${record.txHash}。`);
+    }
+    if (!receipt || typeof receipt !== 'object'
+        || typeof receipt.transactionHash !== 'string'
+        || receipt.transactionHash.toLowerCase() !== record.txHash.toLowerCase()) {
+      throw new Error(`PopDEX BROADCAST ${record.kind} 回执交易哈希冲突。`);
+    }
+    if (receipt.status !== '0x1') {
+      throw new Error(`PopDEX BROADCAST ${record.kind} 回执未成功：status=${String(receipt.status)}。`);
+    }
+    return receipt;
+  }
+
+  async #recoverPlace(record, receipt) {
+    const order = parseOrderCreateReceipt(receipt, {
+      account: record.mainAccount,
+      symbolId: record.symbolId,
+      clientOrderId: record.clientOrderId,
+      priceWad: decimalWad(record.price, 'recovery.place.price').toString(),
+      qtyWad: decimalWad(record.qty, 'recovery.place.qty').toString(),
+    });
+    const official = exactOpenOrder(
+      await this.accountClient.findUniqueOrderByClientId(
+        this.mainAccount,
+        'BTCUSDT',
+        record.clientOrderId,
+      ),
+      'BTCUSDT',
+      this.mainAccount,
+      0,
+    );
+    if (official.orderId !== order.orderId
+        || official.clientOrderId !== record.clientOrderId
+        || official.side !== record.side
+        || official.price !== Number(record.price)
+        || official.sizeBase !== Number(record.qty)) {
+      throw new Error('PopDEX BROADCAST place 官方订单身份冲突。');
+    }
+    this.journal.advance('BROADCAST', 'CONFIRMED', { orderId: order.orderId });
+  }
+
+  async #recoverCancel(record, receipt) {
+    parseOrderCancelReceipt(receipt, {
+      account: record.mainAccount,
+      orderId: record.orderId,
+      clientOrderId: record.clientOrderId,
+    });
+    let official = null;
+    try {
+      official = await this.accountClient.findUniqueOrderByClientId(
+        this.mainAccount,
+        'BTCUSDT',
+        record.clientOrderId,
+      );
+    } catch (error) {
+      if (error?.code !== 'POPDEX_ORDER_NOT_FOUND') throw error;
+    }
+    if (official !== null) {
+      if (String(official.orderId) !== record.orderId
+          || !['Cancelled', 'PartiallyFilledCancelled'].includes(official.status)
+          || decimalWad(official.filledQty, 'recovery.cancel.filledQty') !== 0n
+          || decimalWad(official.remainingQty, 'recovery.cancel.remainingQty') !== 0n) {
+        throw new Error('PopDEX BROADCAST cancel 官方订单终态冲突。');
+      }
+    } else {
+      const [fills, positions] = await Promise.all([
+        this.accountClient.getAllFills(this.mainAccount, 'BTCUSDT'),
+        this.readRpc.getAllOpenPositions(this.mainAccount),
+      ]);
+      if (!Array.isArray(fills) || !Array.isArray(positions)) {
+        throw new Error('PopDEX BROADCAST cancel 官方成交或仓位快照无效。');
+      }
+      if (fills.some((fill) => String(fill?.orderId) === record.orderId)) {
+        throw new Error('PopDEX BROADCAST cancel 订单已经发生成交。');
+      }
+      if (positions.some((position) => String(position?.symbolId) === '20000'
+          && BigInt(strictIntegerString(position.holdSizeWad, 'recovery.position.holdSizeWad')) > 0n)) {
+        throw new Error('PopDEX BROADCAST cancel 后 BTCUSDT 仍有仓位。');
+      }
+    }
+    this.journal.advance('BROADCAST', 'CONFIRMED');
+  }
+
+  async #recoverClose(record, receipt) {
+    const closeQtyWad = decimalWad(record.qty, 'recovery.close.qty').toString();
+    const order = parseOrderCreateReceipt(receipt, {
+      account: record.mainAccount,
+      symbolId: record.symbolId,
+      clientOrderId: record.closeClientOrderId,
+      priceWad: '0',
+      priceRule: 'positive-execution',
+      qtyWad: closeQtyWad,
+    });
+    const [fills, openOrders, positions] = await Promise.all([
+      this.accountClient.getAllFills(this.mainAccount, 'BTCUSDT'),
+      this.accountClient.getAllOpenOrders(this.mainAccount, 'BTCUSDT'),
+      this.readRpc.getAllOpenPositions(this.mainAccount),
+    ]);
+    const result = classifyClose({
+      mainAccount: this.mainAccount,
+      closeOrderId: order.orderId,
+      closeQtyWad,
+      closeClientOrderId: record.closeClientOrderId,
+    }, { fills, openOrders, positions });
+    if (result.kind !== 'completed-flat') {
+      throw new Error(
+        `PopDEX BROADCAST close 官方终态未确认：kind=${result.kind} `
+        + `remaining=${result.remainingPositionQtyWad}。`,
+      );
+    }
+    this.journal.advance('BROADCAST', 'CONFIRMED', { closeOrderId: order.orderId });
+  }
+
+  async #recoverOperation(record, authorization) {
+    this.#validateRecoveryIdentity(record, authorization);
+    if (record.stage === 'CONFIRMED') return;
+    if (record.stage === 'PREPARED') {
+      if (record.txHash !== null) {
+        throw new Error('PopDEX PREPARED 恢复记录不能包含 txHash。');
+      }
+      this.journal.completePreparedWithoutBroadcast('safe-no-broadcast');
+      return;
+    }
+    if (record.stage !== 'BROADCAST' || typeof record.txHash !== 'string') {
+      throw new Error(`PopDEX 恢复阶段 ${String(record.stage)} 无效。`);
+    }
+    const receipt = await this.#exactRecoveryReceipt(record);
+    if (record.kind === 'leverage') {
+      parseLeverageUpdatedReceipt(receipt, { mainAccount: record.mainAccount });
+      if (exactBtcLeverage(await this.readRpc.getAccountConfig(this.mainAccount)) !== '1') {
+        throw new Error('PopDEX BROADCAST leverage 官方回读不是 BTCUSDT 1x。');
+      }
+      this.journal.advance('BROADCAST', 'CONFIRMED');
+      return;
+    }
+    if (record.kind === 'place') return this.#recoverPlace(record, receipt);
+    if (record.kind === 'cancel') return this.#recoverCancel(record, receipt);
+    if (record.kind === 'close') return this.#recoverClose(record, receipt);
+    throw new Error(`PopDEX 恢复操作 kind ${String(record.kind)} 无效。`);
+  }
+
   #publish(candidate) {
     const now = exactNow(this.now);
     this.snapshot = {
@@ -517,14 +790,35 @@ export class PopdexExchange extends EventEmitter {
       throw new Error('PopDEX 当前为 HALTED，必须人工重连。');
     }
     this.#setState('RECONCILING', reason);
+    let recoveryRecord = null;
     try {
-      this.#publish(await this.#buildSnapshot(checkJournal));
+      if (checkJournal) {
+        recoveryRecord = await atStage(
+          'journal-recovery',
+          '恢复日志读取',
+          async () => this.journal.load(),
+        );
+      }
+      let candidate = await this.#buildSnapshot();
+      if (recoveryRecord !== null) {
+        await atStage(
+          'journal-recovery',
+          '只读恢复',
+          () => this.#recoverOperation(recoveryRecord, candidate.authorization),
+        );
+        candidate = await this.#buildSnapshot();
+      }
+      this.#publish(candidate);
+      if (recoveryRecord !== null) {
+        await atStage('journal-recovery', '恢复日志清理', async () => this.journal.clearConfirmed());
+      }
       return this;
     } catch (error) {
       this.lastErrorStage = error?.stage ?? 'reconcile';
       this.lastErrorMessage = sanitizeError(error);
       if (this.lastPublicOkAt === 0) this.dataSource = null;
-      this.#setState(isTransient(error) ? 'RECONCILING' : 'HALTED', this.lastErrorMessage);
+      const nextState = recoveryRecord !== null || !isTransient(error) ? 'HALTED' : 'RECONCILING';
+      this.#setState(nextState, this.lastErrorMessage);
       throw error;
     }
   }
@@ -590,20 +884,81 @@ export class PopdexExchange extends EventEmitter {
     return this.snapshot.tickers.get(id).mark;
   }
 
-  async setLeverage() {
-    throw new Error('PopDEX Stage 6 live 写操作尚未实现。');
+  async setLeverage(marketId, leverage) {
+    this.#assertLiveWriteMarket(marketId, '设置杠杆');
+    if (leverage !== 1 && leverage !== '1') {
+      throw new Error('PopDEX BTCUSDT 实盘只允许设置 1x 杠杆。');
+    }
+    return this.#enqueueWrite('set-leverage', async () => {
+      this.journal.create(this.#writeIdentity('leverage', { leverage: '1' }));
+      await this.tradingClient.setAdapterBtcLeverageOne(this.journal);
+      await this.#refreshAndClearConfirmed('set-leverage');
+      return true;
+    });
   }
 
-  async placeLimitOrder() {
-    throw new Error('PopDEX Stage 6 live 写操作尚未实现。');
+  async placeLimitOrder({ marketId, side, price, sizeBase, reduceOnly = false } = {}) {
+    this.#assertLiveWriteMarket(marketId, '限价下单');
+    if (reduceOnly !== false) {
+      throw new Error('PopDEX 限价单 reduce-only 实盘写操作尚未开放。');
+    }
+    const ticker = this.snapshot.tickers.get(MARKET_IDS.BTCUSDT);
+    const plan = prepareLimitOrder({
+      mainAccount: this.mainAccount,
+      symbol: 'BTCUSDT',
+      side,
+      price: String(price),
+      qty: String(sizeBase),
+      bid: String(ticker.bid),
+      ask: String(ticker.ask),
+      randomBytesImpl: randomBytes,
+      nowMs: exactNow(this.now),
+    });
+    return this.#enqueueWrite('place-limit-order', async () => {
+      this.journal.create(this.#writeIdentity('place', {
+        side: plan.side,
+        price: plan.price,
+        qty: plan.qty,
+        clientOrderId: plan.clientOrderId,
+      }));
+      const order = await this.tradingClient.placeAdapterOrder(plan, this.journal);
+      const owned = {
+        orderId: String(order.orderId),
+        marketId: MARKET_IDS.BTCUSDT,
+        clientOrderId: plan.clientOrderId,
+        side: plan.side,
+        price: Number(plan.price),
+        sizeBase: Number(plan.qty),
+        levelIndex: null,
+      };
+      this.ownedOrders.set(owned.orderId, owned);
+      await this.#refreshAndClearConfirmed('place-limit-order');
+      return { orderId: owned.orderId };
+    });
   }
 
-  async cancelOrder() {
-    throw new Error('PopDEX Stage 6 live 写操作尚未实现。');
+  async cancelOrder(marketId, orderId) {
+    this.#assertLiveWriteMarket(marketId, '撤单');
+    const id = String(orderId);
+    return this.#enqueueWrite('cancel-order', async () => {
+      const owned = this.ownedOrders.get(id);
+      if (!owned || owned.marketId !== MARKET_IDS.BTCUSDT) {
+        throw new Error(`PopDEX 订单 ${id} 不属于适配器，拒绝撤单。`);
+      }
+      await this.#cancelOwnedOrder(owned);
+      return true;
+    });
   }
 
-  async cancelAll() {
-    throw new Error('PopDEX Stage 6 live 写操作尚未实现。');
+  async cancelAll(marketId) {
+    this.#assertLiveWriteMarket(marketId, '批量撤单');
+    return this.#enqueueWrite('cancel-all', async () => {
+      const owned = [...this.ownedOrders.values()]
+        .filter((entry) => entry.marketId === MARKET_IDS.BTCUSDT)
+        .filter((entry) => this.#officialOrder(MARKET_IDS.BTCUSDT, entry.orderId) !== null);
+      for (const order of owned) await this.#cancelOwnedOrder(order);
+      return true;
+    });
   }
 
   getOpenOrders(marketId) {
@@ -618,8 +973,55 @@ export class PopdexExchange extends EventEmitter {
     return this.getOpenOrders(id);
   }
 
-  adoptOrder() {
-    throw new Error('PopDEX Stage 6 live 订单接管尚未实现。');
+  adoptOrder(metadata) {
+    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+      throw new Error('PopDEX adoptOrder 必须提供完整订单元数据。');
+    }
+    const required = ['orderId', 'marketId', 'clientOrderId', 'side', 'price', 'sizeBase', 'levelIndex'];
+    if (required.some((field) => metadata[field] === undefined || metadata[field] === null)) {
+      throw new Error('PopDEX adoptOrder 必须提供完整订单元数据。');
+    }
+    const marketId = this.#assertLiveWriteMarket(metadata.marketId, '订单接管');
+    const orderId = String(metadata.orderId);
+    const official = this.#officialOrder(marketId, orderId);
+    if (official === null) {
+      throw new Error(`PopDEX adoptOrder 官方活动订单 ${orderId} 不存在。`);
+    }
+    if (typeof metadata.clientOrderId !== 'string'
+        || !/^0x[0-9a-fA-F]{64}$/.test(metadata.clientOrderId)) {
+      throw new Error('PopDEX adoptOrder clientOrderId 必须是 bytes32。');
+    }
+    const clientOrderId = metadata.clientOrderId.toLowerCase();
+    if (official.clientOrderId !== clientOrderId) {
+      throw new Error('PopDEX adoptOrder clientOrderId 与官方订单冲突。');
+    }
+    if (metadata.side !== official.side) {
+      throw new Error('PopDEX adoptOrder side 与官方订单冲突。');
+    }
+    if (decimalWad(String(metadata.price), 'adoptOrder.price').toString() !== official.priceWad) {
+      throw new Error('PopDEX adoptOrder price 与官方订单冲突。');
+    }
+    if (decimalWad(String(metadata.sizeBase), 'adoptOrder.sizeBase').toString() !== official.qtyWad) {
+      throw new Error('PopDEX adoptOrder sizeBase 与官方订单冲突。');
+    }
+    if (!Number.isSafeInteger(metadata.levelIndex) || metadata.levelIndex < 0) {
+      throw new Error('PopDEX adoptOrder levelIndex 必须是非负安全整数。');
+    }
+    const adopted = {
+      orderId,
+      marketId,
+      clientOrderId,
+      side: metadata.side,
+      price: Number(metadata.price),
+      sizeBase: Number(metadata.sizeBase),
+      levelIndex: metadata.levelIndex,
+    };
+    const existing = this.ownedOrders.get(orderId);
+    if (existing && JSON.stringify(existing) !== JSON.stringify(adopted)) {
+      throw new Error(`PopDEX adoptOrder 订单 ${orderId} 与已有所有权记录冲突。`);
+    }
+    this.ownedOrders.set(orderId, adopted);
+    return { ...adopted };
   }
 
   getPosition(marketId) {
@@ -628,8 +1030,35 @@ export class PopdexExchange extends EventEmitter {
     return position ? { ...position } : null;
   }
 
-  async closePosition() {
-    throw new Error('PopDEX Stage 6 live 写操作尚未实现。');
+  async closePosition(marketId) {
+    this.#assertLiveWriteMarket(marketId, '平仓');
+    return this.#enqueueWrite('close-position', async () => {
+      const position = this.snapshot.positions.get(MARKET_IDS.BTCUSDT);
+      if (!position) return true;
+      if (position.side !== 'long' || position.sizeBase <= 0) {
+        throw new Error('PopDEX 实盘平仓只允许已确认的 BTCUSDT 多仓。');
+      }
+      if ((this.snapshot.orders.get(MARKET_IDS.BTCUSDT)?.size ?? 0) !== 0) {
+        throw new Error('PopDEX BTCUSDT 平仓前必须先撤销全部活动订单。');
+      }
+      const closeClientOrderId = createBtcCloseClientOrderId(randomBytes(16));
+      const qty = formatUnits(position.holdSizeWad, 18).replace(/\.0$/, '');
+      this.journal.create(this.#writeIdentity('close', {
+        qty,
+        closeClientOrderId,
+        positionId: position.positionId,
+      }));
+      await this.tradingClient.closeAdapterBtcLong({
+        positionId: position.positionId,
+        qtyWad: position.holdSizeWad,
+        closeClientOrderId,
+      }, this.journal);
+      await this.#refreshAndClearConfirmed('close-position');
+      if (this.snapshot.positions.has(MARKET_IDS.BTCUSDT)) {
+        throw new Error('PopDEX 平仓写入已确认，但刷新后的官方快照仍有 BTCUSDT 仓位。');
+      }
+      return true;
+    });
   }
 
   start() {
@@ -664,6 +1093,7 @@ export class PopdexExchange extends EventEmitter {
       lastErrorStage: this.lastErrorStage,
       lastErrorMessage: this.lastErrorMessage,
       writeInFlight: this.writeInFlight,
+      lastQueueError: this.lastQueueError,
       dataSource: this.dataSource,
     };
   }

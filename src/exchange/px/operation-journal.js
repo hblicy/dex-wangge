@@ -374,9 +374,6 @@ export class PopdexOperationJournal {
     if (outcome !== 'safe-no-broadcast') {
       throw new Error('PopDEX operation journal 无广播完成 outcome 必须是 safe-no-broadcast。');
     }
-    if (current.kind === 'place') {
-      throw new Error('PopDEX operation journal place 不能无广播完成。');
-    }
     return this.#persist({
       ...current,
       stage: 'CONFIRMED',

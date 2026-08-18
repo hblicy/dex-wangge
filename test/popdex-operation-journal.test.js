@@ -168,9 +168,9 @@ test('operation journal completes only a PREPARED no-broadcast operation', () =>
 
   const place = createJournal();
   place.create(placeFacts());
-  assert.throws(
-    () => place.completePreparedWithoutBroadcast('safe-no-broadcast'),
-    /place.*不能无广播完成/,
+  assert.equal(
+    place.completePreparedWithoutBroadcast('safe-no-broadcast').stage,
+    'CONFIRMED',
   );
 });
 
