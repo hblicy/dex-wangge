@@ -677,6 +677,7 @@ export class PopdexTradingClient {
         symbolId: plan.symbolId,
         clientOrderId: position.closeClientOrderId,
         priceWad: '0',
+        priceRule: 'positive-execution',
         qtyWad: position.closeQtyWad,
       });
       journal.advance('CLOSE_BROADCAST', 'CLOSE_SETTLING', {

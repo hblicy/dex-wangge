@@ -661,6 +661,7 @@ async function inspectRecovery({ record, journal, readRpc, accountClient }) {
       symbolId: record.symbolId,
       clientOrderId: record.closeClientOrderId,
       priceWad: '0',
+      priceRule: 'positive-execution',
       qtyWad: record.closeQtyWad,
     });
     journal.advance('CLOSE_BROADCAST', 'CLOSE_SETTLING', {
