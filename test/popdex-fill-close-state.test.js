@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { parseUnits } from 'ethers';
+import { decodeBytes32String, parseUnits } from 'ethers';
 import { prepareFillClosePlan } from '../src/exchange/px/fill-close-codec.js';
 import {
   assertCompletedFlat,
   assertConfirmedLong,
   assertEntrySettled,
   assertInitialFlat,
+  classifyClose,
   classifyEntry,
   exactBtcLeverage,
 } from '../src/exchange/px/fill-close-state.js';
@@ -21,6 +22,7 @@ const plan = prepareFillClosePlan({
   randomBytesImpl: () => Uint8Array.from({ length: 16 }, (_unused, index) => index + 1),
 });
 const CLIENT_OID = 'dw-bb-0102030405060708090a0b0c';
+const CLOSE_CLIENT_OID = 'dw-bc-0102030405060708090a0b0c';
 
 function order(overrides = {}) {
   return {
@@ -66,6 +68,40 @@ function position(overrides = {}) {
     realizedPnlWad: '0',
     createdTime: '1',
     updatedTime: '2',
+    ...overrides,
+  };
+}
+
+function closePlan(overrides = {}) {
+  return {
+    mainAccount: ACCOUNT,
+    closeOrderId: '10',
+    closeClientOrderId: plan.closeClientOrderId,
+    closeQtyWad: '200000000000000',
+    ...overrides,
+  };
+}
+
+function closeFill(overrides = {}) {
+  return {
+    fillId: '2',
+    orderId: '10',
+    symbol: 'BTCUSDT',
+    side: 'Sell',
+    execQty: '0.0002',
+    ...overrides,
+  };
+}
+
+function closeOrder(overrides = {}) {
+  return {
+    walletId: ACCOUNT,
+    orderId: '10',
+    clientOid: decodeBytes32String(plan.closeClientOrderId),
+    symbol: 'BTCUSDT',
+    symbolId: '20000',
+    side: 'Sell',
+    reduceOnly: true,
     ...overrides,
   };
 }
@@ -243,4 +279,73 @@ test('completed flat rejects both residual long and reverse short', () => {
     positions: [position({ side: '2' })],
     openOrders: [],
   }), /持仓/);
+});
+
+test('close classifier completes only the exact sell fill and a flat account', () => {
+  assert.equal(decodeBytes32String(plan.closeClientOrderId), CLOSE_CLIENT_OID);
+  assert.deepEqual(classifyClose(closePlan(), {
+    fills: [closeFill()],
+    openOrders: [],
+    positions: [],
+  }), {
+    kind: 'completed-flat',
+    closeOrderId: '10',
+    filledQtyWad: '200000000000000',
+    remainingPositionQtyWad: '0',
+  });
+});
+
+test('close classifier exposes partial and settling facts without a retry signal', () => {
+  assert.deepEqual(classifyClose(closePlan(), {
+    fills: [closeFill({ execQty: '0.0001' })],
+    openOrders: [],
+    positions: [position({ holdSizeWad: '100000000000000' })],
+  }), {
+    kind: 'partial-unresolved',
+    closeOrderId: '10',
+    filledQtyWad: '100000000000000',
+    remainingPositionQtyWad: '100000000000000',
+  });
+  assert.equal(classifyClose(closePlan(), {
+    fills: [],
+    openOrders: [closeOrder()],
+    positions: [position({ holdSizeWad: '200000000000000' })],
+  }).kind, 'settling');
+  assert.equal(classifyClose(closePlan(), {
+    fills: [closeFill({ execQty: '0.0001' })],
+    openOrders: [],
+    positions: [position({ holdSizeWad: '50000000000000' })],
+  }).kind, 'settling');
+});
+
+test('close classifier rejects duplicate and conflicting exact close facts', () => {
+  const complete = { fills: [closeFill()], openOrders: [], positions: [] };
+  assert.throws(() => classifyClose(closePlan(), {
+    ...complete,
+    fills: [closeFill(), closeFill()],
+  }), /close fillId 2 重复/);
+  assert.throws(() => classifyClose(closePlan(), {
+    ...complete,
+    fills: [closeFill({ symbol: 'ETHUSDT' })],
+  }), /平仓成交身份不匹配/);
+  assert.throws(() => classifyClose(closePlan(), {
+    ...complete,
+    fills: [closeFill({ side: 'Buy' })],
+  }), /平仓成交身份不匹配/);
+  assert.throws(() => classifyClose(closePlan(), {
+    ...complete,
+    fills: [closeFill({ execQty: '0.0003' })],
+  }), /成交量超过委托量/);
+  assert.throws(() => classifyClose(closePlan(), {
+    ...complete,
+    openOrders: [closeOrder({ orderId: '11' })],
+  }), /不属于本次平仓/);
+  assert.throws(() => classifyClose(closePlan(), {
+    ...complete,
+    positions: [position({ holdSizeWad: '1' }), position({ positionId: '78', holdSizeWad: '2' })],
+  }), /冲突的 BTCUSDT 持仓/);
+  assert.throws(() => classifyClose(closePlan(), {
+    ...complete,
+    positions: [position({ walletId: OTHER, holdSizeWad: '1' })],
+  }), /账户不匹配/);
 });
