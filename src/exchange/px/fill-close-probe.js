@@ -6,8 +6,8 @@ import { loadEnv, ROOT } from '../../config.js';
 import { PopdexAccountClient } from './account-client.js';
 import { deriveAgentAddress } from './agent.js';
 import {
-  POPDEX_REVERSE_INTERFACE,
   POPDEX_USER_CONFIG_INTERFACE,
+  encodeReduceOnlyMarketClose,
   parseLeverageUpdatedReceipt,
   prepareFillClosePlan,
   verifyStage5Simulation,
@@ -16,6 +16,7 @@ import {
   assertCompletedFlat,
   assertConfirmedLong,
   assertInitialFlat,
+  classifyClose,
   classifyEntry,
   exactBtcLeverage,
 } from './fill-close-state.js';
@@ -69,16 +70,12 @@ export function parseArgs(argv) {
   if (fillClose && argv.length !== 1) {
     throw new Error('PopDEX --confirm-mainnet-fill-close 不能与其他参数组合。');
   }
-  if (fillClose || close) {
-    throw new Error(
-      'PopDEX 主网平仓原语尚未通过真实成交验证，相关写入已暂停；请勿继续自动开仓或自动平仓。',
-    );
-  }
   if (resume) {
     if (cancel) return { mode: 'resume-cancel' };
+    if (close) return { mode: 'resume-close' };
     return { mode: 'resume' };
   }
-  return { mode: 'dry-run' };
+  return { mode: fillClose ? 'fill-close' : 'dry-run' };
 }
 
 function exactEnvironment(deps) {
@@ -211,10 +208,11 @@ function safeResult(context, mode, status) {
     agentAddress,
     agentExpiresAt: authorization.expiresAt,
     clientOrderId: plan.clientOrderId,
+    closeClientOrderId: plan.closeClientOrderId,
     calldataHashes: {
       leverage: keccak256(plan.leverageData),
       entry: keccak256(plan.entryData),
-      close: keccak256(plan.closeData),
+      closePreview: keccak256(plan.closePreviewData),
     },
   };
 }
@@ -237,9 +235,9 @@ async function runDryProbe(deps) {
     },
     {
       to: POPDEX_ORDER_PRECOMPILE,
-      data: plan.closeData,
-      iface: POPDEX_REVERSE_INTERFACE,
-      name: 'placeReverseOrder',
+      data: plan.closePreviewData,
+      iface: POPDEX_ORDER_INTERFACE,
+      name: 'placeOrder',
     },
   ];
   for (const simulation of simulations) {
@@ -356,6 +354,7 @@ async function runFillClose(deps) {
     priceWad: plan.priceWad,
     qtyWad: plan.qtyWad,
     clientOrderId: plan.clientOrderId,
+    closeClientOrderId: plan.closeClientOrderId,
   });
   try {
     if (currentLeverage === '1') {
@@ -430,23 +429,33 @@ async function runFillClose(deps) {
       positionId: position.positionId,
       positionQtyWad: position.holdSizeWad,
     });
-    await trading.closeFillCloseLong(plan, journal);
-    const flat = await pollUntil({
-      read: async () => ({
-        openOrders: await accountClient.getAllOpenOrders(mainAccount, plan.symbol),
-        positions: await readRpc.getAllOpenPositions(mainAccount),
-      }),
-      done: (facts) => facts.openOrders.length === 0
-        && facts.positions.every((item) => String(item.symbolId) !== '20000'
-          || BigInt(item.holdSizeWad) === 0n),
+    const closeOrder = await trading.closeFillCloseLong(plan, {
+      closeClientOrderId: plan.closeClientOrderId,
+      closeQtyWad: position.holdSizeWad,
+      positionQtyWad: position.holdSizeWad,
+      positionId: String(position.positionId),
+    }, journal);
+    const closeResult = await pollUntil({
+      read: async () => {
+        const facts = await recoveryFacts({ accountClient, readRpc, record: journal.load() });
+        return { facts, result: classifyClose(journal.load(), facts) };
+      },
+      done: ({ result }) => result.kind !== 'settling',
       now,
       sleep,
       timeoutMs,
       pollMs,
       label: '平仓终态确认',
     });
-    assertCompletedFlat(flat);
-    journal.advance('CLOSE_BROADCAST', 'COMPLETED', {
+    if (closeResult.result.kind !== 'completed-flat') {
+      throw new Error(
+        `PopDEX 平仓终态未完成：txHash=${journal.load().closeTxHash} `
+        + `orderId=${journal.load().closeOrderId} kind=${closeResult.result.kind} `
+        + `filledQtyWad=${closeResult.result.filledQtyWad} `
+        + `remainingPositionQtyWad=${closeResult.result.remainingPositionQtyWad}。`,
+      );
+    }
+    journal.advance('CLOSE_SETTLING', 'COMPLETED', {
       outcome: 'completed-flat',
       positionQtyWad: '0',
     });
@@ -454,6 +463,7 @@ async function runFillClose(deps) {
     return {
       ...safeResult(context, 'fill-close', 'completed-flat'),
       orderId,
+      closeOrderId: closeOrder.orderId,
       filledQtyWad: settled.filledQtyWad,
     };
   } catch (error) {
@@ -478,11 +488,14 @@ function recoveryPlan(record) {
     priceWad: record.priceWad,
     qtyWad: record.qtyWad,
     clientOrderId: record.clientOrderId,
-    closeData: POPDEX_REVERSE_INTERFACE.encodeFunctionData('placeReverseOrder', [
-      record.mainAccount,
-      20000,
-      1,
-    ]),
+    closeClientOrderId: record.closeClientOrderId,
+    closePreviewData: record.closeClientOrderId === null || record.closeQtyWad === null
+      ? null
+      : encodeReduceOnlyMarketClose({
+        mainAccount: record.mainAccount,
+        closeClientOrderId: record.closeClientOrderId,
+        closeQtyWad: record.closeQtyWad,
+      }),
   });
 }
 
@@ -613,7 +626,10 @@ async function inspectRecovery({ record, journal, readRpc, accountClient }) {
     if (receipt === null) {
       return { status: 'close-receipt-pending', stage: record.stage, action: null, plan };
     }
-    if (receipt.status === '0x0') {
+    if (record.closeKind === 'legacy-reverse' || receipt.status === '0x0') {
+      if (record.closeKind === 'legacy-reverse' && receipt.status !== '0x0') {
+        throw new Error('PopDEX legacy-reverse 恢复记录必须对应失败回执 status=0x0。');
+      }
       const facts = await recoveryFacts({ accountClient, readRpc, record });
       try {
         assertCompletedFlat(facts);
@@ -628,7 +644,7 @@ async function inspectRecovery({ record, journal, readRpc, accountClient }) {
         };
       }
       journal.advance('CLOSE_BROADCAST', 'COMPLETED', {
-        outcome: 'completed-flat',
+        outcome: 'completed-flat-manual',
         positionQtyWad: '0',
       });
       journal.clearCompleted();
@@ -640,18 +656,51 @@ async function inspectRecovery({ record, journal, readRpc, accountClient }) {
         facts,
       };
     }
-    const facts = await recoveryFacts({ accountClient, readRpc, record });
-    try {
-      assertCompletedFlat(facts);
-    } catch {
-      return { status: 'close-confirmed-not-flat', stage: record.stage, action: null, plan, facts };
-    }
-    journal.advance('CLOSE_BROADCAST', 'COMPLETED', {
-      outcome: 'completed-flat',
-      positionQtyWad: '0',
+    const order = parseOrderCreateReceipt(receipt, {
+      account: record.mainAccount,
+      symbolId: record.symbolId,
+      clientOrderId: record.closeClientOrderId,
+      priceWad: '0',
+      qtyWad: record.closeQtyWad,
     });
-    journal.clearCompleted();
-    return { status: 'completed-flat', stage: record.stage, action: null, plan, facts };
+    journal.advance('CLOSE_BROADCAST', 'CLOSE_SETTLING', {
+      closeOrderId: order.orderId,
+    });
+    record = journal.load();
+  }
+
+  if (record.stage === 'CLOSE_SETTLING') {
+    const facts = await recoveryFacts({ accountClient, readRpc, record });
+    const close = classifyClose(record, facts);
+    if (close.kind === 'completed-flat') {
+      journal.advance('CLOSE_SETTLING', 'COMPLETED', {
+        outcome: 'completed-flat',
+        positionQtyWad: '0',
+      });
+      journal.clearCompleted();
+      return {
+        status: 'completed-flat',
+        stage: record.stage,
+        action: null,
+        plan,
+        facts,
+        close,
+      };
+    }
+    return {
+      status: close.kind === 'partial-unresolved'
+        ? 'partial-close-unresolved'
+        : 'close-settling',
+      stage: record.stage,
+      action: null,
+      closeTxHash: record.closeTxHash,
+      closeOrderId: record.closeOrderId,
+      filledQtyWad: close.filledQtyWad,
+      remainingPositionQtyWad: close.remainingPositionQtyWad,
+      plan,
+      facts,
+      close,
+    };
   }
 
   const cancelConfirmed = record.stage === 'REMAINDER_CANCEL_BROADCAST';
@@ -758,8 +807,18 @@ async function runRecovery(mode, deps) {
     }
     assertConfirmedLong(inspected.plan, inspected.facts, current.positionQtyWad);
     const trading = recoveryTrading(deps, environment, readRpc, accountClient);
-    await trading.closeFillCloseLong(inspected.plan, journal);
-    return { mode, status: 'close-broadcast', positionId: current.positionId };
+    const closeOrder = await trading.closeFillCloseLong(inspected.plan, {
+      closeClientOrderId: current.closeClientOrderId,
+      closeQtyWad: current.positionQtyWad,
+      positionQtyWad: current.positionQtyWad,
+      positionId: String(current.positionId),
+    }, journal);
+    return {
+      mode,
+      status: 'close-broadcast',
+      positionId: current.positionId,
+      closeOrderId: closeOrder?.orderId,
+    };
   }
   throw new Error(`PopDEX 恢复模式 ${mode} 无效。`);
 }
@@ -788,6 +847,11 @@ function render(result) {
       ...(result.action ? [`requiredAction=${result.action}`] : []),
       ...(result.orderId ? [`orderId=${result.orderId}`] : []),
       ...(result.positionId ? [`positionId=${result.positionId}`] : []),
+      ...(result.closeTxHash ? [`closeTxHash=${result.closeTxHash}`] : []),
+      ...(result.closeOrderId ? [`closeOrderId=${result.closeOrderId}`] : []),
+      ...(result.filledQtyWad ? [`filledQtyWad=${result.filledQtyWad}`] : []),
+      ...(result.remainingPositionQtyWad
+        ? [`remainingPositionQtyWad=${result.remainingPositionQtyWad}`] : []),
       ...(result.reason ? [`reason=${result.reason}`] : []),
     ];
   }
@@ -798,9 +862,10 @@ function render(result) {
     `availableMargin=${result.availableMargin}`,
     `main=${maskedAddress(result.mainAccount)} agent=${maskedAddress(result.agentAddress)}`,
     `clientOrderId=${result.clientOrderId}`,
+    `closeClientOrderId=${result.closeClientOrderId}`,
     `calldata leverage=${result.calldataHashes.leverage}`,
     `calldata entry=${result.calldataHashes.entry}`,
-    `calldata close=${result.calldataHashes.close}`,
+    `calldata closePreview=${result.calldataHashes.closePreview}`,
   ];
 }
 
