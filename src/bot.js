@@ -433,6 +433,23 @@ export class GridBot {
       throw new Error(`${action}前撤单失败：${cause?.message || cause}`, { cause });
     }
     if (ok !== true) throw new Error(`${action}前撤单失败：交易所未确认全部撤单成功。`);
+    if (this.ex.requiresDurableFillAck === true) {
+      const result = await this.ex.reconcileOwnedOrders({
+        marketId,
+        reason: `cancel:${action}`,
+        suppressRequote: true,
+      });
+      if (!Array.isArray(result?.activeOrders) || result.activeOrders.length !== 0) {
+        throw new Error(`${action}前撤单失败：严格对账仍存在活动订单。`);
+      }
+      this.ex.releaseRecoveredEvents();
+      await this._fillQueue;
+      const pending = this.ex.pendingFillEvents();
+      if (!Array.isArray(pending) || pending.length !== 0) {
+        throw new Error(`${action}前撤单失败：仍有未完成成交事件。`);
+      }
+      return;
+    }
     if (this.ex.requiresCancelConfirmation !== true) return;
     this._alert(`${action}：撤单请求已接受，等待交易所连续快照确认。`);
     try {

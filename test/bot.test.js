@@ -649,6 +649,7 @@ function strictExchange(overrides = {}) {
     return { activeOrders: [...exchange.orders.values()], pendingEvents: [] };
   };
   exchange.releaseRecoveredEvents = () => { exchange.calls.push('releaseRecoveredEvents'); };
+  exchange.pendingFillEvents = () => [];
   exchange.acknowledgeFillEvent = (eventId, orderId) => {
     exchange.calls.push(`acknowledgeFillEvent:${eventId}:${String(orderId)}`);
   };
@@ -935,4 +936,38 @@ test('strict snapshot failure after replacement preserves recoverable order and 
   assert.equal(bot._processedFillEventIds.has(eventId), false);
   assert.equal(exchange.calls.some((call) => call.startsWith('acknowledgeFillEvent:')), false);
   assert.match(exchange.haltReason, /snapshot write failed/);
+});
+
+test('strict stop drains suppressed cancellation fills before detaching listeners', async () => {
+  const exchange = strictExchange();
+  const eventId = `px-fill-${'2'.repeat(64)}`;
+  exchange.cancelAll = async () => { exchange.orders.clear(); return true; };
+  let released = false;
+  exchange.releaseRecoveredEvents = () => {
+    if (released) return;
+    released = true;
+    exchange.emit('fill', {
+      fillEventId: eventId,
+      orderId: 'old', marketId: 1, side: 'buy', price: 95, sizeBase: 1,
+      levelIndex: 1, suppressRequote: true,
+    });
+  };
+  const bot = new GridBot(exchange);
+  bot.config = { ...strictConfig, displayName: 'TEST-USD', gridRunId: 'run-1' };
+  bot.grid = { levels: [90, 95, 100, 105, 110], spacing: 5, count: 4 };
+  bot.running = true;
+  bot.active.set('old', {
+    levelIndex: 1, side: 'buy', price: 95, sizeBase: 1, opening: true,
+    clientOrderId: `0x${'11'.repeat(32)}`, reduceOnly: false,
+    parentFillEventId: null,
+  });
+  exchange.on('fill', bot._onFill);
+  exchange.on('price', bot._onPrice);
+
+  await bot.stop({ closePosition: false });
+
+  assert.equal(bot.running, false);
+  assert.equal(bot.stats.buys, 1);
+  assert.ok(exchange.calls.includes(`acknowledgeFillEvent:${eventId}:null`));
+  assert.equal(exchange.listenerCount('fill'), 0);
 });
