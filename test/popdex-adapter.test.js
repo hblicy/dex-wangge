@@ -602,6 +602,22 @@ test('BROADCAST place recovery confirms official facts and never broadcasts agai
   assert.ok(journal.calls.includes('advance:BROADCAST:CONFIRMED'));
 });
 
+test('BROADCAST place recovery compares price and quantity as exact WAD facts', async () => {
+  const record = broadcastPlaceRecord({ price: '60000.000000000000000001' });
+  const journal = memoryJournal(record);
+  const deps = dependencies({
+    journal,
+    btcOrders: [openOrder()],
+    receipt: placeReceipt(record),
+  });
+  const ex = createLiveAdapter(deps);
+
+  await assert.rejects(ex.reconnect(), /官方订单身份冲突/);
+  assert.equal(ex.getHealth().state, 'HALTED');
+  assert.equal(journal.load().stage, 'BROADCAST');
+  assert.equal(deps.broadcastCalls, 0);
+});
+
 test('PREPARED recovery completes safely without broadcast', async () => {
   const record = { ...broadcastPlaceRecord(), stage: 'PREPARED', txHash: null };
   const journal = memoryJournal(record);

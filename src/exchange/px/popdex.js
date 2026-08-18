@@ -655,8 +655,8 @@ export class PopdexExchange extends EventEmitter {
     if (official.orderId !== order.orderId
         || official.clientOrderId !== record.clientOrderId
         || official.side !== record.side
-        || official.price !== Number(record.price)
-        || official.sizeBase !== Number(record.qty)) {
+        || official.priceWad !== decimalWad(record.price, 'recovery.place.price').toString()
+        || official.qtyWad !== decimalWad(record.qty, 'recovery.place.qty').toString()) {
       throw new Error('PopDEX BROADCAST place 官方订单身份冲突。');
     }
     this.journal.advance('BROADCAST', 'CONFIRMED', { orderId: order.orderId });
