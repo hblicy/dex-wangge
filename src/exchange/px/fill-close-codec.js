@@ -153,7 +153,7 @@ export function prepareFillClosePlan({
   const entropyHex = hexlify(entropy.slice(0, 12)).slice(2);
   const clientOrderId = encodeBytes32String(`dw-bb-${entropyHex}`).toLowerCase();
   const closeClientOrderId = createBtcCloseClientOrderId(entropy);
-  const orderParams = encodeOrderParams('buy');
+  const orderParams = encodeOrderParams({ side: 'buy' });
   const leverageData = encodeBtcLeverageOne(account);
   const entryData = POPDEX_ORDER_INTERFACE.encodeFunctionData('placeOrder', [
     account,

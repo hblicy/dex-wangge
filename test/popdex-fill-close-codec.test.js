@@ -102,7 +102,7 @@ test('fill-close plan is fixed to BTCUSDT 1x minimum long with 0.3 percent cap',
   assert.equal(entry.price.toString(), prepared.priceWad);
   assert.equal(entry.qty.toString(), prepared.qtyWad);
   assert.equal(entry.clientOrderId, prepared.clientOrderId);
-  assert.equal(entry.orderParams, encodeOrderParams('buy'));
+  assert.equal(entry.orderParams, encodeOrderParams({ side: 'buy' }));
   assert.equal(entry.slippage, 0n);
   assert.equal(entry.builder, ZeroAddress);
   assert.equal(entry.builderFeeRate, 0n);

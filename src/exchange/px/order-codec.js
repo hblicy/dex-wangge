@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   encodeBytes32String,
   hexlify,
@@ -41,13 +42,35 @@ function exactClientOrderId(value) {
   return value.toLowerCase();
 }
 
-export function encodeOrderParams(side) {
+export function createGridClientOrderId({ symbol, side, intentId }) {
+  const marketCode = symbol === 'BTCUSDT' ? 'b' : symbol === 'ETHUSDT' ? 'e' : null;
+  const normalizedSide = exactSide(side);
+  if (marketCode === null) {
+    throw new Error(`PopDEX market ${String(symbol)} 不在白名单。`);
+  }
+  if (typeof intentId !== 'string' || intentId.length === 0) {
+    throw new Error('PopDEX intentId 不能为空。');
+  }
+  const sideCode = normalizedSide === 'buy' ? 'b' : 's';
+  const digest = createHash('sha256').update(intentId, 'utf8').digest('hex').slice(0, 24);
+  return encodeBytes32String(`dw-${marketCode}${sideCode}-${digest}`).toLowerCase();
+}
+
+export function encodeOrderParams({ side, reduceOnly = false, positionSide = '0' }) {
+  if (typeof reduceOnly !== 'boolean') {
+    throw new Error('PopDEX reduceOnly 必须是布尔值。');
+  }
+  if (positionSide !== '0') {
+    throw new Error('PopDEX 网格订单只允许 OneWay/Net positionSide=0。');
+  }
   const normalizedSide = exactSide(side);
   const bytes = new Uint8Array(32);
   bytes[0] = 2;
   bytes[1] = 0;
   bytes[2] = normalizedSide === 'buy' ? 0 : 1;
   bytes[3] = 1;
+  bytes[6] = reduceOnly ? 1 : 0;
+  bytes[7] = 0;
   return hexlify(bytes);
 }
 
@@ -61,12 +84,25 @@ export function prepareLimitOrder({
   ask,
   randomBytesImpl,
   nowMs,
+  reduceOnly = false,
+  positionSide = '0',
+  clientOrderId: explicitClientOrderId = null,
+  intentId = null,
 }) {
   const account = strictAddress(mainAccount, 'mainAccount');
   if (typeof symbol !== 'string' || !(symbol in POPDEX_EXPECTED_MARKETS)) {
     throw new Error(`PopDEX market ${String(symbol)} 不在白名单。`);
   }
   const normalizedSide = exactSide(side);
+  if (typeof reduceOnly !== 'boolean') {
+    throw new Error('PopDEX reduceOnly 必须是布尔值。');
+  }
+  if (positionSide !== '0') {
+    throw new Error('PopDEX 网格订单只允许 OneWay/Net positionSide=0。');
+  }
+  if (reduceOnly && (symbol !== 'BTCUSDT' || normalizedSide !== 'sell')) {
+    throw new Error('PopDEX reduce-only 限价网格只允许 BTCUSDT sell。');
+  }
   if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
     throw new Error('PopDEX nowMs 必须是非负安全整数。');
   }
@@ -117,8 +153,12 @@ export function prepareLimitOrder({
   const marketCode = symbol === 'BTCUSDT' ? 'b' : 'e';
   const sideCode = normalizedSide === 'buy' ? 'b' : 's';
   const clientOrderLabel = `dw-${marketCode}${sideCode}-${hexlify(entropy.slice(0, 12)).slice(2)}`;
-  const clientOrderId = encodeBytes32String(clientOrderLabel).toLowerCase();
-  const orderParams = encodeOrderParams(normalizedSide);
+  const clientOrderId = explicitClientOrderId !== null
+    ? exactClientOrderId(explicitClientOrderId)
+    : intentId !== null
+      ? createGridClientOrderId({ symbol, side: normalizedSide, intentId })
+      : encodeBytes32String(clientOrderLabel).toLowerCase();
+  const orderParams = encodeOrderParams({ side: normalizedSide, reduceOnly, positionSide });
   const data = POPDEX_ORDER_INTERFACE.encodeFunctionData('placeOrder', [
     account,
     clientOrderId,
@@ -144,6 +184,8 @@ export function prepareLimitOrder({
     qtyWad: qtyWad.toString(),
     clientOrderId,
     orderParams,
+    reduceOnly,
+    positionSide,
     data,
   });
 }
