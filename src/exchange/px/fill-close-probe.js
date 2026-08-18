@@ -8,6 +8,7 @@ import { deriveAgentAddress } from './agent.js';
 import {
   POPDEX_REVERSE_INTERFACE,
   POPDEX_USER_CONFIG_INTERFACE,
+  parseLeverageUpdatedReceipt,
   prepareFillClosePlan,
   verifyStage5Simulation,
 } from './fill-close-codec.js';
@@ -538,10 +539,29 @@ async function exactSavedReceipt(readRpc, record, field) {
 
 async function inspectRecovery({ record, journal, readRpc, accountClient }) {
   const plan = recoveryPlan(record);
-  if (['PREPARED', 'LEVERAGE_BROADCAST', 'LEVERAGE_CONFIRMED'].includes(record.stage)) {
+  if (['PREPARED', 'LEVERAGE_CONFIRMED'].includes(record.stage)) {
     const facts = await recoveryFacts({ accountClient, readRpc, record });
     assertInitialFlat(facts);
     journal.advance(record.stage, 'COMPLETED', { outcome: 'safe-no-exposure' });
+    journal.clearCompleted();
+    return { status: 'safe-no-exposure', stage: record.stage, action: null, plan, facts };
+  }
+
+  if (record.stage === 'LEVERAGE_BROADCAST') {
+    const receipt = await exactSavedReceipt(readRpc, record, 'leverageTxHash');
+    if (receipt === null) {
+      return { status: 'leverage-receipt-pending', stage: record.stage, action: null, plan };
+    }
+    const facts = await recoveryFacts({ accountClient, readRpc, record });
+    assertInitialFlat(facts);
+    if (receipt.status === '0x1') {
+      parseLeverageUpdatedReceipt(receipt, plan);
+      const readback = exactBtcLeverage(await readRpc.getAccountConfig(record.mainAccount));
+      if (readback !== '1') {
+        throw new Error(`PopDEX BTCUSDT 杠杆恢复回读必须是 1，实际 ${readback}。`);
+      }
+    }
+    journal.advance('LEVERAGE_BROADCAST', 'COMPLETED', { outcome: 'safe-no-exposure' });
     journal.clearCompleted();
     return { status: 'safe-no-exposure', stage: record.stage, action: null, plan, facts };
   }

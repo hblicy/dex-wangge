@@ -6,6 +6,8 @@ import {
   parseArgs,
   runProbe,
 } from '../src/exchange/px/fill-close-probe.js';
+import { POPDEX_USER_CONFIG_PRECOMPILE } from '../src/exchange/px/constants.js';
+import { POPDEX_USER_CONFIG_INTERFACE } from '../src/exchange/px/fill-close-codec.js';
 
 const MAIN_ACCOUNT = '0x1111111111111111111111111111111111111111';
 const AGENT_PRIVATE_KEY = `0x${'22'.repeat(32)}`;
@@ -485,10 +487,15 @@ function recoveryOrder({ filled = '0', remaining = '0.0002', cancelled = '0' } =
 
 function recoveryDependencies(stage, {
   receiptStatus = null,
+  receiptLogs = [],
   order = null,
   fills = [],
   openOrders = [],
   positions = [],
+  accountConfig = {
+    positionMode: '0',
+    symbolLeverages: [{ symbolId: '20000', leverage: '1' }],
+  },
   recordOverrides = {},
 } = {}) {
   const flow = [];
@@ -508,9 +515,10 @@ function recoveryDependencies(stage, {
               : stage === 'LEVERAGE_BROADCAST' ? `0x${'11'.repeat(32)}`
                 : `0x${'22'.repeat(32)}`,
           status: receiptStatus,
-          logs: [],
+          logs: receiptLogs,
         };
       },
+      async getAccountConfig() { return accountConfig; },
       async getAllOpenPositions() { return positions; },
     },
     accountClient: {
@@ -581,6 +589,27 @@ test('plain recovery safely clears pre-entry and exact failed-entry records only
   const failedEntry = recoveryDependencies('ENTRY_BROADCAST', { receiptStatus: '0x0' });
   assert.equal((await runProbe({ mode: 'resume' }, failedEntry.deps)).status, 'safe-no-exposure');
   assert.equal(failedEntry.journal.load(), null);
+});
+
+test('leverage broadcast recovery waits for its receipt and verifies success before clearing', async () => {
+  const pending = recoveryDependencies('LEVERAGE_BROADCAST');
+  assert.equal((await runProbe({ mode: 'resume' }, pending.deps)).status, 'leverage-receipt-pending');
+  assert.equal(pending.journal.load().stage, 'LEVERAGE_BROADCAST');
+
+  const event = POPDEX_USER_CONFIG_INTERFACE.encodeEventLog(
+    POPDEX_USER_CONFIG_INTERFACE.getEvent('LeverageUpdated'),
+    [MAIN_ACCOUNT, 2, 20000, '0x0000000000000000000000000000000000000000', 1, true, 0],
+  );
+  const confirmed = recoveryDependencies('LEVERAGE_BROADCAST', {
+    receiptStatus: '0x1',
+    receiptLogs: [{ address: POPDEX_USER_CONFIG_PRECOMPILE, ...event }],
+  });
+  assert.equal((await runProbe({ mode: 'resume' }, confirmed.deps)).status, 'safe-no-exposure');
+  assert.equal(confirmed.journal.load(), null);
+
+  const malformed = recoveryDependencies('LEVERAGE_BROADCAST', { receiptStatus: '0x1' });
+  await assert.rejects(runProbe({ mode: 'resume' }, malformed.deps), /LeverageUpdated/);
+  assert.equal(malformed.journal.load().stage, 'LEVERAGE_BROADCAST');
 });
 
 test('recovery cancel requires the exact active entry and refuses an existing cancel hash', async () => {
