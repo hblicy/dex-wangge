@@ -75,3 +75,17 @@ test('only the isolated PopDEX write RPC boundary can broadcast raw transactions
   assert.deepEqual(broadcasters.sort(), ['official-artifacts.js', 'write-rpc-client.js']);
   assert.doesNotMatch(readProject('src/exchange/px/write-probe.js'), /eth_sendRawTransaction/);
 });
+
+test('PopDEX Stage 6 factory remains absent from application entry points', () => {
+  for (const file of [
+    'src/server.js',
+    'src/bot.js',
+    'src/config.js',
+    'src/startup.js',
+    'src/recovery.js',
+    'public/index.html',
+  ]) {
+    const source = readProject(file);
+    assert.doesNotMatch(source, /exchange\/px\/index|createPopdexExchange|PX_MODE/, file);
+  }
+});
