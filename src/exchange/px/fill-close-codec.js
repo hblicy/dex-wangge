@@ -11,7 +11,11 @@ import {
 } from 'ethers';
 import { POPDEX_EXPECTED_MARKETS, POPDEX_USER_CONFIG_PRECOMPILE } from './constants.js';
 import { encodeOrderParams, POPDEX_ORDER_INTERFACE } from './order-codec.js';
-import { strictAddress, strictDecimalString } from './normalize.js';
+import {
+  strictAddress,
+  strictDecimalString,
+  strictIntegerString,
+} from './normalize.js';
 
 const WAD_DECIMALS = 18;
 const WAD = 10n ** 18n;
@@ -21,6 +25,8 @@ const FUTURES_CATEGORY = '2';
 const ONE_WAY_POSITION_MODE = '0';
 const LONG_POSITION_SIDE = '1';
 const TARGET_LEVERAGE = '1';
+const BYTES32 = /^0x[0-9a-fA-F]{64}$/;
+const CLOSE_SLIPPAGE_WAD = 30_000_000_000_000_000n;
 
 export const POPDEX_USER_CONFIG_INTERFACE = new Interface([
   'function getAccountConfig(address account) view returns ((uint8 status,uint8 vipLevel,uint8 positionMode,uint64 bizPermissionCode,tuple(uint16 symbolId,uint8 leverage)[] symbolLeverages,tuple(address tokenAddress,uint8 leverage)[] tokenLeverages) config)',
@@ -28,9 +34,37 @@ export const POPDEX_USER_CONFIG_INTERFACE = new Interface([
   'event LeverageUpdated(address indexed account,uint8 category,uint16 symbolId,address tokenAddress,uint8 newLeverage,bool succeeded,uint32 code)',
 ]);
 
-export const POPDEX_REVERSE_INTERFACE = new Interface([
-  'function placeReverseOrder(address account,uint16 symbolId,uint8 positionSide) returns (bool success)',
-]);
+export const POPDEX_REDUCE_ONLY_MARKET_PARAMS =
+  '0x0201010000000100000000000000000000000000000000000000000000000000';
+
+function exactBytes32(value, field) {
+  if (typeof value !== 'string' || !BYTES32.test(value)) {
+    throw new Error(`PopDEX ${field} 必须是精确 bytes32 十六进制字符串。`);
+  }
+  return value.toLowerCase();
+}
+
+export function encodeReduceOnlyMarketClose({
+  mainAccount,
+  closeClientOrderId,
+  closeQtyWad,
+}) {
+  const account = strictAddress(mainAccount, 'close.mainAccount');
+  const clientOrderId = exactBytes32(closeClientOrderId, 'closeClientOrderId');
+  const qty = BigInt(strictIntegerString(closeQtyWad, 'closeQtyWad'));
+  if (qty <= 0n) throw new Error('PopDEX closeQtyWad 必须大于 0。');
+  return POPDEX_ORDER_INTERFACE.encodeFunctionData('placeOrder', [
+    account,
+    clientOrderId,
+    20000,
+    POPDEX_REDUCE_ONLY_MARKET_PARAMS,
+    0n,
+    qty,
+    CLOSE_SLIPPAGE_WAD,
+    ZeroAddress,
+    0n,
+  ]);
+}
 
 function decimalToWad(value, field) {
   const normalized = strictDecimalString(value, field);
@@ -96,8 +130,9 @@ export function prepareFillClosePlan({
   }
 
   const entropy = exactEntropy(randomBytesImpl);
-  const clientOrderLabel = `dw-bb-${hexlify(entropy.slice(0, 12)).slice(2)}`;
-  const clientOrderId = encodeBytes32String(clientOrderLabel).toLowerCase();
+  const entropyHex = hexlify(entropy.slice(0, 12)).slice(2);
+  const clientOrderId = encodeBytes32String(`dw-bb-${entropyHex}`).toLowerCase();
+  const closeClientOrderId = encodeBytes32String(`dw-bc-${entropyHex}`).toLowerCase();
   const orderParams = encodeOrderParams('buy');
   const leverageData = POPDEX_USER_CONFIG_INTERFACE.encodeFunctionData('updateLeverage', [
     account,
@@ -114,11 +149,11 @@ export function prepareFillClosePlan({
     ZeroAddress,
     0n,
   ]);
-  const closeData = POPDEX_REVERSE_INTERFACE.encodeFunctionData('placeReverseOrder', [
-    account,
-    20000,
-    1,
-  ]);
+  const closePreviewData = encodeReduceOnlyMarketClose({
+    mainAccount: account,
+    closeClientOrderId,
+    closeQtyWad: qtyWad.toString(),
+  });
 
   return Object.freeze({
     mainAccount: account,
@@ -136,10 +171,11 @@ export function prepareFillClosePlan({
     priceWad: priceWad.toString(),
     qtyWad: qtyWad.toString(),
     clientOrderId,
+    closeClientOrderId,
     orderParams,
     leverageData,
     entryData,
-    closeData,
+    closePreviewData,
   });
 }
 

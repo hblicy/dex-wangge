@@ -60,8 +60,9 @@ export function exactBtcLeverage(config) {
     throw new Error('PopDEX 账户必须是 OneWay positionMode=0。');
   }
   const matches = config.symbolLeverages.filter((item) => item?.symbolId === BTC_SYMBOL_ID);
-  if (matches.length !== 1) {
-    throw new Error(`PopDEX BTCUSDT 杠杆记录必须唯一，实际 ${matches.length}。`);
+  if (matches.length === 0) return null;
+  if (matches.length > 1) {
+    throw new Error(`PopDEX BTCUSDT 杠杆记录重复，实际 ${matches.length}。`);
   }
   const leverage = integerWad(matches[0].leverage, 'BTC leverage');
   if (leverage < 1n || leverage > 255n) {
@@ -224,6 +225,87 @@ export function assertConfirmedLong(plan, { positions, openOrders } = {}, filled
     throw new Error('PopDEX BTCUSDT 持仓量与本单成交量不一致。');
   }
   return candidate;
+}
+
+export function classifyClose(plan, { fills, openOrders, positions } = {}) {
+  if (!plan || typeof plan !== 'object'
+      || !Array.isArray(fills)
+      || !Array.isArray(openOrders)
+      || !Array.isArray(positions)) {
+    throw new Error('PopDEX 平仓快照格式无效。');
+  }
+  const closeOrderId = strictIntegerString(plan.closeOrderId, 'close.orderId');
+  const closeQty = integerWad(plan.closeQtyWad, 'close.qtyWad');
+  const expectedClientOid = decodeBytes32String(plan.closeClientOrderId);
+  const expectedAccount = strictAddress(plan.mainAccount, 'close.mainAccount');
+  if (closeQty <= 0n) throw new Error('PopDEX 平仓数量必须大于 0。');
+
+  const btcOpen = openOrders.filter(isBtc);
+  for (const item of btcOpen) {
+    const wallet = strictAddress(item.walletId, 'close order.walletId');
+    if (!sameAddress(wallet, expectedAccount)
+        || String(item.orderId) !== closeOrderId
+        || item.clientOid !== expectedClientOid
+        || item.side !== 'Sell'
+        || item.reduceOnly !== true) {
+      throw new Error('PopDEX 出现不属于本次平仓的 BTCUSDT 活动订单。');
+    }
+  }
+  if (btcOpen.length > 1) throw new Error('PopDEX 平仓活动订单重复。');
+
+  const seen = new Set();
+  let fillQty = 0n;
+  for (const item of fills) {
+    if (String(item?.orderId) !== closeOrderId) continue;
+    const fillId = strictIntegerString(item.fillId, 'close fill.fillId');
+    if (seen.has(fillId)) throw new Error(`PopDEX close fillId ${fillId} 重复。`);
+    seen.add(fillId);
+    if (item.symbol !== BTC_SYMBOL || item.side !== 'Sell') {
+      throw new Error('PopDEX 平仓成交身份不匹配。');
+    }
+    const execQty = decimalWad(item.execQty, 'close fill.execQty');
+    if (execQty <= 0n) throw new Error('PopDEX close fill.execQty 必须大于 0。');
+    fillQty += execQty;
+  }
+  if (fillQty > closeQty) throw new Error('PopDEX 平仓成交量超过委托量。');
+
+  const nonzero = positions.filter((item) => isBtc(item)
+    && integerWad(item.holdSizeWad, 'close position.holdSizeWad') > 0n);
+  if (nonzero.length > 1 || nonzero.some((item) => item.side !== LONG_POSITION_SIDE)) {
+    throw new Error('PopDEX 平仓后出现冲突的 BTCUSDT 持仓。');
+  }
+  if (nonzero.length === 1) {
+    const wallet = strictAddress(nonzero[0].walletId, 'close position.walletId');
+    if (!sameAddress(wallet, expectedAccount)) {
+      throw new Error('PopDEX 平仓剩余仓位账户不匹配。');
+    }
+  }
+  const remaining = nonzero.length === 0
+    ? 0n
+    : integerWad(nonzero[0].holdSizeWad, 'close position.holdSizeWad');
+
+  if (fillQty === closeQty && remaining === 0n && btcOpen.length === 0) {
+    return {
+      kind: 'completed-flat',
+      closeOrderId,
+      filledQtyWad: fillQty.toString(),
+      remainingPositionQtyWad: '0',
+    };
+  }
+  if (fillQty > 0n && fillQty + remaining === closeQty && btcOpen.length === 0) {
+    return {
+      kind: 'partial-unresolved',
+      closeOrderId,
+      filledQtyWad: fillQty.toString(),
+      remainingPositionQtyWad: remaining.toString(),
+    };
+  }
+  return {
+    kind: 'settling',
+    closeOrderId,
+    filledQtyWad: fillQty.toString(),
+    remainingPositionQtyWad: remaining.toString(),
+  };
 }
 
 export function assertCompletedFlat({ positions, openOrders } = {}) {
