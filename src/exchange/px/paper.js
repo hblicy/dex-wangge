@@ -1,7 +1,9 @@
 import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
 import { formatUnits, parseUnits } from 'ethers';
 import { POPDEX_EXPECTED_MARKETS } from './constants.js';
 import { strictDecimalString, strictIntegerString } from './normalize.js';
+import { createGridClientOrderId } from './order-codec.js';
 
 const MARKET_IDS = Object.freeze({ BTCUSDT: 20000, ETHUSDT: 20001 });
 const SYMBOLS = Object.freeze(['BTCUSDT', 'ETHUSDT']);
@@ -110,8 +112,22 @@ function exactOrderInput(input, market) {
     throw new Error('PopDEX Paper levelIndex 必须是非负安全整数。');
   }
   if (input.clientOrderId !== undefined
-      && (typeof input.clientOrderId !== 'string' || input.clientOrderId.length === 0)) {
-    throw new Error('PopDEX Paper clientOrderId 必须是非空字符串。');
+      && typeof input.clientOrderId === 'string' && input.clientOrderId.length === 0) {
+    throw new Error('PopDEX Paper clientOrderId 不能为空。');
+  }
+  const opening = input.opening ?? input.reduceOnly !== true;
+  if (typeof opening !== 'boolean' || opening === (input.reduceOnly === true)) {
+    throw new Error('PopDEX Paper opening 与 reduceOnly 必须是互斥布尔值。');
+  }
+  if (input.intentId !== undefined
+      && (typeof input.intentId !== 'string' || input.intentId.length === 0
+        || input.intentId.length > 300 || /[\r\n]/.test(input.intentId))) {
+    throw new Error('PopDEX Paper intentId 必须是 1-300 字符的单行字符串。');
+  }
+  if (input.parentFillEventId !== undefined && input.parentFillEventId !== null
+      && (typeof input.parentFillEventId !== 'string'
+        || !/^px-fill-[0-9a-f]{64}$/.test(input.parentFillEventId))) {
+    throw new Error('PopDEX Paper parentFillEventId 无效。');
   }
   return {
     side: input.side,
@@ -119,7 +135,13 @@ function exactOrderInput(input, market) {
     sizeBase: Number(formatUnits(qtyWad, 18)),
     reduceOnly: input.reduceOnly === true,
     levelIndex: input.levelIndex ?? null,
-    clientOrderId: input.clientOrderId ?? null,
+    opening,
+    intentId: input.intentId ?? null,
+    parentFillEventId: input.parentFillEventId ?? null,
+    explicitClientOrderId: typeof input.clientOrderId === 'string'
+      && /^0x[0-9a-fA-F]{64}$/.test(input.clientOrderId)
+      ? input.clientOrderId.toLowerCase()
+      : null,
   };
 }
 
@@ -169,6 +191,8 @@ export class PopdexPaperExchange extends EventEmitter {
     this.markets = new Map();
     this.tickers = new Map();
     this.orders = new Map();
+    this.pendingEvents = new Map();
+    this.releasedFillEvents = new Set();
     this.positions = new Map();
     this.leverages = new Map();
     this.sequence = 1;
@@ -177,6 +201,8 @@ export class PopdexPaperExchange extends EventEmitter {
     this.lastErrorMessage = null;
     this.timer = null;
     this.refreshPromise = null;
+    this.strictOrderRecovery = true;
+    this.requiresDurableFillAck = true;
   }
 
   #market(marketId) {
@@ -271,17 +297,33 @@ export class PopdexPaperExchange extends EventEmitter {
         order.sizeBase,
         order.reduceOnly,
       );
-      this.emit('fill', {
+      const filledQtyWad = decimalWad(qty, 'fill.sizeBase').toString();
+      const priceWad = decimalWad(order.price, 'fill.price').toString();
+      const fillId = String(this.sequence++);
+      const fillEventId = `px-fill-${createHash('sha256')
+        .update(`${order.orderId}:${order.clientOrderId}:${fillId}:${filledQtyWad}:${priceWad}`)
+        .digest('hex')}`;
+      this.pendingEvents.set(fillEventId, {
+        fillEventId,
+        stage: 'EVENT_PENDING',
+        terminalState: 'FILLED',
+        filledQtyWad,
+        priceWad,
+        fillIds: [fillId],
+        suppressRequote: false,
+        replacementOrderId: null,
         orderId: order.orderId,
         marketId: order.marketId,
         side: order.side,
-        price: order.price,
-        sizeBase: qty,
         levelIndex: order.levelIndex,
         clientOrderId: order.clientOrderId,
+        opening: order.opening,
+        reduceOnly: order.reduceOnly,
+        parentFillEventId: order.parentFillEventId,
         fee,
       });
     }
+    this.releaseRecoveredEvents();
   }
 
   async #readOfficial(matchOrders) {
@@ -316,12 +358,16 @@ export class PopdexPaperExchange extends EventEmitter {
   }
 
   async reconnect() {
+    if (this.state === 'HALTED') this.state = 'RECONCILING';
     await this.#readOfficial(true);
     this.start();
     return this;
   }
 
   refresh() {
+    if (this.state === 'HALTED') {
+      return Promise.reject(new Error('PopDEX Paper 当前为 HALTED，必须人工重连。'));
+    }
     if (this.refreshPromise) return this.refreshPromise;
     this.refreshPromise = this.#readOfficial(true).finally(() => { this.refreshPromise = null; });
     return this.refreshPromise;
@@ -376,8 +422,25 @@ export class PopdexPaperExchange extends EventEmitter {
     this.#assertFresh(market.marketId, '新增订单');
     const normalized = exactOrderInput(input, market);
     const orderId = `paper-${this.sequence++}`;
-    this.orders.set(orderId, { orderId, marketId: market.marketId, ...normalized });
-    return { orderId };
+    const clientOrderId = normalized.explicitClientOrderId ?? createGridClientOrderId({
+      symbol: market.name,
+      side: normalized.side,
+      intentId: normalized.intentId ?? `paper:${orderId}`,
+    });
+    const order = {
+      orderId,
+      clientOrderId,
+      marketId: market.marketId,
+      side: normalized.side,
+      price: normalized.price,
+      sizeBase: normalized.sizeBase,
+      reduceOnly: normalized.reduceOnly,
+      levelIndex: normalized.levelIndex,
+      opening: normalized.opening,
+      parentFillEventId: normalized.parentFillEventId,
+    };
+    this.orders.set(orderId, order);
+    return { ...order };
   }
 
   async cancelOrder(marketId, orderId) {
@@ -410,6 +473,65 @@ export class PopdexPaperExchange extends EventEmitter {
     return this.getOpenOrders(marketId);
   }
 
+  pendingFillEvents() {
+    return [...this.pendingEvents.values()].map((event) => structuredClone(event));
+  }
+
+  async recoverOwnedOrders({ marketId } = {}) {
+    return this.reconcileOwnedOrders({ marketId });
+  }
+
+  async reconcileOwnedOrders({ marketId } = {}) {
+    const market = this.#market(marketId);
+    return {
+      status: this.state,
+      activeOrders: this.getOpenOrders(market.marketId),
+      pendingEvents: this.pendingFillEvents()
+        .filter((event) => event.marketId === market.marketId),
+      positions: this.getPosition(market.marketId) ? [this.getPosition(market.marketId)] : [],
+      diagnostics: {
+        owned: this.getOpenOrders(market.marketId).length,
+        pending: this.pendingFillEvents()
+          .filter((event) => event.marketId === market.marketId).length,
+      },
+    };
+  }
+
+  releaseRecoveredEvents() {
+    for (const event of this.pendingFillEvents()) {
+      if (event.stage !== 'EVENT_PENDING' || this.releasedFillEvents.has(event.fillEventId)) continue;
+      this.releasedFillEvents.add(event.fillEventId);
+      this.emit('fill', {
+        ...event,
+        price: Number(formatUnits(event.priceWad, 18)),
+        sizeBase: Number(formatUnits(event.filledQtyWad, 18)),
+      });
+    }
+  }
+
+  acknowledgeFillEvent(fillEventId, replacementOrderId) {
+    const event = this.pendingEvents.get(fillEventId);
+    if (!event) throw new Error(`PopDEX Paper 成交事件 ${String(fillEventId)} 不存在。`);
+    if (event.suppressRequote) {
+      if (replacementOrderId !== null) {
+        throw new Error('PopDEX Paper suppression 事件不允许 replacementOrderId。');
+      }
+    } else {
+      const replacement = this.orders.get(String(replacementOrderId));
+      if (!replacement || replacement.parentFillEventId !== fillEventId) {
+        throw new Error('PopDEX Paper 补单身份不匹配。');
+      }
+    }
+    this.pendingEvents.delete(fillEventId);
+  }
+
+  haltFromBot(error) {
+    if (this.state === 'HALTED' && this.lastErrorMessage !== null) return;
+    this.state = 'HALTED';
+    this.lastErrorMessage = errorMessage(error);
+    this.emit('fault', error);
+  }
+
   adoptOrder(metadata) {
     if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
       throw new Error('PopDEX Paper adoptOrder 必须提供完整订单元数据。');
@@ -425,7 +547,23 @@ export class PopdexPaperExchange extends EventEmitter {
     const orderId = String(metadata.orderId);
     if (orderId.length === 0) throw new Error('PopDEX Paper adoptOrder orderId 不能为空。');
     const normalized = exactOrderInput(metadata, market);
-    const adopted = { orderId, marketId: market.marketId, ...normalized };
+    const clientOrderId = normalized.explicitClientOrderId ?? createGridClientOrderId({
+      symbol: market.name,
+      side: normalized.side,
+      intentId: normalized.intentId ?? `paper:adopt:${orderId}`,
+    });
+    const adopted = {
+      orderId,
+      clientOrderId,
+      marketId: market.marketId,
+      side: normalized.side,
+      price: normalized.price,
+      sizeBase: normalized.sizeBase,
+      reduceOnly: normalized.reduceOnly,
+      levelIndex: normalized.levelIndex,
+      opening: normalized.opening,
+      parentFillEventId: normalized.parentFillEventId,
+    };
     const existing = this.orders.get(orderId);
     if (existing && JSON.stringify(existing) !== JSON.stringify(adopted)) {
       throw new Error(`PopDEX Paper adoptOrder 订单 ${orderId} 与已有订单冲突。`);
@@ -465,6 +603,7 @@ export class PopdexPaperExchange extends EventEmitter {
   start() {
     if (this.timer) return;
     this.timer = this.setIntervalImpl(() => {
+      if (this.state === 'HALTED') return;
       this.refresh().catch((error) => this.emit('fault', error));
     }, this.pollMs);
     this.timer?.unref?.();

@@ -69,6 +69,21 @@ function createPaper(deps = dependencies(), overrides = {}) {
   };
 }
 
+function fullOrderInput(overrides = {}) {
+  return {
+    marketId: 20000,
+    side: 'buy',
+    price: 60000,
+    sizeBase: 0.0002,
+    reduceOnly: false,
+    levelIndex: 3,
+    opening: true,
+    intentId: 'grid:paper-run:20000:3:buy:open',
+    parentFillEventId: null,
+    ...overrides,
+  };
+}
+
 test('paper requires explicit fee rate and complete official markets', async () => {
   const deps = dependencies();
   assert.throws(() => new PopdexPaperExchange({ publicClient: deps.publicClient }), /feeRate.*显式/);
@@ -81,6 +96,79 @@ test('paper requires explicit fee rate and complete official markets', async () 
   assert.deepEqual((await exchange.getMarkets()).map((market) => market.marketId), [20000, 20001]);
   assert.equal(exchange.getHealth().dataSource, 'popdex-public');
   assert.equal(exchange.balance, 1000);
+});
+
+test('paper placement returns full durable order metadata', async () => {
+  const { exchange } = createPaper();
+  await exchange.init();
+  const order = await exchange.placeLimitOrder(fullOrderInput());
+  assert.deepEqual(Object.keys(order).sort(), [
+    'clientOrderId', 'levelIndex', 'marketId', 'opening', 'orderId',
+    'parentFillEventId', 'price', 'reduceOnly', 'side', 'sizeBase',
+  ]);
+  assert.match(order.clientOrderId, /^0x[0-9a-f]{64}$/);
+  assert.equal(exchange.strictOrderRecovery, true);
+  assert.equal(exchange.requiresDurableFillAck, true);
+});
+
+test('paper strict recovery releases one terminal event only once per process', async () => {
+  const deps = dependencies();
+  const { exchange } = createPaper(deps);
+  await exchange.init();
+  const received = [];
+  exchange.on('fill', (fill) => received.push(fill));
+  await exchange.placeLimitOrder(fullOrderInput());
+  deps.setTicker('BTCUSDT', {
+    bid: 59999, ask: 60000, last: 60000, index: 60000, mark: 60000,
+  });
+  await exchange.refresh();
+
+  const recovered = await exchange.recoverOwnedOrders({ marketId: 20000, reason: 'startup' });
+  assert.equal(recovered.activeOrders.length, 0);
+  assert.equal(recovered.pendingEvents.length, 1);
+  exchange.releaseRecoveredEvents();
+  exchange.releaseRecoveredEvents();
+  assert.equal(received.length, 1);
+  assert.match(received[0].fillEventId, /^px-fill-[0-9a-f]{64}$/);
+});
+
+test('paper acknowledges a fill only with its own durable replacement', async () => {
+  const deps = dependencies();
+  const { exchange } = createPaper(deps);
+  await exchange.init();
+  await exchange.placeLimitOrder(fullOrderInput());
+  deps.setTicker('BTCUSDT', {
+    bid: 59999, ask: 60000, last: 60000, index: 60000, mark: 60000,
+  });
+  await exchange.refresh();
+  const [event] = exchange.pendingFillEvents();
+  const replacement = await exchange.placeLimitOrder(fullOrderInput({
+    side: 'sell',
+    price: 61000,
+    reduceOnly: true,
+    opening: false,
+    levelIndex: 4,
+    intentId: `replacement:${event.fillEventId}`,
+    parentFillEventId: event.fillEventId,
+  }));
+
+  assert.throws(
+    () => exchange.acknowledgeFillEvent(event.fillEventId, 'wrong-order'),
+    /补单身份不匹配/,
+  );
+  exchange.acknowledgeFillEvent(event.fillEventId, replacement.orderId);
+  assert.deepEqual(exchange.pendingFillEvents(), []);
+});
+
+test('paper bot halt blocks automatic refresh until explicit reconnect', async () => {
+  const { exchange } = createPaper();
+  await exchange.init();
+  exchange.haltFromBot(new Error('replacement failed'));
+  assert.equal(exchange.getHealth().state, 'HALTED');
+  await assert.rejects(exchange.refresh(), /HALTED.*人工重连/);
+  assert.equal(exchange.getHealth().state, 'HALTED');
+  await exchange.reconnect();
+  assert.equal(exchange.getHealth().state, 'READY');
 });
 
 test('paper fills crossed limits once and preserves exact grid metadata', async () => {
@@ -99,10 +187,17 @@ test('paper fills crossed limits once and preserves exact grid metadata', async 
   await exchange.refresh();
   await exchange.refresh();
   assert.equal(fills.length, 1);
-  assert.deepEqual(fills[0], {
-    orderId, marketId: 20000, side: 'buy', price: 60000, sizeBase: 0.0002,
-    levelIndex: 3, clientOrderId: 'paper-grid-3', fee: 0.006,
-  });
+  assert.equal(fills[0].orderId, orderId);
+  assert.equal(fills[0].marketId, 20000);
+  assert.equal(fills[0].side, 'buy');
+  assert.equal(fills[0].price, 60000);
+  assert.equal(fills[0].sizeBase, 0.0002);
+  assert.equal(fills[0].levelIndex, 3);
+  assert.match(fills[0].clientOrderId, /^0x[0-9a-f]{64}$/);
+  assert.equal(fills[0].opening, true);
+  assert.equal(fills[0].reduceOnly, false);
+  assert.equal(fills[0].parentFillEventId, null);
+  assert.equal(fills[0].fee, 0.006);
   assert.equal(exchange.getPosition(20000).sizeBase, 0.0002);
 });
 

@@ -907,3 +907,32 @@ test('strict invalid fill event halts before any accounting or acknowledgement',
   assert.equal(bot.stats.buys, 0);
   assert.equal(exchange.calls.length, 0);
 });
+
+test('strict snapshot failure after replacement preserves recoverable order and pending event', async () => {
+  const exchange = strictExchange();
+  const bot = new GridBot(exchange, {
+    onChange: () => { throw new Error('snapshot write failed'); },
+    logger: { log() {} },
+  });
+  bot.config = { ...strictConfig, displayName: 'TEST-USD', gridRunId: 'run-1' };
+  bot.grid = { levels: [90, 95, 100, 105, 110], spacing: 5, count: 4 };
+  bot.running = true;
+  const eventId = `px-fill-${'1'.repeat(64)}`;
+
+  await assert.rejects(bot._handleStrictFill({
+    fillEventId: eventId,
+    orderId: 'old', marketId: 1, side: 'buy', price: 95, sizeBase: 1,
+    levelIndex: 1, suppressRequote: false,
+  }, {
+    levelIndex: 1, side: 'buy', price: 95, sizeBase: 1, opening: true,
+    recovery: false,
+  }), /snapshot write failed/);
+
+  assert.equal(exchange.orders.size, 1);
+  assert.equal([...exchange.orders.values()][0].parentFillEventId, eventId);
+  assert.equal(bot.stats.buys, 0);
+  assert.equal(bot.fills.length, 0);
+  assert.equal(bot._processedFillEventIds.has(eventId), false);
+  assert.equal(exchange.calls.some((call) => call.startsWith('acknowledgeFillEvent:')), false);
+  assert.match(exchange.haltReason, /snapshot write failed/);
+});
