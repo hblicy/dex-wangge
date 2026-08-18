@@ -87,6 +87,7 @@ export class DecibelExchange extends EventEmitter {
   constructor(opts = {}) {
     super();
     this.mode = 'live';
+    this.requiresCancelConfirmation = true;
     this.network = opts.network === 'testnet' ? 'testnet' : 'mainnet';
     this.net = NETWORKS[this.network];
     this.apiKey = opts.apiKey;                 // Geomi API key (read + fullnode auth)
@@ -352,9 +353,7 @@ export class DecibelExchange extends EventEmitter {
 
   async cancelOrder(marketId, orderId) {
     const m = this._market(marketId);
-    const id = String(orderId);
-    await this.write.cancelOrder({ orderId: id, marketName: m.name, subaccountAddr: this.subaccount });
-    this._tracked.delete(id);
+    await this.write.cancelOrder({ orderId: String(orderId), marketName: m.name, subaccountAddr: this.subaccount });
     return true;
   }
 
@@ -362,29 +361,34 @@ export class DecibelExchange extends EventEmitter {
     const m = this._market(marketId);
     try {
       const open = await this._openOrders();
-      const expected = new Set(
-        [...this._tracked].filter(([, order]) => order.marketId === m.marketId).map(([id]) => id),
-      );
-      const seen = new Set();
-      let allCancelled = true;
+      if (!Array.isArray(open)) throw new Error('Decibel 挂单查询返回了无效响应。');
+      const failures = [];
       for (const o of open) {
         if (String(o.market) !== m.addr && String(o.market) !== m.name) continue;
         if (o.is_tpsl) continue; // leave TP/SL attached to positions alone
         const id = String(o.order_id);
-        seen.add(id);
         try {
           await this.write.cancelOrder({ orderId: id, marketName: m.name, subaccountAddr: this.subaccount });
-          this._tracked.delete(id);
-        } catch (e) { allCancelled = false; this.emit('error', e); }
+        } catch (e) { failures.push(e); this.emit('error', e); }
       }
-      for (const id of expected) if (!seen.has(id)) allCancelled = false;
-      return allCancelled;
+      return failures.length === 0;
     } catch (e) { this.emit('error', e); return false; }
+  }
+
+  /** Drop local tracking only after GridBot has independently confirmed cancellation. */
+  forgetOrder(orderId) { this._tracked.delete(String(orderId)); }
+  forgetOrders(marketId) {
+    const mId = Number(marketId);
+    for (const [id, order] of this._tracked) {
+      if (order.marketId === mId) this._tracked.delete(id);
+    }
   }
 
   async _openOrders() {
     const r = await this.read.userOpenOrders.getByAddr({ subAddr: this.subaccount, limit: 500, offset: 0 });
-    return Array.isArray(r) ? r : (r?.items || []);
+    if (Array.isArray(r)) return r;
+    if (Array.isArray(r?.items)) return r.items;
+    return null;
   }
 
   getOpenOrders(marketId) {
@@ -395,6 +399,7 @@ export class DecibelExchange extends EventEmitter {
   async fetchOpenOrders(marketId) {
     const m = this._market(marketId);
     const rows = await this._openOrders();
+    if (!Array.isArray(rows)) throw new Error('Decibel 挂单查询返回了无效响应。');
     const out = [];
     for (const o of rows) {
       if (String(o.market) !== m.addr && String(o.market) !== m.name) continue;
