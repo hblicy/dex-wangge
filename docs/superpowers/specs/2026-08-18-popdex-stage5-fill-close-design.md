@@ -15,6 +15,7 @@
 当前 PopDEX 官方网页构建产物和现有只读客户端已确认：
 
 - Mainnet `chainId=2184`，BTCUSDT `symbolId=20000`。
+- UserConfig 预编译地址为 `0x0000000000000000000000000000000000001009`；官方界面以该地址配合 UserConfig ABI 调用 `updatePositionMode`。
 - 账户配置通过 `getAccountConfig(account)` 读取，其中 `symbolLeverages` 包含 `symbolId:uint16` 和 `leverage:uint8`。
 - 杠杆写入接口为 `updateLeverage(account, request)`；BTC 合约请求固定使用 `newLeverage=1`、`symbolId=20000`、`category=Regular(0)` 和零地址 `tokenAddress`。
 - `LeverageUpdated` 事件包含账户、市场、杠杆、`succeeded` 和 `code`，可用于回执核验。
@@ -34,7 +35,7 @@
 - 不追价、不重试下单、不重复平仓。
 - 探针结束后 BTCUSDT 杠杆保持 1x，不恢复原杠杆。
 - 实盘完整探针的一次明确授权覆盖最小开仓和紧接其后的首次整仓平仓；进程重启后不继承写授权。
-- 启动前必须确认 BTCUSDT 无活动订单、无持仓、Agent 有效且保证金足够；读取并记录账户 `positionMode`，但本探针不得修改持仓模式。
+- 启动前必须确认 BTCUSDT 无活动订单、无持仓、Agent 有效且保证金足够；账户 `positionMode` 必须是官方界面映射的 `OneWay=0`，本探针不得修改持仓模式。
 
 任何前置条件不满足都必须在广播前失败。
 
