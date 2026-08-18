@@ -127,6 +127,8 @@ The isolated `npm run popdex:fill-close-probe` implementation is complete for of
 
 The default command is read-only apart from `eth_call` simulation: it does not sign, broadcast, or create `.popdex-fill-close-probe.json`. A new full Mainnet run requires the dedicated `--confirm-mainnet-fill-close` flag. Ordinary `--resume` performs no exchange write. Recovery cancellation and recovery closing require separate `--resume --confirm-mainnet-cancel` and `--resume --confirm-mainnet-close` approvals, and an already persisted transaction hash prevents a second broadcast.
 
+The 2026-08-18 Mainnet fill response was observed to expose its exact decimal-string identity as `execId`, with no `fillId` or `tradeId` field. The account normalizer maps that verified field to the internal `fillId` while rejecting conflicting aliases, so fill deduplication and recovery retain the exchange-provided identity without numeric conversion.
+
 Automated tests prove the complete state machine with mocked exchange dependencies, including 1x readback, full/partial/zero fill branches, exact cancellation, long-position quantity equality, reverse close, final flat state, bounded polling, crash recovery, and no-retry behavior. No marketable Mainnet fill, leverage update, or reverse close was executed during this implementation; those gates remain pending separate user approval and live evidence.
 
 ## Required write probes

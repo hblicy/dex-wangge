@@ -139,13 +139,15 @@ export function normalizeFill(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('PopDEX fill 必须是对象。');
   }
-  const rawFillId = value.fillId ?? value.tradeId;
-  if (value.fillId !== undefined && value.tradeId !== undefined && value.fillId !== value.tradeId) {
-    throw new Error('PopDEX fill.fillId 与 fill.tradeId 冲突。');
+  const fillIds = [value.fillId, value.tradeId, value.execId]
+    .filter((item) => item !== undefined)
+    .map((item) => strictIntegerString(item, 'fill ID'));
+  if (new Set(fillIds).size > 1) {
+    throw new Error('PopDEX fill ID 字段冲突。');
   }
   return {
     ...value,
-    fillId: strictIntegerString(rawFillId, 'fill.fillId'),
+    fillId: strictIntegerString(fillIds[0], 'fill.fillId'),
     orderId: strictIntegerString(value.orderId, 'fill.orderId'),
     symbol: strictTargetSymbol(value.symbol, 'fill.symbol'),
     side: strictNonEmptyString(value.side, 'fill.side'),

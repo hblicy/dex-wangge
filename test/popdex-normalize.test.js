@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  normalizeFill,
   normalizeMarket,
   strictAddress,
   strictDecimalString,
@@ -47,4 +48,21 @@ test('PopDEX primitive parsers reject unsafe or lossy values', () => {
   assert.equal(strictDecimalString('0.0001', 'qty'), '0.0001');
   assert.throws(() => strictIntegerString(9007199254740992, 'orderId'), /字符串/);
   assert.throws(() => strictDecimalString('1e-4', 'qty'), /十进制字符串/);
+});
+
+test('PopDEX current mainnet execId is preserved as the canonical fillId', () => {
+  const fill = normalizeFill({
+    execId: '238561552737763342',
+    orderId: '238561551932456960',
+    symbol: 'BTCUSDT',
+    side: 'Buy',
+    execPrice: '64115',
+    execQty: '0.0002',
+  });
+  assert.equal(fill.fillId, '238561552737763342');
+  assert.equal(fill.execId, '238561552737763342');
+  assert.throws(() => normalizeFill({
+    ...fill,
+    fillId: '1',
+  }), /fill.*ID.*冲突/);
 });
