@@ -199,3 +199,16 @@ test('existing ownership and terminal event facts cannot be overwritten or reint
     event: { ...terminalResult().event, suppressRequote: true },
   })), /终态事件事实冲突/);
 });
+
+test('partial reconciliation persists exact fill IDs for restart deduplication', () => {
+  const store = createStore();
+  store.upsertOrder(ownedOrder());
+  store.applyResult('123', {
+    state: 'PARTIAL',
+    event: null,
+    filledQtyWad: '80',
+    fillIds: ['7'],
+  });
+  assert.equal(store.listOrders()[0].filledQtyWad, '80');
+  assert.deepEqual(store.listOrders()[0].fillIds, ['7']);
+});

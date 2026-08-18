@@ -70,10 +70,12 @@ function fill(fillId, qtyWad, price = '63000', overrides = {}) {
 
 test('partial fills stay active and duplicate fill IDs fail', () => {
   const active = officialOrder({ filledQtyWad: '100', remainingQtyWad: '100' });
-  assert.equal(reconcileOwnedOrder(ownedOrder(), {
+  const partial = reconcileOwnedOrder(ownedOrder(), {
     active,
     fills: [fill('1', '100')],
-  }).state, 'PARTIAL');
+  });
+  assert.equal(partial.state, 'PARTIAL');
+  assert.deepEqual(partial.fillIds, ['1']);
 
   assert.throws(() => reconcileOwnedOrder(ownedOrder(), {
     active,

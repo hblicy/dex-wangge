@@ -222,6 +222,7 @@ export function reconcileOwnedOrder(ownedValue, {
   }
   const owned = normalizeOwned(ownedValue);
   const fills = normalizeFills(fillValues, owned);
+  const exactFillIds = fills.fills.map((value) => value.fillId).sort();
 
   if (active !== null) {
     const official = normalizeOfficial(active, owned, 'active');
@@ -234,6 +235,7 @@ export function reconcileOwnedOrder(ownedValue, {
     if (official.remainingQtyWad === 0n) return result('SETTLING');
     return result(fills.qtyWad === 0n ? 'OPEN' : 'PARTIAL', null, {
       filledQtyWad: fills.qtyWad.toString(),
+      fillIds: exactFillIds,
     });
   }
 

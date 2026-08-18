@@ -12,7 +12,7 @@ const EVENT_KEYS = new Set([
   'suppressRequote', 'replacementOrderId',
 ]);
 const RESULT_KEYS = new Set([
-  'state', 'event', 'filledQtyWad', 'officialFilledQtyWad', 'fillSumQtyWad',
+  'state', 'event', 'filledQtyWad', 'fillIds', 'officialFilledQtyWad', 'fillSumQtyWad',
 ]);
 const STATES = new Set([
   'OPEN', 'PARTIAL', 'FILLED', 'CANCELLED', 'REJECTED', 'EXPIRED', 'SETTLING',
@@ -327,6 +327,9 @@ export class PopdexOwnershipStore {
       order.state = result.state;
       const resultFilled = result.filledQtyWad ?? result.event?.filledQtyWad ?? order.filledQtyWad;
       order.filledQtyWad = wad(resultFilled, 'result.filledQtyWad');
+      if (result.fillIds !== undefined) {
+        order.fillIds = fillIds(result.fillIds, 'result.fillIds');
+      }
       if (result.event !== null && result.event !== undefined) {
         const nextEvent = eventFromResult(result.event, order);
         order.fillIds = fillIds(result.event.fillIds, 'result.event.fillIds');
