@@ -7,12 +7,12 @@ import {
   POPDEX_USER_CONFIG_PRECOMPILE,
 } from './constants.js';
 import {
-  POPDEX_REVERSE_INTERFACE,
   POPDEX_USER_CONFIG_INTERFACE,
+  encodeReduceOnlyMarketClose,
   parseLeverageUpdatedReceipt,
   verifyStage5Simulation,
 } from './fill-close-codec.js';
-import { exactBtcLeverage } from './fill-close-state.js';
+import { assertConfirmedLong, exactBtcLeverage } from './fill-close-state.js';
 import { encodeCancelOrder, POPDEX_ORDER_INTERFACE } from './order-codec.js';
 import { strictAddress, strictIntegerString } from './normalize.js';
 import { parseOrderCancelReceipt, parseOrderCreateReceipt } from './receipt-events.js';
@@ -321,6 +321,7 @@ export class PopdexTradingClient {
     expectedStage,
     nextStage,
     txHashField,
+    journalFields = {},
     to = POPDEX_ORDER_PRECOMPILE,
     simulationInterface = null,
   }) {
@@ -339,7 +340,10 @@ export class PopdexTradingClient {
     }
     const serialized = await this.#sign(target, calldata);
     const localTxHash = keccak256(serialized).toLowerCase();
-    journal.advance(expectedStage, nextStage, { [txHashField]: localTxHash });
+    journal.advance(expectedStage, nextStage, {
+      ...journalFields,
+      [txHashField]: localTxHash,
+    });
     try {
       const remoteTxHash = (await this.writeRpc.broadcast(serialized)).toLowerCase();
       if (remoteTxHash !== localTxHash) {
@@ -629,23 +633,56 @@ export class PopdexTradingClient {
     }
   }
 
-  async closeFillCloseLong(plan, journal) {
+  async closeFillCloseLong(plan, position, journal) {
     this.#assertFillClosePlan(plan);
+    if (!position || position.closeClientOrderId !== plan.closeClientOrderId
+        || position.positionQtyWad !== position.closeQtyWad
+        || typeof position.positionId !== 'string') {
+      throw new Error('PopDEX Stage 5 平仓身份或数量与已确认持仓不匹配。');
+    }
     await this.preflight();
+    const [openOrders, positions] = await Promise.all([
+      this.accountClient.getAllOpenOrders(this.mainAccount, 'BTCUSDT'),
+      this.readRpc.getAllOpenPositions(this.mainAccount),
+    ]);
+    const livePosition = assertConfirmedLong(
+      plan,
+      { openOrders, positions },
+      position.positionQtyWad,
+    );
+    if (String(livePosition.positionId) !== position.positionId) {
+      throw new Error('PopDEX Stage 5 平仓前持仓 ID 与 journal 不匹配。');
+    }
+    const data = encodeReduceOnlyMarketClose({
+      mainAccount: this.mainAccount,
+      closeClientOrderId: position.closeClientOrderId,
+      closeQtyWad: position.closeQtyWad,
+    });
     const receipt = await this.#submit({
-      data: plan.closeData,
-      functionName: 'placeReverseOrder',
+      data,
+      functionName: 'placeOrder',
       journal,
       expectedStage: 'POSITION_CONFIRMED',
       nextStage: 'CLOSE_BROADCAST',
       txHashField: 'closeTxHash',
-      simulationInterface: POPDEX_REVERSE_INTERFACE,
+      journalFields: {
+        closeKind: 'reduce-only-market',
+        closeQtyWad: position.closeQtyWad,
+      },
+      simulationInterface: POPDEX_ORDER_INTERFACE,
     });
     try {
-      if (receipt.status !== '0x1') {
-        throw new Error('PopDEX placeReverseOrder 回执必须是 status=0x1。');
-      }
-      return receipt;
+      const order = parseOrderCreateReceipt(receipt, {
+        account: plan.mainAccount,
+        symbolId: plan.symbolId,
+        clientOrderId: position.closeClientOrderId,
+        priceWad: '0',
+        qtyWad: position.closeQtyWad,
+      });
+      journal.advance('CLOSE_BROADCAST', 'CLOSE_SETTLING', {
+        closeOrderId: order.orderId,
+      });
+      return order;
     } catch (error) {
       safeJournalError(journal, 'CLOSE_BROADCAST', error);
       throw error;
