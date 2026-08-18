@@ -5,10 +5,14 @@ import {
   Interface,
   ZeroAddress,
 } from 'ethers';
-import { POPDEX_ORDER_INTERFACE } from '../src/exchange/px/order-codec.js';
 import {
-  POPDEX_REVERSE_INTERFACE,
+  encodeOrderParams,
+  POPDEX_ORDER_INTERFACE,
+} from '../src/exchange/px/order-codec.js';
+import {
+  POPDEX_REDUCE_ONLY_MARKET_PARAMS,
   POPDEX_USER_CONFIG_INTERFACE,
+  encodeReduceOnlyMarketClose,
   parseLeverageUpdatedReceipt,
   prepareFillClosePlan,
   verifyStage5Simulation,
@@ -17,6 +21,20 @@ import {
 const ACCOUNT = '0x1111111111111111111111111111111111111111';
 const OTHER = '0x2222222222222222222222222222222222222222';
 const USER_CONFIG_PRECOMPILE = '0x0000000000000000000000000000000000001009';
+const MAINNET_ACCOUNT = '0xdA1efA6fc801D6788Cc785405610462f99CCb3e8';
+const MAINNET_CLOSE_CLIENT_ID =
+  '0x7765622d31373837303334333039323331000000000000000000000000000000';
+const MAINNET_CLOSE_CALLDATA =
+  '0x0f05a9d9'
+  + '000000000000000000000000da1efa6fc801d6788cc785405610462f99ccb3e8'
+  + '7765622d31373837303334333039323331000000000000000000000000000000'
+  + '0000000000000000000000000000000000000000000000000000000000004e20'
+  + '0201010000000100000000000000000000000000000000000000000000000000'
+  + '0000000000000000000000000000000000000000000000000000000000000000'
+  + '0000000000000000000000000000000000000000000000000000b5e620f48000'
+  + '000000000000000000000000000000000000000000000000006a94d74f430000'
+  + '0000000000000000000000000000000000000000000000000000000000000000'
+  + '0000000000000000000000000000000000000000000000000000000000000000';
 
 function deterministicBytes() {
   return Uint8Array.from({ length: 16 }, (_unused, index) => index + 1);
@@ -42,6 +60,11 @@ test('fill-close plan is fixed to BTCUSDT 1x minimum long with 0.3 percent cap',
   assert.equal(prepared.price, '63189');
   assert.equal(prepared.qty, '0.0002');
   assert.equal(decodeBytes32String(prepared.clientOrderId), 'dw-bb-0102030405060708090a0b0c');
+  assert.equal(
+    decodeBytes32String(prepared.closeClientOrderId),
+    'dw-bc-0102030405060708090a0b0c',
+  );
+  assert.notEqual(prepared.clientOrderId, prepared.closeClientOrderId);
 
   const leverage = POPDEX_USER_CONFIG_INTERFACE.decodeFunctionData(
     'updateLeverage',
@@ -61,15 +84,37 @@ test('fill-close plan is fixed to BTCUSDT 1x minimum long with 0.3 percent cap',
   assert.equal(entry.price.toString(), prepared.priceWad);
   assert.equal(entry.qty.toString(), prepared.qtyWad);
   assert.equal(entry.clientOrderId, prepared.clientOrderId);
+  assert.equal(entry.orderParams, encodeOrderParams('buy'));
   assert.equal(entry.slippage, 0n);
   assert.equal(entry.builder, ZeroAddress);
   assert.equal(entry.builderFeeRate, 0n);
 
-  const close = POPDEX_REVERSE_INTERFACE.decodeFunctionData(
-    'placeReverseOrder',
-    prepared.closeData,
+  const close = POPDEX_ORDER_INTERFACE.decodeFunctionData(
+    'placeOrder',
+    prepared.closePreviewData,
   );
-  assert.deepEqual(Array.from(close, String), [ACCOUNT, '20000', '1']);
+  assert.equal(close.clientOrderId, prepared.closeClientOrderId);
+  assert.equal(close.orderParams, POPDEX_REDUCE_ONLY_MARKET_PARAMS);
+  assert.equal(close.price, 0n);
+  assert.equal(close.qty.toString(), prepared.qtyWad);
+  assert.equal(close.slippage, 30000000000000000n);
+  assert.equal(close.builder, ZeroAddress);
+  assert.equal(close.builderFeeRate, 0n);
+});
+
+test('reduce-only market close exactly matches the successful Mainnet calldata', () => {
+  assert.equal(
+    encodeReduceOnlyMarketClose({
+      mainAccount: MAINNET_ACCOUNT,
+      closeClientOrderId: MAINNET_CLOSE_CLIENT_ID,
+      closeQtyWad: '200000000000000',
+    }),
+    MAINNET_CLOSE_CALLDATA,
+  );
+  assert.equal(
+    POPDEX_REDUCE_ONLY_MARKET_PARAMS,
+    '0x0201010000000100000000000000000000000000000000000000000000000000',
+  );
 });
 
 test('fill-close plan rejects overrides and invalid orderbook facts', () => {
@@ -90,21 +135,21 @@ test('fill-close plan rejects overrides and invalid orderbook facts', () => {
 
 test('stage5 simulation accepts only empty or ABI true results', () => {
   assert.equal(
-    verifyStage5Simulation('0x', POPDEX_REVERSE_INTERFACE, 'placeReverseOrder'),
+    verifyStage5Simulation('0x', POPDEX_ORDER_INTERFACE, 'placeOrder'),
     'empty',
   );
-  const trueResult = POPDEX_REVERSE_INTERFACE.encodeFunctionResult('placeReverseOrder', [true]);
+  const trueResult = POPDEX_USER_CONFIG_INTERFACE.encodeFunctionResult('updateLeverage', [true]);
   assert.equal(
-    verifyStage5Simulation(trueResult, POPDEX_REVERSE_INTERFACE, 'placeReverseOrder'),
+    verifyStage5Simulation(trueResult, POPDEX_USER_CONFIG_INTERFACE, 'updateLeverage'),
     'bool-true',
   );
-  const falseResult = POPDEX_REVERSE_INTERFACE.encodeFunctionResult('placeReverseOrder', [false]);
+  const falseResult = POPDEX_USER_CONFIG_INTERFACE.encodeFunctionResult('updateLeverage', [false]);
   assert.throws(
-    () => verifyStage5Simulation(falseResult, POPDEX_REVERSE_INTERFACE, 'placeReverseOrder'),
+    () => verifyStage5Simulation(falseResult, POPDEX_USER_CONFIG_INTERFACE, 'updateLeverage'),
     /未返回 true/,
   );
   assert.throws(
-    () => verifyStage5Simulation('0x12', POPDEX_REVERSE_INTERFACE, 'placeReverseOrder'),
+    () => verifyStage5Simulation('0x12', POPDEX_ORDER_INTERFACE, 'placeOrder'),
     /模拟结果无效/,
   );
 });
