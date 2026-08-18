@@ -17,7 +17,7 @@
 - Mainnet `chainId=2184`，BTCUSDT `symbolId=20000`。
 - UserConfig 预编译地址为 `0x0000000000000000000000000000000000001009`；官方界面以该地址配合 UserConfig ABI 调用 `updatePositionMode`。
 - 账户配置通过 `getAccountConfig(account)` 读取，其中 `symbolLeverages` 包含 `symbolId:uint16` 和 `leverage:uint8`。
-- 杠杆写入接口为 `updateLeverage(account, request)`；BTC 合约请求固定使用 `newLeverage=1`、`symbolId=20000`、`category=Regular(0)` 和零地址 `tokenAddress`。
+- 杠杆写入接口为 `updateLeverage(account, request)`；BTC 合约请求固定使用 `newLeverage=1`、`symbolId=20000`、`category=Futures(2)` 和零地址 `tokenAddress`。官方枚举明确为 `Spot=0`、`Margin=1`、`Futures=2`；订单类别 `Regular=0` 是另一枚举，禁止混用。
 - `LeverageUpdated` 事件包含账户、市场、杠杆、`succeeded` 和 `code`，可用于回执核验。
 - 平仓接口为 `placeReverseOrder(account, symbolId, positionSide)`；`PositionSide.Long=1`、`PositionSide.Short=2`。
 - 官方仓位分页包含 `symbolId`、`side`、`holdSizeWad`、`closeSizeWad` 和 `lockedSizeWad`，所有大整数必须以字符串处理。
