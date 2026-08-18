@@ -165,6 +165,13 @@ test('operation journal completes only a PREPARED no-broadcast operation', () =>
     () => broadcast.completePreparedWithoutBroadcast('safe-no-broadcast'),
     /只有 PREPARED/,
   );
+
+  const place = createJournal();
+  place.create(placeFacts());
+  assert.throws(
+    () => place.completePreparedWithoutBroadcast('safe-no-broadcast'),
+    /place.*不能无广播完成/,
+  );
 });
 
 test('operation journal rejects unknown fields unsafe IDs malformed bytes32 and invalid kind facts', () => {
@@ -179,6 +186,9 @@ test('operation journal rejects unknown fields unsafe IDs malformed bytes32 and 
   assert.throws(() => createJournal().create(baseFacts({
     kind: 'close', positionId: '1', qty: '0', closeClientOrderId: CLOSE_CLIENT_ID,
   })), /qty/);
+  assert.throws(() => createJournal().create(placeFacts({
+    qty: '0.0002000000000000001',
+  })), /18 位小数/);
   assert.throws(() => createJournal().create(baseFacts({ kind: 'leverage', leverage: '2' })), /leverage/);
   assert.throws(() => createJournal().create(placeFacts({ symbol: 'ETHUSDT', symbolId: '20001' })), /只允许 BTCUSDT/);
 });

@@ -96,6 +96,26 @@ function exactEntropy(randomBytesImpl) {
   return entropy;
 }
 
+function exactEntropyBytes(value) {
+  if (!(value instanceof Uint8Array) || value.byteLength !== 16) {
+    throw new Error('PopDEX entropy 必须是 16 字节 Uint8Array。');
+  }
+  return value;
+}
+
+export function createBtcCloseClientOrderId(entropy) {
+  const entropyHex = hexlify(exactEntropyBytes(entropy).slice(0, 12)).slice(2);
+  return encodeBytes32String(`dw-bc-${entropyHex}`).toLowerCase();
+}
+
+export function encodeBtcLeverageOne(mainAccount) {
+  const account = strictAddress(mainAccount, 'mainAccount');
+  return POPDEX_USER_CONFIG_INTERFACE.encodeFunctionData('updateLeverage', [
+    account,
+    [1, 20000, ZeroAddress, 2],
+  ]);
+}
+
 export function prepareFillClosePlan({
   mainAccount,
   ask,
@@ -132,12 +152,9 @@ export function prepareFillClosePlan({
   const entropy = exactEntropy(randomBytesImpl);
   const entropyHex = hexlify(entropy.slice(0, 12)).slice(2);
   const clientOrderId = encodeBytes32String(`dw-bb-${entropyHex}`).toLowerCase();
-  const closeClientOrderId = encodeBytes32String(`dw-bc-${entropyHex}`).toLowerCase();
+  const closeClientOrderId = createBtcCloseClientOrderId(entropy);
   const orderParams = encodeOrderParams('buy');
-  const leverageData = POPDEX_USER_CONFIG_INTERFACE.encodeFunctionData('updateLeverage', [
-    account,
-    [1, 20000, ZeroAddress, 2],
-  ]);
+  const leverageData = encodeBtcLeverageOne(account);
   const entryData = POPDEX_ORDER_INTERFACE.encodeFunctionData('placeOrder', [
     account,
     clientOrderId,

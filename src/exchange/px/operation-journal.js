@@ -73,7 +73,12 @@ function positiveUint128(value, field) {
 
 function positiveDecimal(value, field) {
   const normalized = strictDecimalString(value, `operation journal ${field}`);
-  if (Number(normalized) <= 0) {
+  const [whole, fraction = ''] = normalized.split('.');
+  if (fraction.length > 18) {
+    throw new Error(`PopDEX operation journal ${field} 最多支持 18 位小数。`);
+  }
+  const scaled = BigInt(whole) * (10n ** 18n) + BigInt(fraction.padEnd(18, '0') || '0');
+  if (scaled <= 0n) {
     throw new Error(`PopDEX operation journal ${field} 必须大于 0。`);
   }
   return normalized;
@@ -368,6 +373,9 @@ export class PopdexOperationJournal {
     }
     if (outcome !== 'safe-no-broadcast') {
       throw new Error('PopDEX operation journal 无广播完成 outcome 必须是 safe-no-broadcast。');
+    }
+    if (current.kind === 'place') {
+      throw new Error('PopDEX operation journal place 不能无广播完成。');
     }
     return this.#persist({
       ...current,

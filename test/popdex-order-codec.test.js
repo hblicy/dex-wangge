@@ -10,6 +10,7 @@ import {
   encodeCancelOrder,
   encodeOrderParams,
   POPDEX_ORDER_INTERFACE,
+  prepareLimitOrder,
   prepareProbeOrder,
 } from '../src/exchange/px/order-codec.js';
 
@@ -30,6 +31,10 @@ function validOrder(overrides = {}) {
     ...overrides,
   };
 }
+
+test('production limit planner is byte-identical to the validated probe planner', () => {
+  assert.deepEqual(prepareLimitOrder(validOrder()), prepareProbeOrder(validOrder()));
+});
 
 test('prepareProbeOrder encodes the fixed BTC buy ABI vector without floating point', () => {
   const plan = prepareProbeOrder(validOrder());

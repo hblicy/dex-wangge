@@ -51,7 +51,7 @@ export function encodeOrderParams(side) {
   return hexlify(bytes);
 }
 
-export function prepareProbeOrder({
+export function prepareLimitOrder({
   mainAccount,
   symbol,
   side,
@@ -146,6 +146,10 @@ export function prepareProbeOrder({
     orderParams,
     data,
   });
+}
+
+export function prepareProbeOrder(input) {
+  return prepareLimitOrder(input);
 }
 
 export function encodeCancelOrder({ mainAccount, orderId, clientOrderId }) {
