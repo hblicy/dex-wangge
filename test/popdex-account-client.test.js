@@ -70,6 +70,23 @@ function makeAccountFetch(seen = []) {
   };
 }
 
+function accountClientFromPages(pages) {
+  return new PopdexAccountClient({
+    fetchImpl: async (input) => {
+      const url = new URL(input);
+      const key = `${url.pathname.endsWith('/trade/fills') ? 'fills' : 'orders'}:${String(url.searchParams.get('cursor'))}`;
+      const page = pages.get(key);
+      if (!page) throw new Error(`unexpected page ${key}`);
+      return jsonResponse({
+        code: '200',
+        msg: 'success',
+        data: page.data,
+        cursor: page.cursor,
+      });
+    },
+  });
+}
+
 test('account reads do not require or send a copied website bearer token', async () => {
   const seen = [];
   const client = new PopdexAccountClient({ fetchImpl: makeAccountFetch(seen) });
@@ -124,4 +141,68 @@ test('missing account is an explicit error rather than empty state', async () =>
   });
   const client = new PopdexAccountClient({ fetchImpl: missingAccountFetch });
   await assert.rejects(client.getOverview(ACCOUNT), /11100.*Account does not exist/);
+});
+
+test('account client collects all fills and rejects a repeated cursor', async () => {
+  const fill = (fillId) => ({
+    fillId,
+    orderId: '9',
+    symbol: 'BTCUSDT',
+    side: 'Buy',
+    execPrice: '63000',
+    execQty: '0.0001',
+  });
+  const client = accountClientFromPages(new Map([
+    ['fills:null', { data: [fill('1')], cursor: '7' }],
+    ['fills:7', { data: [fill('2')], cursor: '' }],
+  ]));
+  assert.equal((await client.getAllFills(ACCOUNT, 'BTCUSDT')).length, 2);
+
+  const repeated = accountClientFromPages(new Map([
+    ['fills:null', { data: [], cursor: '7' }],
+    ['fills:7', { data: [], cursor: '7' }],
+  ]));
+  await assert.rejects(repeated.getAllFills(ACCOUNT, 'BTCUSDT'), /cursor.*重复/);
+});
+
+test('account client collects all open orders with bounded strict pagination', async () => {
+  const order = (orderId) => ({
+    orderId,
+    clientOid: `dw-bb-${orderId.padStart(24, '0')}`,
+    symbol: 'BTCUSDT',
+    side: 'Buy',
+    status: 'OPEN',
+    price: '60000',
+    qty: '0.0002',
+    filledQty: '0',
+  });
+  const client = accountClientFromPages(new Map([
+    ['orders:null', { data: { orders: [order('1')] }, cursor: '7' }],
+    ['orders:7', { data: { orders: [order('2')] }, cursor: '' }],
+  ]));
+  assert.equal((await client.getAllOpenOrders(ACCOUNT, 'BTCUSDT')).length, 2);
+
+  const repeated = accountClientFromPages(new Map([
+    ['orders:null', { data: { orders: [] }, cursor: '7' }],
+    ['orders:7', { data: { orders: [] }, cursor: '7' }],
+  ]));
+  await assert.rejects(repeated.getAllOpenOrders(ACCOUNT, 'BTCUSDT'), /cursor.*重复/);
+
+  const endlessPages = new Map();
+  endlessPages.set('orders:null', { data: { orders: [] }, cursor: '1' });
+  for (let page = 1; page <= 10; page += 1) {
+    endlessPages.set(`orders:${page}`, {
+      data: { orders: [] },
+      cursor: String(page + 1),
+    });
+  }
+  await assert.rejects(
+    accountClientFromPages(endlessPages).getAllOpenOrders(ACCOUNT, 'BTCUSDT'),
+    /分页超过.*10/,
+  );
+
+  const malformed = accountClientFromPages(new Map([
+    ['orders:null', { data: { orders: null }, cursor: '' }],
+  ]));
+  await assert.rejects(malformed.getAllOpenOrders(ACCOUNT, 'BTCUSDT'), /orders.*数组/);
 });
