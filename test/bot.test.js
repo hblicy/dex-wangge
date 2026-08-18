@@ -39,6 +39,80 @@ test('stop stays running and keeps tracking when cancelAll fails', async () => {
   assert.equal(bot.active.size, 4);
 });
 
+test('Decibel cancellation requires two consecutive valid empty snapshots', async () => {
+  const live = [{ orderId: '1', price: 95, side: 'buy' }];
+  const exchange = new FakeExchange();
+  exchange.requiresCancelConfirmation = true;
+  exchange.cancelAll = async () => true;
+  const snapshots = [[], live, [], []];
+  exchange.fetchOpenOrders = async () => snapshots.shift();
+  let forgot = 0;
+  exchange.forgetOrders = () => { forgot++; };
+  const bot = new GridBot(exchange, {
+    cancelVerifyAttempts: 4, cancelVerifyDelayMs: 0, cancelVerifyStableReads: 2,
+  });
+
+  await bot._requireCancelAll(1, '测试');
+
+  assert.equal(snapshots.length, 0);
+  assert.equal(forgot, 1);
+});
+
+test('Decibel cancellation keeps state when snapshots are malformed', async () => {
+  const exchange = new FakeExchange();
+  exchange.requiresCancelConfirmation = true;
+  exchange.cancelAll = async () => true;
+  exchange.fetchOpenOrders = async () => null;
+  const bot = new GridBot(exchange, {
+    cancelVerifyAttempts: 2, cancelVerifyDelayMs: 0, cancelVerifyStableReads: 2,
+  });
+
+  await assert.rejects(bot._requireCancelAll(1, '测试'), /无法从交易所读取挂单快照/);
+});
+
+test('Decibel cancellation waits for pending placements before cancelAll', async () => {
+  const exchange = new FakeExchange();
+  exchange.requiresCancelConfirmation = true;
+  let cancelCalls = 0;
+  exchange.cancelAll = async () => { cancelCalls++; exchange.orders.clear(); return true; };
+  const bot = new GridBot(exchange, {
+    cancelVerifyAttempts: 2, cancelVerifyDelayMs: 0, cancelVerifyStableReads: 2,
+  });
+  let release;
+  const placement = new Promise((resolve) => { release = resolve; });
+  bot._pendingLevels.set(2, placement);
+
+  const cancelling = bot._requireCancelAll(1, '测试');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(cancelCalls, 0);
+  bot._pendingLevels.delete(2);
+  release();
+  await cancelling;
+  assert.equal(cancelCalls, 1);
+});
+
+test('Decibel stop never closes a position when cancellation confirmation fails', async () => {
+  const live = [{ orderId: '1', price: 95, side: 'buy' }];
+  const exchange = new FakeExchange();
+  exchange.requiresCancelConfirmation = true;
+  exchange.cancelAll = async () => true;
+  exchange.fetchOpenOrders = async () => live;
+  let closeCalls = 0;
+  exchange.closePosition = async () => { closeCalls++; return true; };
+  const bot = new GridBot(exchange, {
+    cancelVerifyAttempts: 2, cancelVerifyDelayMs: 0, cancelVerifyStableReads: 2,
+  });
+  bot.running = true;
+  bot.config = { ...config };
+  bot.active.set('1', { levelIndex: 1, side: 'buy', price: 95, placedAt: 1 });
+
+  await assert.rejects(bot.stop({ closePosition: true }), /撤单未完成确认/);
+
+  assert.equal(bot.running, true);
+  assert.equal(bot.active.size, 1);
+  assert.equal(closeCalls, 0);
+});
+
 test('start rejects a price outside the grid before placing orders', async () => {
   const exchange = new FakeExchange({ price: 80 });
   const bot = new GridBot(exchange);
@@ -508,4 +582,34 @@ test('adapter health fields pass through while generic bot counters remain', () 
   assert.equal(health.unknownOrders, 1);
   assert.equal(health.placeFails, 0);
   assert.equal(Object.hasOwn(health, 'exchangeOpenOrders'), true);
+});
+
+test('reconcile does not resend an accepted Decibel duplicate cancellation', async () => {
+  const exchange = new FakeExchange();
+  exchange.requiresCancelConfirmation = true;
+  exchange.orders = new Map([
+    ['survivor', { price: 95, side: 'buy' }],
+    ['duplicate', { price: 95, side: 'buy' }],
+  ]);
+  let cancelCalls = 0;
+  exchange.cancelOrder = async () => { cancelCalls++; return true; };
+  const forgotten = [];
+  exchange.forgetOrder = (orderId) => forgotten.push(String(orderId));
+  const bot = new GridBot(exchange);
+  bot.running = true;
+  bot.config = { ...config };
+  bot.grid = { levels: [90, 95, 100, 105], spacing: 5, count: 4 };
+
+  await bot.reconcileOpenOrders();
+  await bot.reconcileOpenOrders();
+
+  assert.equal(cancelCalls, 1);
+  assert.equal(bot._pendingCancelOrders.has('duplicate'), true);
+
+  exchange.orders.delete('duplicate');
+  await bot.reconcileOpenOrders();
+  await bot.reconcileOpenOrders();
+
+  assert.deepEqual(forgotten, ['duplicate']);
+  assert.equal(bot._pendingCancelOrders.size, 0);
 });
