@@ -87,6 +87,7 @@ export class DecibelExchange extends EventEmitter {
   constructor(opts = {}) {
     super();
     this.mode = 'live';
+    this.requiresCancelConfirmation = true;
     this.network = opts.network === 'testnet' ? 'testnet' : 'mainnet';
     this.net = NETWORKS[this.network];
     this.apiKey = opts.apiKey;                 // Geomi API key (read + fullnode auth)

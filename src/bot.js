@@ -65,6 +65,10 @@ export class GridBot {
     this._finishingRecovery = false; // prevents concurrent recovery-finalization attempts
     this._cancellingRecoveryLadder = false;
     this._recoveryOrdersPromise = null;
+    this._cancelVerifyAttempts = opts.cancelVerifyAttempts ?? 12;
+    this._cancelVerifyDelayMs = opts.cancelVerifyDelayMs ?? 750;
+    this._cancelVerifyStableReads = opts.cancelVerifyStableReads ?? 2;
+    this._pendingCancelOrders = new Map();
     this._pnlBase = null;            // realizedPnl baseline; resetStats uses an offset because some
                                      // adapters (RISEx) re-fetch realizedPnl from the exchange every poll
   }
@@ -282,16 +286,81 @@ export class GridBot {
     };
   }
 
+  async _waitForPendingPlacements() {
+    const deadline = Date.now() + 300_000;
+    while (this._pendingLevels.size > 0) {
+      if (Date.now() >= deadline) {
+        throw new Error(`仍有下单流程未结束（在途 ${this._pendingLevels.size} 笔），无法安全开始撤单。`);
+      }
+      const pending = [...this._pendingLevels.values()];
+      await Promise.race([Promise.allSettled(pending), sleep(50)]);
+    }
+  }
+
+  async _confirmOrdersGone(marketId, orderIds = null) {
+    if (typeof this.ex.fetchOpenOrders !== 'function') {
+      throw new Error('交易所适配器不支持查询真实挂单，无法安全确认撤单。');
+    }
+    const wanted = orderIds ? new Set([...orderIds].map(String)) : null;
+    let stableEmpty = 0;
+    let sawValidSnapshot = false;
+    let lastRemaining = null;
+    let lastError = null;
+    for (let attempt = 1; attempt <= this._cancelVerifyAttempts; attempt++) {
+      try {
+        const real = await this.ex.fetchOpenOrders(marketId);
+        if (Array.isArray(real)) {
+          this._exchangeOpenOrders = real.length;
+          sawValidSnapshot = true;
+          const remaining = wanted
+            ? real.filter((order) => wanted.has(String(order.orderId)))
+            : real;
+          lastRemaining = remaining.length;
+          if (remaining.length === 0) {
+            stableEmpty++;
+            if (stableEmpty >= this._cancelVerifyStableReads) return true;
+          } else {
+            stableEmpty = 0;
+          }
+        } else {
+          stableEmpty = 0;
+        }
+      } catch (error) {
+        lastError = error;
+        stableEmpty = 0;
+      }
+      if (attempt < this._cancelVerifyAttempts) await sleep(this._cancelVerifyDelayMs);
+    }
+    if (!sawValidSnapshot) {
+      throw new Error('撤单请求已发送，但无法从交易所读取挂单快照进行确认'
+        + (lastError ? `：${lastError?.message || lastError}` : '。'));
+    }
+    throw new Error(`撤单未完成确认：交易所仍检测到 ${lastRemaining ?? '未知'} 笔目标挂单。`);
+  }
+
   async _requireCancelAll(marketId, action, { waitForRecovery = true } = {}) {
     if (waitForRecovery && this._recoveryOrdersPromise) {
       await this._recoveryOrdersPromise;
     }
+    await this._waitForPendingPlacements();
     let ok;
     try { ok = await this.ex.cancelAll(marketId); }
     catch (cause) {
       throw new Error(`${action}前撤单失败：${cause?.message || cause}`, { cause });
     }
     if (ok !== true) throw new Error(`${action}前撤单失败：交易所未确认全部撤单成功。`);
+    if (this.ex.requiresCancelConfirmation !== true) return;
+    this._alert(`${action}：撤单请求已接受，等待交易所连续快照确认。`);
+    try {
+      await this._confirmOrdersGone(marketId);
+    } catch (cause) {
+      throw new Error(`${action}前撤单失败：${cause?.message || cause}`, { cause });
+    }
+    this.ex.forgetOrders?.(marketId);
+    for (const [orderId, pending] of this._pendingCancelOrders) {
+      if (pending.marketId === Number(marketId)) this._pendingCancelOrders.delete(orderId);
+    }
+    this._alert(`${action}：已连续确认交易所挂单清空。`);
   }
 
   async _start(cfg) {
