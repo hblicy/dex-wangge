@@ -175,6 +175,36 @@ export class PopdexAccountClient {
     return this.#orders(account, symbol);
   }
 
+  async #collectPages(readPage, label, { maxPages = 10 } = {}) {
+    if (!Number.isSafeInteger(maxPages) || maxPages <= 0 || maxPages > 10) {
+      throw new Error(`PopDEX ${label} maxPages 必须是 1-10 的安全整数。`);
+    }
+    const all = [];
+    const seenCursors = new Set();
+    let cursor = null;
+    for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
+      const rows = await readPage(cursor);
+      all.push(...rows);
+      if (rows.cursor === undefined) return all;
+      if (seenCursors.has(rows.cursor)) {
+        throw new Error(`PopDEX ${label} cursor ${rows.cursor} 重复。`);
+      }
+      seenCursors.add(rows.cursor);
+      cursor = rows.cursor;
+    }
+    throw new Error(`PopDEX ${label} 分页超过 maxPages=${maxPages}。`);
+  }
+
+  async getAllOpenOrders(account, symbol, options = {}) {
+    const wallet = strictAddress(account, 'account');
+    const target = targetSymbol(symbol);
+    return this.#collectPages(
+      (cursor) => this.#orders(wallet, target, cursor),
+      'orders',
+      options,
+    );
+  }
+
   async getOrderHistory(account, symbol, cursor = null) {
     return this.#orders(account, symbol, cursor);
   }
@@ -212,6 +242,16 @@ export class PopdexAccountClient {
     const payload = envelope.data;
     const rows = listFrom(payload, ['data', 'list', 'rows', 'fills'], 'fills');
     return attachCursor(rows.map(normalizeFill), envelope, payload);
+  }
+
+  async getAllFills(account, symbol, options = {}) {
+    const wallet = strictAddress(account, 'account');
+    const target = targetSymbol(symbol);
+    return this.#collectPages(
+      (cursor) => this.getFills(wallet, target, cursor),
+      'fills',
+      options,
+    );
   }
 
   async getOverview(account) {
