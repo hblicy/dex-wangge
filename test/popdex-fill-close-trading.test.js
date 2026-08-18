@@ -138,7 +138,9 @@ function dependencies({
               overrides.symbolId ?? parsed.args.symbolId,
               overrides.orderId ?? (parsed.args.price === 0n ? CLOSE_ORDER_ID : ORDER_ID),
               overrides.clientOrderId ?? parsed.args.clientOrderId,
-              overrides.price ?? parsed.args.price,
+              overrides.price ?? (parsed.args.price === 0n
+                ? 62358000000000000000000n
+                : parsed.args.price),
               overrides.qty ?? parsed.args.qty,
               0,
               2,

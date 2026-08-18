@@ -112,6 +112,48 @@ test('OrderCreate receipt rejects missing, duplicate, failed and conflicting eve
   );
 });
 
+test('OrderCreate market receipt accepts only an explicitly requested positive execution price', () => {
+  const expected = {
+    account: ACCOUNT,
+    symbolId: '20000',
+    clientOrderId: CLIENT_ORDER_ID,
+    priceWad: '0',
+    qtyWad: '200000000000000',
+    priceRule: 'positive-execution',
+  };
+  const result = parseOrderCreateReceipt(receipt([
+    createLog({ price: '62358000000000000000000' }),
+  ]), expected);
+  assert.equal(result.priceWad, '62358000000000000000000');
+
+  assert.throws(
+    () => parseOrderCreateReceipt(receipt([createLog({ price: '0' })]), expected),
+    /priceWad.*正整数/,
+  );
+  assert.throws(
+    () => parseOrderCreateReceipt(receipt([createLog({ price: '-1' })]), expected),
+    /priceWad.*非负整数字符串/,
+  );
+  assert.throws(
+    () => parseOrderCreateReceipt(receipt([
+      createLog({ price: '62358000000000000000000' }),
+    ]), { ...expected, priceRule: undefined }),
+    /priceWad.*不匹配/,
+  );
+  assert.throws(
+    () => parseOrderCreateReceipt(receipt([
+      createLog({ price: '62358000000000000000000' }),
+    ]), { ...expected, priceWad: '1' }),
+    /positive-execution.*priceWad=0/,
+  );
+  assert.throws(
+    () => parseOrderCreateReceipt(receipt([
+      createLog({ price: '62358000000000000000000' }),
+    ]), { ...expected, priceRule: 'unknown' }),
+    /priceRule.*无效/,
+  );
+});
+
 test('OrderCancel receipt confirms the exact order and client ID', () => {
   const result = parseOrderCancelReceipt(receipt([cancelLog()]), {
     account: ACCOUNT,

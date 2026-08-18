@@ -3,6 +3,7 @@ import { POPDEX_ORDER_PRECOMPILE } from './constants.js';
 import { strictAddress, strictIntegerString } from './normalize.js';
 
 const BYTES32 = /^0x[0-9a-fA-F]{64}$/;
+const ORDER_CREATE_PRICE_RULES = new Set(['exact', 'positive-execution']);
 
 export const POPDEX_ORDER_EVENT_INTERFACE = new Interface([
   'event OrderCreate(address indexed account,uint16 indexed symbol,uint128 orderId,bytes32 clientOid,int256 price,int256 qty,int256 borrowAmount,uint8 status,bool succeeded,uint32 code)',
@@ -26,6 +27,14 @@ function mismatch(eventName, field, expected, actual) {
   throw new Error(
     `PopDEX ${eventName} ${field} 不匹配：expected=${String(expected)} actual=${String(actual)}。`,
   );
+}
+
+function exactPriceRule(value) {
+  const rule = value ?? 'exact';
+  if (!ORDER_CREATE_PRICE_RULES.has(rule)) {
+    throw new Error(`PopDEX OrderCreate expected.priceRule 无效：${String(rule)}。`);
+  }
+  return rule;
 }
 
 function exactEvent(receipt, eventName) {
@@ -71,6 +80,7 @@ export function parseOrderCreateReceipt(receipt, expected) {
   const clientOrderId = exactBytes32(expected.clientOrderId, 'OrderCreate expected.clientOrderId');
   const priceWad = strictIntegerString(expected.priceWad, 'OrderCreate expected.priceWad');
   const qtyWad = strictIntegerString(expected.qtyWad, 'OrderCreate expected.qtyWad');
+  const priceRule = exactPriceRule(expected.priceRule);
   const args = exactEvent(receipt, 'OrderCreate');
   exactSuccess('OrderCreate', args);
 
@@ -83,10 +93,22 @@ export function parseOrderCreateReceipt(receipt, expected) {
     ['account', account.toLowerCase(), actualAccount.toLowerCase()],
     ['symbolId', symbolId, actualSymbolId],
     ['clientOrderId', clientOrderId, actualClientOrderId],
-    ['priceWad', priceWad, actualPriceWad],
     ['qtyWad', qtyWad, actualQtyWad],
   ]) {
     if (wanted !== actual) mismatch('OrderCreate', field, wanted, actual);
+  }
+  if (priceRule === 'exact') {
+    if (priceWad !== actualPriceWad) {
+      mismatch('OrderCreate', 'priceWad', priceWad, actualPriceWad);
+    }
+  } else {
+    if (priceWad !== '0') {
+      throw new Error('PopDEX OrderCreate positive-execution 只允许提交 priceWad=0。');
+    }
+    const executionPriceWad = strictIntegerString(actualPriceWad, 'OrderCreate priceWad');
+    if (BigInt(executionPriceWad) <= 0n) {
+      throw new Error('PopDEX OrderCreate priceWad 必须是正整数。');
+    }
   }
 
   return {
