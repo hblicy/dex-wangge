@@ -147,3 +147,41 @@ test('Decibel cancelAll reports failure and retains failed order tracking', asyn
   assert.equal(await exchange.cancelAll(1), false);
   assert.equal(exchange._tracked.has('order-1'), true);
 });
+
+test('Decibel keeps accepted cancellations tracked until explicitly forgotten', async () => {
+  const exchange = new DecibelExchange({ apiKey: 'x', privateKey: '1' });
+  exchange.markets.set(1, { marketId: 1, name: 'BTC-USD', addr: '0xbtc' });
+  exchange._tracked.set('order-1', { marketId: 1 });
+  exchange.write = { cancelOrder: async () => ({ hash: '0x1' }) };
+
+  assert.equal(await exchange.cancelOrder(1, 'order-1'), true);
+  assert.equal(exchange._tracked.has('order-1'), true);
+  exchange.forgetOrder('order-1');
+  assert.equal(exchange._tracked.has('order-1'), false);
+});
+
+test('Decibel cancelAll ignores tracked orders missing from one valid snapshot', async () => {
+  const exchange = new DecibelExchange({ apiKey: 'x', privateKey: '1' });
+  exchange.markets.set(1, { marketId: 1, name: 'BTC-USD', addr: '0xbtc' });
+  exchange._tracked.set('order-1', { marketId: 1 });
+  exchange._tracked.set('order-2', { marketId: 1 });
+  exchange._openOrders = async () => [{ order_id: 'order-1', market: 'BTC-USD', is_tpsl: false }];
+  const cancelled = [];
+  exchange.write = { cancelOrder: async ({ orderId }) => { cancelled.push(orderId); } };
+
+  assert.equal(await exchange.cancelAll(1), true);
+  assert.deepEqual(cancelled, ['order-1']);
+  assert.deepEqual([...exchange._tracked.keys()], ['order-1', 'order-2']);
+});
+
+test('Decibel cancelAll rejects a malformed open-order snapshot', async () => {
+  const exchange = new DecibelExchange({ apiKey: 'x', privateKey: '1' });
+  exchange.on('error', () => {});
+  exchange.markets.set(1, { marketId: 1, name: 'BTC-USD', addr: '0xbtc' });
+  exchange._openOrders = async () => null;
+  let writes = 0;
+  exchange.write = { cancelOrder: async () => { writes++; } };
+
+  assert.equal(await exchange.cancelAll(1), false);
+  assert.equal(writes, 0);
+});
