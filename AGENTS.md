@@ -5,10 +5,12 @@
 ## 当前产品边界
 
 - Decibel、Extended 与 RISEx 支持 `paper` 和 `live`；RISEx live 只允许 mainnet 的 BTC-PERP / ETH-PERP。
-- PopDEX 处于“只读验证 + 独立临时 Agent 授权 + 显式 CLI 单笔探针”阶段；普通下单撤单探针允许 BTCUSDT / ETHUSDT，第 5 阶段成交平仓探针只允许 BTCUSDT、Buy/Long、OneWay、1x。两者都尚未注册为可运行交易所，也尚未开放自动网格。
+- PopDEX Stage 5 主网最小金额闭环已经验收：BTCUSDT、Buy/Long、OneWay、1x 的限价成交、撤余单和 reduce-only 市价平仓均已由官方订单、成交、回执和最终空仓事实确认。
+- PopDEX Stage 6 已提供隔离的 live `IExchange` 外观、通用操作日志和使用官方行情的 Paper 模式；这些模块尚未注册到 Bot、服务器、配置、API 或前端，不能由网页启动。
+- PopDEX Stage 7 必须完成 live 成交补单、重启订单接管、离线成交恢复、断线对账和 BTC 小网格验收；当前尚未开放自动网格，完成前 PopDEX 实盘网格也不得开放。
 - PopDEX 主钱包私钥禁止进入前端、后端、配置或日志。临时 Agent 私钥只能由浏览器内存生成，链上授权回验成功且用户明确确认后才能写入 `.env`；撤销必须先确认链上 Agent 已失效，再清除本地私钥。
 - PopDEX Agent API 必须独立于 exchange registry、GridBot、`.state.json`、AI、Decibel 和 RISEx；本阶段禁止新增 PopDEX start/stop/order/cancel/leverage/close 路由。
-- PopDEX 真实订单只允许由独立 CLI 触发：已验收的非成交下单撤单探针使用 `npm run popdex:write-probe` 与 `--confirm-mainnet-write`；第 5 阶段成交平仓探针使用独立的 `npm run popdex:fill-close-probe`、`--confirm-mainnet-fill-close` 和恢复写入参数。默认命令与普通 `--resume` 必须只读；服务器、网页、Agent API 和 GridBot 禁止导入或调用交易客户端。任何新的主网写入仍需用户逐次明确批准。
+- PopDEX 真实订单只允许由独立 CLI 触发：已验收的 CLI 单笔下单撤单探针使用 `npm run popdex:write-probe` 与 `--confirm-mainnet-write`；第 5 阶段成交平仓探针使用独立的 `npm run popdex:fill-close-probe`、`--confirm-mainnet-fill-close` 和恢复写入参数。默认命令与普通 `--resume` 必须只读；服务器、网页、Agent API 和 GridBot 禁止导入或调用交易客户端。任何新的主网写入仍需用户逐次明确批准。
 - PopDEX UserConfig 预编译固定为 `0x0000000000000000000000000000000000001009`，`getAccountConfig`、`updateLeverage`、`LeverageUpdated` 属于该预编译。BTCUSDT 杠杆请求固定 `newLeverage=1`、`symbolId=20000`、零 token 地址、`category=Futures(2)`；禁止把 `OrderCategory.Regular(0)` 当作合约品类。官方网页成功平仓交易 `0xbb8f…1e50` 证明最终清仓使用 Order 预编译的 `placeOrder`：Market、Sell、ReduceOnly、Net、`price=0`、精确仓位数量、`slippage=3%`；`placeReverseOrder(account,20000,Long=1)` 已被主网以 `[15200]` 否定，禁止再次使用。
 - PopDEX 新账户的 `getAccountConfig().symbolLeverages` 可以没有 BTCUSDT 条目；这只表示尚无显式市场杠杆配置，禁止猜成默认 1x。dry-run 显示 `unset`，实盘必须写入固定 1x 并回读到唯一、明确的 BTCUSDT 1x 条目后才能下单。
 - PopDEX 当前主网 `/trade/fills` 使用十进制字符串 `execId` 作为成交唯一标识；规范化层必须将其保留为内部 `fillId`，并继续拒绝 `execId`、`fillId`、`tradeId` 之间的冲突或非法值。

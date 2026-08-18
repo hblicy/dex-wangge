@@ -274,7 +274,9 @@ npm run popdex:write-probe -- --resume --confirm-mainnet-cancel
 
 这条命令会发送一笔 PopDEX Mainnet 撤单交易，但不会创建新订单。它会再次校验 Agent 授权、订单身份和零成交事实，只广播一次撤单；撤单后若 REST 不再返回该活动订单，则按上一段的回执、成交和持仓证据完成确认。若日志阶段已经是 `CANCEL_BROADCAST`，严禁再次执行该命令，只运行普通 `--resume` 查询既有撤单结果。任何成交、待发送/待确认/待撤状态、订单身份冲突或证据不完整都会保留恢复记录。
 
-建议先用 BTCUSDT 最小金额完成闭环，再单独验收 ETHUSDT。本阶段尚未开放 PopDEX 自动网格、服务器交易路由或网页交易；该探针不能替代实盘网格验收。
+建议先用 BTCUSDT 最小金额完成闭环，再单独验收 ETHUSDT。Stage 5 主网最小金额成交—平仓闭环已经通过验证；Stage 6 已在 `src/exchange/px/` 内实现隔离的 live `IExchange` 外观、崩溃安全操作日志和基于 PopDEX 官方行情的 Paper 模式。
+
+**PopDEX 网格尚未开放。** Stage 6 工厂没有接入 Bot、服务器、配置、API 或前端，不会出现 PopDEX 网格启动按钮。必须等 Stage 7 完成成交补单、重启接管、离线成交恢复、断线对账和 BTC 小网格验收后，才能讨论开放实盘网格。
 
 ### 5.5 🤖 AI 助手页
 
@@ -635,7 +637,7 @@ AI_REPORT_HOUR=20             # 每天几点生成日报（0-23 整点）
 │   └── exchange/
     │       ├── de/           # Decibel 接入（live + paper）
     │       ├── ex/           # Extended 接入（live + paper + Stark 签名）
-    │       ├── px/           # PopDEX 只读 + Agent 授权 + 独立 CLI 单笔下单撤单探针
+    │       ├── px/           # PopDEX 探针 + 隔离的 Stage 6 live IExchange / Paper（尚未接入网格）
     │       └── rs/           # RISEx 接入（live + paper + 私有 WS / 订单状态机）
 └── test/
     └── grid.test.js      # 网格逻辑单元测试

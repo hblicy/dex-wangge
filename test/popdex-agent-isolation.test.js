@@ -89,3 +89,12 @@ test('PopDEX Stage 6 factory remains absent from application entry points', () =
     assert.doesNotMatch(source, /exchange\/px\/index|createPopdexExchange|PX_MODE/, file);
   }
 });
+
+test('living documentation records Stage 6 boundary and Stage 7 gate', () => {
+  const agents = readProject('AGENTS.md');
+  const readme = readProject('README.md');
+  assert.match(agents, /Stage 6.*IExchange.*Paper/s);
+  assert.match(agents, /Stage 7.*成交补单.*恢复/s);
+  assert.match(readme, /PopDEX 网格尚未开放/);
+  assert.doesNotMatch(readme, /PopDEX.*可上实盘网格/);
+});
