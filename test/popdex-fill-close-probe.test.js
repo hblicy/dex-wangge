@@ -6,8 +6,12 @@ import {
   parseArgs,
   runProbe,
 } from '../src/exchange/px/fill-close-probe.js';
-import { POPDEX_USER_CONFIG_PRECOMPILE } from '../src/exchange/px/constants.js';
+import {
+  POPDEX_ORDER_PRECOMPILE,
+  POPDEX_USER_CONFIG_PRECOMPILE,
+} from '../src/exchange/px/constants.js';
 import { POPDEX_USER_CONFIG_INTERFACE } from '../src/exchange/px/fill-close-codec.js';
+import { POPDEX_ORDER_EVENT_INTERFACE } from '../src/exchange/px/receipt-events.js';
 
 const MAIN_ACCOUNT = '0x1111111111111111111111111111111111111111';
 const AGENT_PRIVATE_KEY = `0x${'22'.repeat(32)}`;
@@ -551,6 +555,26 @@ function recoveryLong(holdSizeWad) {
   };
 }
 
+function recoveryCloseReceiptLog() {
+  const record = recoveryRecord('CLOSE_BROADCAST');
+  const event = POPDEX_ORDER_EVENT_INTERFACE.encodeEventLog(
+    POPDEX_ORDER_EVENT_INTERFACE.getEvent('OrderCreate'),
+    [
+      MAIN_ACCOUNT,
+      20000,
+      10,
+      record.closeClientOrderId,
+      '62358000000000000000000',
+      record.closeQtyWad,
+      0,
+      2,
+      true,
+      0,
+    ],
+  );
+  return { address: POPDEX_ORDER_PRECOMPILE, ...event };
+}
+
 function recoveryDependencies(stage, {
   receiptStatus = null,
   receiptLogs = [],
@@ -709,6 +733,20 @@ test('plain recovery settles the exact close without broadcasting again', async 
   assert.equal(completeResult.status, 'completed-flat');
   assert.equal(complete.closeCalls, 0);
   assert.equal(complete.journal.load(), null);
+});
+
+test('plain recovery accepts a successful market-close receipt with a positive execution price', async () => {
+  const scenario = recoveryDependencies('CLOSE_BROADCAST', {
+    receiptStatus: '0x1',
+    receiptLogs: [recoveryCloseReceiptLog()],
+    fills: [recoveryCloseFill('0.0001')],
+    openOrders: [],
+    positions: [],
+  });
+  const result = await runProbe({ mode: 'resume' }, scenario.deps);
+  assert.equal(result.status, 'completed-flat');
+  assert.equal(scenario.closeCalls, 0);
+  assert.equal(scenario.journal.load(), null);
 });
 
 test('leverage broadcast recovery waits for its receipt and verifies success before clearing', async () => {
