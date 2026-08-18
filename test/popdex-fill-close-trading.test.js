@@ -41,7 +41,9 @@ function config(leverage) {
     vipLevel: '0',
     positionMode: '0',
     bizPermissionCode: '0',
-    symbolLeverages: [{ symbolId: '20000', leverage }],
+    symbolLeverages: leverage === null
+      ? []
+      : [{ symbolId: '20000', leverage }],
     tokenLeverages: [],
   };
 }
@@ -180,6 +182,16 @@ test('stage5 leverage writes once to UserConfig and confirms event plus readback
     'LEVERAGE_BROADCAST',
     'LEVERAGE_CONFIRMED',
   ]);
+  assert.equal(deps.configReads, 2);
+});
+
+test('stage5 leverage writes fixed 1x when BTC has no explicit leverage record', async () => {
+  const deps = dependencies({ initialLeverage: null });
+  const journal = fakeJournal();
+  const result = await client(deps).setBtcLeverageOne(plan, journal);
+  assert.equal(result.leverage, '1');
+  assert.equal(result.changed, true);
+  assert.equal(deps.serialized.length, 1);
   assert.equal(deps.configReads, 2);
 });
 

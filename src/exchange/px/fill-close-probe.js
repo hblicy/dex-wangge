@@ -173,7 +173,7 @@ async function prepareReadContext(deps) {
     writeRpc,
     publicClient,
     accountClient,
-    currentLeverage,
+    currentLeverage: currentLeverage ?? 'unset',
     authorization,
     margin,
     notional,

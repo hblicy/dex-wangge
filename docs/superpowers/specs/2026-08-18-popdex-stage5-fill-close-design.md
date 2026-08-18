@@ -71,7 +71,7 @@ npm run popdex:fill-close-probe
 
 ## 杠杆流程
 
-1. 从 `getAccountConfig(account).symbolLeverages` 唯一匹配 `symbolId=20000`。
+1. 从 `getAccountConfig(account).symbolLeverages` 匹配 `symbolId=20000`；空匹配表示该市场尚无显式杠杆配置，不能假定为 1x，必须进入固定 1x 写入流程；重复匹配仍视为无效事实。
 2. 若已为 1x，不发送杠杆交易，直接记录 `LEVERAGE_CONFIRMED`。
 3. 若不是 1x，构造固定 BTC 合约杠杆请求并先模拟。
 4. 广播前持久化可确定的交易哈希和 `LEVERAGE_BROADCAST` 阶段，只广播一次。
