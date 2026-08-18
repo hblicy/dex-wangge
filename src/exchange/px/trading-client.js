@@ -1,6 +1,18 @@
 import { decodeBytes32String, keccak256, parseUnits, Wallet } from 'ethers';
 import { confirmMissingCancelledOrder } from './cancel-confirmation.js';
-import { POPDEX_CHAIN_ID, POPDEX_EXPECTED_MARKETS, POPDEX_ORDER_PRECOMPILE } from './constants.js';
+import {
+  POPDEX_CHAIN_ID,
+  POPDEX_EXPECTED_MARKETS,
+  POPDEX_ORDER_PRECOMPILE,
+  POPDEX_USER_CONFIG_PRECOMPILE,
+} from './constants.js';
+import {
+  POPDEX_REVERSE_INTERFACE,
+  POPDEX_USER_CONFIG_INTERFACE,
+  parseLeverageUpdatedReceipt,
+  verifyStage5Simulation,
+} from './fill-close-codec.js';
+import { exactBtcLeverage } from './fill-close-state.js';
 import { encodeCancelOrder, POPDEX_ORDER_INTERFACE } from './order-codec.js';
 import { strictAddress, strictIntegerString } from './normalize.js';
 import { parseOrderCancelReceipt, parseOrderCreateReceipt } from './receipt-events.js';
@@ -274,9 +286,18 @@ export class PopdexTradingClient {
     });
   }
 
-  async #sign(data) {
+  #allowedTarget(to) {
+    const target = strictAddress(to, 'write target');
+    if (![POPDEX_ORDER_PRECOMPILE, POPDEX_USER_CONFIG_PRECOMPILE]
+      .some((allowed) => sameAddress(allowed, target))) {
+      throw new Error(`PopDEX 写入目标 ${target} 不在允许列表。`);
+    }
+    return target;
+  }
+
+  async #sign(to, data) {
     return this.wallet.signTransaction({
-      to: POPDEX_ORDER_PRECOMPILE,
+      to: this.#allowedTarget(to),
       data,
       value: 0n,
       chainId: POPDEX_CHAIN_ID,
@@ -293,16 +314,30 @@ export class PopdexTradingClient {
     }
   }
 
-  async #submit({ data, functionName, journal, expectedStage, nextStage, txHashField }) {
+  async #submit({
+    data,
+    functionName,
+    journal,
+    expectedStage,
+    nextStage,
+    txHashField,
+    to = POPDEX_ORDER_PRECOMPILE,
+    simulationInterface = null,
+  }) {
     const calldata = exactHex(data, `${functionName} calldata`);
+    const target = this.#allowedTarget(to);
     const simulated = await this.writeRpc.simulate({
       from: this.wallet.address,
-      to: POPDEX_ORDER_PRECOMPILE,
+      to: target,
       data: calldata,
       value: '0x0',
     });
-    this.#verifySimulation(functionName, simulated);
-    const serialized = await this.#sign(calldata);
+    if (simulationInterface === null) {
+      this.#verifySimulation(functionName, simulated);
+    } else {
+      verifyStage5Simulation(simulated, simulationInterface, functionName);
+    }
+    const serialized = await this.#sign(target, calldata);
     const localTxHash = keccak256(serialized).toLowerCase();
     journal.advance(expectedStage, nextStage, { [txHashField]: localTxHash });
     try {
@@ -470,6 +505,149 @@ export class PopdexTradingClient {
       return completed;
     } catch (error) {
       safeJournalError(journal, 'CANCEL_BROADCAST', error);
+      throw error;
+    }
+  }
+
+  #assertFillClosePlan(plan) {
+    if (!plan || typeof plan !== 'object'
+        || typeof plan.mainAccount !== 'string'
+        || !sameAddress(plan.mainAccount, this.mainAccount)) {
+      throw new Error('PopDEX Stage 5 计划 mainAccount 与交易客户端不匹配。');
+    }
+    for (const [field, expected] of [
+      ['symbol', 'BTCUSDT'],
+      ['symbolId', '20000'],
+      ['side', 'buy'],
+      ['leverage', '1'],
+      ['positionMode', '0'],
+      ['positionSide', '1'],
+      ['category', '2'],
+    ]) {
+      if (plan[field] !== expected) {
+        throw new Error(
+          `PopDEX Stage 5 计划 ${field} 不匹配：expected=${expected} actual=${String(plan[field])}。`,
+        );
+      }
+    }
+  }
+
+  async setBtcLeverageOne(plan, journal) {
+    this.#assertFillClosePlan(plan);
+    await this.preflight();
+    const current = exactBtcLeverage(await this.readRpc.getAccountConfig(this.mainAccount));
+    if (current === '1') {
+      journal.advance('PREPARED', 'LEVERAGE_CONFIRMED');
+      return { leverage: '1', changed: false };
+    }
+    const receipt = await this.#submit({
+      data: plan.leverageData,
+      functionName: 'updateLeverage',
+      journal,
+      expectedStage: 'PREPARED',
+      nextStage: 'LEVERAGE_BROADCAST',
+      txHashField: 'leverageTxHash',
+      to: POPDEX_USER_CONFIG_PRECOMPILE,
+      simulationInterface: POPDEX_USER_CONFIG_INTERFACE,
+    });
+    try {
+      const event = parseLeverageUpdatedReceipt(receipt, plan);
+      const readback = exactBtcLeverage(
+        await this.readRpc.getAccountConfig(this.mainAccount),
+      );
+      if (readback !== '1') {
+        throw new Error(`PopDEX BTCUSDT 杠杆回读必须是 1，实际 ${readback}。`);
+      }
+      journal.advance('LEVERAGE_BROADCAST', 'LEVERAGE_CONFIRMED');
+      return { ...event, changed: true };
+    } catch (error) {
+      safeJournalError(journal, 'LEVERAGE_BROADCAST', error);
+      throw error;
+    }
+  }
+
+  async placeFillCloseEntry(plan, journal) {
+    this.#assertFillClosePlan(plan);
+    await this.preflight();
+    const receipt = await this.#submit({
+      data: plan.entryData,
+      functionName: 'placeOrder',
+      journal,
+      expectedStage: 'LEVERAGE_CONFIRMED',
+      nextStage: 'ENTRY_BROADCAST',
+      txHashField: 'entryTxHash',
+      simulationInterface: POPDEX_ORDER_INTERFACE,
+    });
+    try {
+      const order = parseOrderCreateReceipt(receipt, {
+        account: plan.mainAccount,
+        symbolId: plan.symbolId,
+        clientOrderId: plan.clientOrderId,
+        priceWad: plan.priceWad,
+        qtyWad: plan.qtyWad,
+      });
+      journal.advance('ENTRY_BROADCAST', 'ENTRY_SETTLING', { orderId: order.orderId });
+      return order;
+    } catch (error) {
+      safeJournalError(journal, 'ENTRY_BROADCAST', error);
+      throw error;
+    }
+  }
+
+  async cancelFillCloseRemainder(plan, order, journal) {
+    this.#assertFillClosePlan(plan);
+    if (!order || typeof order !== 'object') {
+      throw new Error('PopDEX Stage 5 撤单 order 必须是对象。');
+    }
+    if (order.clientOrderId !== plan.clientOrderId) {
+      throw new Error('PopDEX Stage 5 撤单 clientOrderId 与入场计划不匹配。');
+    }
+    await this.preflight();
+    const data = encodeCancelOrder({
+      mainAccount: this.mainAccount,
+      orderId: order.orderId,
+      clientOrderId: order.clientOrderId,
+    });
+    const receipt = await this.#submit({
+      data,
+      functionName: 'cancelOrder',
+      journal,
+      expectedStage: 'ENTRY_SETTLING',
+      nextStage: 'REMAINDER_CANCEL_BROADCAST',
+      txHashField: 'cancelTxHash',
+      simulationInterface: POPDEX_ORDER_INTERFACE,
+    });
+    try {
+      return parseOrderCancelReceipt(receipt, {
+        account: this.mainAccount,
+        orderId: order.orderId,
+        clientOrderId: order.clientOrderId,
+      });
+    } catch (error) {
+      safeJournalError(journal, 'REMAINDER_CANCEL_BROADCAST', error);
+      throw error;
+    }
+  }
+
+  async closeFillCloseLong(plan, journal) {
+    this.#assertFillClosePlan(plan);
+    await this.preflight();
+    const receipt = await this.#submit({
+      data: plan.closeData,
+      functionName: 'placeReverseOrder',
+      journal,
+      expectedStage: 'POSITION_CONFIRMED',
+      nextStage: 'CLOSE_BROADCAST',
+      txHashField: 'closeTxHash',
+      simulationInterface: POPDEX_REVERSE_INTERFACE,
+    });
+    try {
+      if (receipt.status !== '0x1') {
+        throw new Error('PopDEX placeReverseOrder 回执必须是 status=0x1。');
+      }
+      return receipt;
+    } catch (error) {
+      safeJournalError(journal, 'CLOSE_BROADCAST', error);
       throw error;
     }
   }

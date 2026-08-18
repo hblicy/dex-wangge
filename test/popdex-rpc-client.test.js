@@ -11,6 +11,10 @@ const ACCOUNT = '0x1111111111111111111111111111111111111111';
 const AGENT = '0x2222222222222222222222222222222222222222';
 const ORDER_PRECOMPILE = '0x0000000000000000000000000000000000001000';
 const ACCOUNT_PRECOMPILE = '0x0000000000000000000000000000000000001008';
+const USER_CONFIG_PRECOMPILE = '0x0000000000000000000000000000000000001009';
+const USER_CONFIG_ABI = [
+  'function getAccountConfig(address account) view returns ((uint8 status,uint8 vipLevel,uint8 positionMode,uint64 bizPermissionCode,tuple(uint16 symbolId,uint8 leverage)[] symbolLeverages,tuple(address tokenAddress,uint8 leverage)[] tokenLeverages) config)',
+];
 const OPEN_POSITIONS_ABI = [
   'function getOpenPositionsByAccount(address account,uint32 offset,uint32 limit) view returns ((tuple(address walletId,uint128 positionId,uint16 symbolId,uint8 side,uint256 holdSize,uint256 avgOpenPrice,uint256 closeSize,uint256 lockedSize,int256 realizedPnl,uint64 createdTime,uint64 updatedTime)[] positions,bool hasMore) page)',
 ];
@@ -183,6 +187,91 @@ test('RPC client reads official open-position precompile without losing uint val
     }],
     hasMore: false,
   });
+});
+
+test('RPC client reads exact UserConfig leverage without number coercion', async () => {
+  const iface = new Interface(USER_CONFIG_ABI);
+  const client = new PopdexRpcClient({
+    fetchImpl: async (_input, options) => {
+      const request = JSON.parse(options.body);
+      assert.equal(request.params[0].to, USER_CONFIG_PRECOMPILE);
+      assert.equal(
+        iface.decodeFunctionData('getAccountConfig', request.params[0].data).account,
+        ACCOUNT,
+      );
+      return rpcResponse({
+        jsonrpc: '2.0',
+        id: request.id,
+        result: iface.encodeFunctionResult('getAccountConfig', [[
+          0,
+          7,
+          1,
+          9007199254740993n,
+          [[20000, 20], [65535, 255]],
+          [[AGENT, 3]],
+        ]]),
+      });
+    },
+  });
+
+  assert.deepEqual(await client.getAccountConfig(ACCOUNT), {
+    status: '0',
+    vipLevel: '7',
+    positionMode: '1',
+    bizPermissionCode: '9007199254740993',
+    symbolLeverages: [
+      { symbolId: '20000', leverage: '20' },
+      { symbolId: '65535', leverage: '255' },
+    ],
+    tokenLeverages: [{ tokenAddress: AGENT, leverage: '3' }],
+  });
+});
+
+test('RPC client rejects duplicate UserConfig symbol leverage entries', async () => {
+  const iface = new Interface(USER_CONFIG_ABI);
+  const client = new PopdexRpcClient({
+    fetchImpl: async (_input, options) => {
+      const request = JSON.parse(options.body);
+      return rpcResponse({
+        jsonrpc: '2.0',
+        id: request.id,
+        result: iface.encodeFunctionResult('getAccountConfig', [[
+          0,
+          0,
+          0,
+          0,
+          [[20000, 1], [20000, 2]],
+          [],
+        ]]),
+      });
+    },
+  });
+  await assert.rejects(client.getAccountConfig(ACCOUNT), /symbolLeverages.*重复/);
+});
+
+test('RPC client collects all positions and rejects impossible pagination', async () => {
+  const client = new PopdexRpcClient({ fetchImpl: async () => { throw new Error('unused'); } });
+  const offsets = [];
+  client.getOpenPositions = async (_account, offset) => {
+    offsets.push(offset);
+    return offset === 0
+      ? { positions: [{ positionId: '1' }], hasMore: true }
+      : { positions: [{ positionId: '2' }], hasMore: false };
+  };
+  assert.deepEqual(await client.getAllOpenPositions(ACCOUNT), [
+    { positionId: '1' },
+    { positionId: '2' },
+  ]);
+  assert.deepEqual(offsets, [0, 1]);
+
+  client.getOpenPositions = async () => ({ positions: [], hasMore: true });
+  await assert.rejects(client.getAllOpenPositions(ACCOUNT), /hasMore=true.*为空/);
+
+  client.getOpenPositions = async () => ({ positions: [{ positionId: '1' }], hasMore: true });
+  await assert.rejects(
+    client.getAllOpenPositions(ACCOUNT, { maxPages: 1 }),
+    /分页超过.*1/,
+  );
 });
 
 test('RPC client reads official active orders without losing uint values', async () => {

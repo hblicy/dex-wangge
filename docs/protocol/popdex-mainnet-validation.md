@@ -84,8 +84,17 @@ Artifact `/perp-static/client/js/98039.36abf38e738893c0cb67.chunk.js` identifies
 placeOrder(address account,bytes32 clientOrderId,uint16 symbolId,bytes32 orderParams,uint256 price,uint256 qty,uint256 slippage,address builder,uint256 builderFeeRate)
 cancelOrder(address account,uint128 orderId,bytes32 clientOrderId)
 placeReverseOrder(address account,uint16 symbolId,uint8 positionSide)
-updateLeverage(address account,(uint8 newLeverage,uint16 symbolId,address tokenAddress,uint8 category) request)
 ```
+
+UserConfig precompile is `0x0000000000000000000000000000000000001009`. Its relevant ABI is:
+
+```text
+getAccountConfig(address account)
+updateLeverage(address account,(uint8 newLeverage,uint16 symbolId,address tokenAddress,uint8 category) request)
+LeverageUpdated(address account,uint8 category,uint16 symbolId,address tokenAddress,uint8 newLeverage,bool succeeded,uint32 code)
+```
+
+BTCUSDT leverage updates use `newLeverage=1`, `symbolId=20000`, zero `tokenAddress`, and `category=Futures(2)`. `OrderCategory.Regular(0)` is a different enum and must not be used as the leverage category. The Order precompile `0x0000000000000000000000000000000000001000` remains the source of `placeOrder`, `cancelOrder`, `placeReverseOrder`, order pages, and position pages.
 
 The official ABI uses `placeReverseOrder`, not `closePosition`, for the reverse-position close primitive. Artifact `/perp-static/client/js/screens-Main.3500ad687658add27232.chunk.js` proves at least one Agent write path: `updatePositionMode` is sent with the Agent account, `type="legacy"`, `nonce=Date.now()`, `gas=1000000`, and `gasPrice=0`, followed by receipt confirmation.
 
@@ -112,9 +121,17 @@ The same authoritative ABI exposes `getOpenPositionsByAccount(address account,ui
 
 The bounded Mainnet probe established the mapping through the exact `OrderCreate` event in the recorded placement receipt and the matching official REST row. The implementation still rejects treating `txHash` itself as `orderId`.
 
+## Stage 5 fill-close probe
+
+The isolated `npm run popdex:fill-close-probe` implementation is complete for offline and simulated-exchange validation. It is fixed to BTCUSDT, Buy/Long, OneWay position mode, 1x leverage, the minimum aligned quantity, and a limit-price cap of best ask plus 0.3%. Partial fills cancel the exact remaining order before position confirmation; zero fills exit without retry; a non-zero long closes through `placeReverseOrder(account,20000,Long=1)`. Completion requires zero BTCUSDT active orders and no long or short position.
+
+The default command is read-only apart from `eth_call` simulation: it does not sign, broadcast, or create `.popdex-fill-close-probe.json`. A new full Mainnet run requires the dedicated `--confirm-mainnet-fill-close` flag. Ordinary `--resume` performs no exchange write. Recovery cancellation and recovery closing require separate `--resume --confirm-mainnet-cancel` and `--resume --confirm-mainnet-close` approvals, and an already persisted transaction hash prevents a second broadcast.
+
+Automated tests prove the complete state machine with mocked exchange dependencies, including 1x readback, full/partial/zero fill branches, exact cancellation, long-position quantity equality, reverse close, final flat state, bounded polling, crash recovery, and no-retry behavior. No marketable Mainnet fill, leverage update, or reverse close was executed during this implementation; those gates remain pending separate user approval and live evidence.
+
 ## Required write probes
 
-The first bounded probe is complete: a newly authorized Agent was verified on chain, one non-marketable minimum-value BTCUSDT order was signed and broadcast by that Agent, the exact `OrderCreate` receipt mapped the deterministic `clientOrderId` to the official `orderId`, REST and the web UI confirmed the live order, and a single Agent cancellation produced the exact `OrderCancel` receipt. The remaining separately approved probes are:
+The first bounded probe is complete: a newly authorized Agent was verified on chain, one non-marketable minimum-value BTCUSDT order was signed and broadcast by that Agent, the exact `OrderCreate` receipt mapped the deterministic `clientOrderId` to the official `orderId`, REST and the web UI confirmed the live order, and a single Agent cancellation produced the exact `OrderCancel` receipt. The Stage 5 fill-close implementation has passed offline state-machine tests only. The remaining separately approved probes are:
 
 1. Execute the minimum aligned marketable quantity, confirm the fill stream and non-empty on-chain position schema, submit the proven reduce-only close primitive, and confirm the position is flat.
 2. Record the official maximum-open-order response and bounded rate-limit headers or errors; no current authoritative limit was found in the captured evidence.
@@ -130,7 +147,7 @@ BLOCKED
 | Order precompile ABI and Agent signing/send model | Validated for one non-marketable place and cancel probe. |
 | Agent, main account and delegated order relationship | Validated for the bounded place/cancel probe through on-chain Agent readback, signed transactions and exact receipt events. |
 | `txHash`, `clientOrderId`, `orderId` mapping | Validated for the bounded probe through the exact `OrderCreate` receipt and REST order identity. |
-| Place and cancel terminal states | Validated for one non-marketable zero-fill BTCUSDT probe; marketable fill, leverage and reduce-only close remain blocked. |
+| Place and cancel terminal states | Validated for one non-marketable zero-fill BTCUSDT probe; the marketable fill, UserConfig leverage update and `placeReverseOrder` close are implemented offline but remain blocked on Mainnet evidence. |
 | Complete order, fill and position schema and pagination | Partially validated: a real empty account passed both target-market REST reads, overview, and the official on-chain position read. Non-empty rows and pagination remain blocked. |
 | Maximum open orders and rate limits | Blocked: no authoritative value was present in the read-only evidence. |
 

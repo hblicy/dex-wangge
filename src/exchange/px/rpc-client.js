@@ -5,7 +5,9 @@ import {
   POPDEX_CHAIN_ID,
   POPDEX_ORDER_PRECOMPILE,
   POPDEX_RPC_URL,
+  POPDEX_USER_CONFIG_PRECOMPILE,
 } from './constants.js';
+import { POPDEX_USER_CONFIG_INTERFACE } from './fill-close-codec.js';
 import { strictAddress } from './normalize.js';
 
 const OPEN_POSITIONS_INTERFACE = new Interface([
@@ -270,9 +272,71 @@ export class PopdexRpcClient {
         { cause: error },
       );
     }
+    if (typeof decoded.hasMore !== 'boolean') {
+      throw new Error('PopDEX RPC getOpenPositionsByAccount hasMore 必须是布尔值。');
+    }
     return {
       positions: decoded.positions.map(exactPosition),
       hasMore: decoded.hasMore,
+    };
+  }
+
+  async getAllOpenPositions(account, { maxPages = 10, pageSize = 100 } = {}) {
+    const wallet = strictAddress(account, 'account');
+    if (!Number.isSafeInteger(maxPages) || maxPages <= 0 || maxPages > 10) {
+      throw new Error('PopDEX positions maxPages 必须是 1-10 的安全整数。');
+    }
+    const exactPageSize = uint32(pageSize, 'position pageSize', { allowZero: false });
+    const positions = [];
+    let offset = 0;
+    for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
+      const page = await this.getOpenPositions(wallet, offset, exactPageSize);
+      positions.push(...page.positions);
+      if (!page.hasMore) return positions;
+      if (page.positions.length === 0) {
+        throw new Error('PopDEX positions hasMore=true 但当前页为空。');
+      }
+      offset += page.positions.length;
+    }
+    throw new Error(`PopDEX positions 分页超过 maxPages=${maxPages}。`);
+  }
+
+  async getAccountConfig(account) {
+    const wallet = strictAddress(account, 'account');
+    const data = POPDEX_USER_CONFIG_INTERFACE.encodeFunctionData('getAccountConfig', [wallet]);
+    const raw = await this.call('eth_call', [
+      { to: POPDEX_USER_CONFIG_PRECOMPILE, data },
+      'latest',
+    ]);
+    let config;
+    try {
+      [config] = POPDEX_USER_CONFIG_INTERFACE.decodeFunctionResult('getAccountConfig', raw);
+    } catch (cause) {
+      throw new Error(
+        `PopDEX RPC getAccountConfig 解码失败：${sanitizedCause(cause)}`,
+        { cause },
+      );
+    }
+    const symbolLeverages = config.symbolLeverages.map((item) => ({
+      symbolId: item.symbolId.toString(),
+      leverage: item.leverage.toString(),
+    }));
+    if (new Set(symbolLeverages.map((item) => item.symbolId)).size !== symbolLeverages.length) {
+      throw new Error('PopDEX RPC getAccountConfig symbolLeverages 存在重复 symbolId。');
+    }
+    return {
+      status: config.status.toString(),
+      vipLevel: config.vipLevel.toString(),
+      positionMode: config.positionMode.toString(),
+      bizPermissionCode: config.bizPermissionCode.toString(),
+      symbolLeverages,
+      tokenLeverages: config.tokenLeverages.map((item, index) => ({
+        tokenAddress: addressAllowZero(
+          item.tokenAddress,
+          `tokenLeverages[${index}].tokenAddress`,
+        ),
+        leverage: item.leverage.toString(),
+      })),
     };
   }
 
