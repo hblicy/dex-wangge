@@ -375,6 +375,41 @@ export class PopdexRpcClient {
     return this.#getOrderPage('getCompletedOrdersByAccount', account, offset, limit);
   }
 
+  async #collectOrderPages(readPage, label, { maxPages = 10, pageSize = ORDER_PAGE_SIZE } = {}) {
+    if (!Number.isSafeInteger(maxPages) || maxPages <= 0 || maxPages > 10) {
+      throw new Error(`PopDEX ${label} maxPages 必须是 1-10 的安全整数。`);
+    }
+    const exactPageSize = uint32(pageSize, `${label} pageSize`, { allowZero: false });
+    const orders = [];
+    let offset = 0;
+    for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
+      const page = await readPage(offset, exactPageSize);
+      orders.push(...page.orders);
+      if (!page.hasMore) return orders;
+      if (page.orders.length === 0) {
+        throw new Error(`PopDEX ${label} hasMore=true 但当前页为空。`);
+      }
+      offset += page.orders.length;
+    }
+    throw new Error(`PopDEX ${label} 分页超过 maxPages=${maxPages}。`);
+  }
+
+  getAllActiveOrders(account, options = {}) {
+    return this.#collectOrderPages(
+      (offset, limit) => this.getActiveOrders(account, offset, limit),
+      'active orders',
+      options,
+    );
+  }
+
+  getAllCompletedOrders(account, options = {}) {
+    return this.#collectOrderPages(
+      (offset, limit) => this.getCompletedOrders(account, offset, limit),
+      'completed orders',
+      options,
+    );
+  }
+
   async findUniqueOrderByClientId(
     account,
     clientOrderId,

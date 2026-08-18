@@ -185,7 +185,17 @@ export class PopdexAccountClient {
     for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
       const rows = await readPage(cursor);
       all.push(...rows);
-      if (rows.cursor === undefined) return all;
+      if (rows.cursor === undefined) {
+        Object.defineProperty(all, 'pageInfo', {
+          value: Object.freeze({
+            pages: pageIndex + 1,
+            cursors: [...seenCursors],
+            rows: all.length,
+          }),
+          enumerable: false,
+        });
+        return all;
+      }
       if (seenCursors.has(rows.cursor)) {
         throw new Error(`PopDEX ${label} cursor ${rows.cursor} 重复。`);
       }
@@ -207,6 +217,16 @@ export class PopdexAccountClient {
 
   async getOrderHistory(account, symbol, cursor = null) {
     return this.#orders(account, symbol, cursor);
+  }
+
+  async getAllOrderHistory(account, symbol, options = {}) {
+    const wallet = strictAddress(account, 'account');
+    const target = targetSymbol(symbol);
+    return this.#collectPages(
+      (cursor) => this.getOrderHistory(wallet, target, cursor),
+      'order history',
+      options,
+    );
   }
 
   async findUniqueOrderByClientId(account, symbol, clientOrderId, { maxPages = 10 } = {}) {

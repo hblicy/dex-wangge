@@ -156,7 +156,10 @@ test('account client collects all fills and rejects a repeated cursor', async ()
     ['fills:null', { data: [fill('1')], cursor: '7' }],
     ['fills:7', { data: [fill('2')], cursor: '' }],
   ]));
-  assert.equal((await client.getAllFills(ACCOUNT, 'BTCUSDT')).length, 2);
+  const rows = await client.getAllFills(ACCOUNT, 'BTCUSDT');
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.pageInfo, { pages: 2, cursors: ['7'], rows: 2 });
+  assert.equal(Object.keys(rows).includes('pageInfo'), false);
 
   const repeated = accountClientFromPages(new Map([
     ['fills:null', { data: [], cursor: '7' }],
@@ -180,7 +183,14 @@ test('account client collects all open orders with bounded strict pagination', a
     ['orders:null', { data: { orders: [order('1')] }, cursor: '7' }],
     ['orders:7', { data: { orders: [order('2')] }, cursor: '' }],
   ]));
-  assert.equal((await client.getAllOpenOrders(ACCOUNT, 'BTCUSDT')).length, 2);
+  const rows = await client.getAllOpenOrders(ACCOUNT, 'BTCUSDT');
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.pageInfo, { pages: 2, cursors: ['7'], rows: 2 });
+  assert.equal(Object.keys(rows).includes('pageInfo'), false);
+
+  const history = await client.getAllOrderHistory(ACCOUNT, 'BTCUSDT');
+  assert.equal(history.length, 2);
+  assert.deepEqual(history.pageInfo, { pages: 2, cursors: ['7'], rows: 2 });
 
   const repeated = accountClientFromPages(new Map([
     ['orders:null', { data: { orders: [] }, cursor: '7' }],
