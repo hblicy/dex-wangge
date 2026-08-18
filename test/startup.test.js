@@ -112,6 +112,16 @@ test('startup passes the persisted snapshot to adapters that enforce ownership',
   assert.doesNotThrow(() => prepareExchangeRecovery({}, snapshot));
 });
 
+test('startup does not inject price-based recovery snapshots into strict ownership adapters', () => {
+  let calls = 0;
+  const exchange = {
+    strictOrderRecovery: true,
+    setRecoverySnapshot: () => { calls++; },
+  };
+  prepareExchangeRecovery(exchange, { running: true, active: [['stale', {}]] });
+  assert.equal(calls, 0);
+});
+
 test('resume rejects HALTED exchange before calling bot and never cleans up automatically', async () => {
   let resumed = false;
   let cancelled = false;
