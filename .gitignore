@@ -8,6 +8,11 @@
 .state.json.bak-*
 .popdex-write-probe.json
 .popdex-fill-close-probe.json
+.popdex-ownership.json
+.popdex-grid-probe.json
+.popdex-grid-probe-ownership.json
+.popdex-grid-probe-operation.json
+.popdex-grid-probe.lock
 
 # 依赖缓存
 node_modules/
