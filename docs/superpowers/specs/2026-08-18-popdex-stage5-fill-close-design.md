@@ -2,6 +2,8 @@
 
 日期：2026-08-18
 
+> 主网验收修正（2026-08-18）：本设计中把 `PositionSide.Long=1` 直接传给 `placeReverseOrder` 的假设已被交易 `0x3e921b…5bbda` 以 `[15200] Invalid position side` 否定。后续官方网页成功平仓交易 `0xbb8f28e0cbef74faa8d706676ec6ad93c89196d6440cc4ac8d46c362c8b91e50` 证明正确路径是 `placeOrder` 的 Market + Sell + ReduceOnly + Net，`price=0`、数量等于精确仓位 WAD、`slippage=3%`。平仓部分由 `2026-08-18-popdex-reduce-only-market-close-design.md` 取代；本文其他阶段约束继续有效。
+
 ## 目标
 
 在 PopDEX Mainnet 上完成第 5 阶段剩余验收：BTCUSDT 杠杆设置与回读、最小买入成交、剩余委托撤销、仓位确认以及整仓平仓。
@@ -19,7 +21,7 @@
 - 账户配置通过 `getAccountConfig(account)` 读取，其中 `symbolLeverages` 包含 `symbolId:uint16` 和 `leverage:uint8`。
 - 杠杆写入接口为 `updateLeverage(account, request)`；BTC 合约请求固定使用 `newLeverage=1`、`symbolId=20000`、`category=Futures(2)` 和零地址 `tokenAddress`。官方枚举明确为 `Spot=0`、`Margin=1`、`Futures=2`；订单类别 `Regular=0` 是另一枚举，禁止混用。
 - `LeverageUpdated` 事件包含账户、市场、杠杆、`succeeded` 和 `code`，可用于回执核验。
-- 平仓接口为 `placeReverseOrder(account, symbolId, positionSide)`；`PositionSide.Long=1`、`PositionSide.Short=2`。
+- 官方网页成功交易证明最终平仓应调用 `placeOrder`，订单固定为 Market、Sell、ReduceOnly、Net，`price=0`、数量为精确仓位 WAD、`slippage=3%`、零 builder 和零 builder fee；`placeReverseOrder(account,20000,Long=1)` 已被主网拒绝，禁止再次尝试。
 - 官方仓位分页包含 `symbolId`、`side`、`holdSizeWad`、`closeSizeWad` 和 `lockedSizeWad`，所有大整数必须以字符串处理。
 - 已验收的 Agent 签名、写 RPC、订单回执、订单分页和恢复机制可以作为底层能力复用。
 
@@ -49,7 +51,7 @@ npm run popdex:fill-close-probe
 
 组件职责：
 
-- 扩展 `src/exchange/px/order-codec.js` 或新增同层纯编码模块，支持 `getAccountConfig`、`updateLeverage` 和 `placeReverseOrder` 的固定 ABI 编码与严格结果校验。
+- 扩展 `src/exchange/px/order-codec.js` 或新增同层纯编码模块，支持 `getAccountConfig`、`updateLeverage` 和官方 reduce-only market `placeOrder` 的固定 ABI 编码与严格结果校验。
 - 扩展 `src/exchange/px/rpc-client.js`，提供账户配置回读及严格、完整的 BTC 仓位分页读取。
 - 扩展 `src/exchange/px/trading-client.js`，复用已有 Agent 验证、模拟、签名、单次广播和回执读取能力。
 - 新增独立探针编排文件，负责预检、杠杆、入场、撤销剩余委托、仓位核验和平仓。
@@ -119,19 +121,19 @@ npm run popdex:fill-close-probe
 - 没有 BTCUSDT 活动订单；
 - 仓位数量与本次订单已成交数量一致。
 
-满足条件后记录 `POSITION_CONFIRMED`，调用官方：
+满足条件后记录 `POSITION_CONFIRMED`，按官方成功交易调用：
 
 ```text
-placeReverseOrder(mainAccount, 20000, Long=1)
+placeOrder(mainAccount, closeClientOrderId, 20000, Market+Sell+ReduceOnly+Net, 0, exactPositionQtyWad, 3%, zeroBuilder, 0)
 ```
 
 平仓步骤：
 
 1. 先模拟，无法证明成功则不广播。
 2. 广播前保存交易哈希和 `CLOSE_BROADCAST`，只广播一次。
-3. 要求交易回执成功。
-4. 有界轮询完整仓位分页和活动订单分页。
-5. 只有同时确认 BTC 持仓为零、没有反向空仓、没有 BTC 活动订单，才能记录 `COMPLETED`。
+3. 要求交易回执成功，并解析唯一匹配 `closeClientOrderId` 的 `OrderCreate` 取得 `closeOrderId`。
+4. 进入 `CLOSE_SETTLING`，有界轮询该平仓订单的成交、完整仓位分页和活动订单分页。
+5. 只有该 Sell 平仓单的去重成交量等于原精确仓位量，同时确认 BTC 持仓为零、没有反向空仓、没有 BTC 活动订单，才能记录 `COMPLETED`。
 
 若平仓后仍有残余或反向仓位，探针不得再次自动平仓，必须保留恢复记录并要求人工处理。
 
@@ -148,6 +150,7 @@ ENTRY_SETTLING
 REMAINDER_CANCEL_BROADCAST
 POSITION_CONFIRMED
 CLOSE_BROADCAST
+CLOSE_SETTLING
 COMPLETED
 ```
 
@@ -157,7 +160,7 @@ COMPLETED
 - symbol、symbolId、杠杆、价格、数量；
 - 主账户和 Agent 地址；
 - `clientOrderId`、官方 `orderId`；
-- 杠杆、入场、撤单和平仓交易哈希；
+- 杠杆、入场、撤单和平仓交易哈希，以及独立 `closeClientOrderId`、`closeOrderId` 和 `closeQtyWad`；
 - 已确认成交量、仓位 ID、方向和数量；
 - 最后查询到的活动订单数、仓位数、更新时间和脱敏错误摘要。
 
@@ -195,7 +198,7 @@ COMPLETED
 
 自动测试不得连接主网或执行真实签名广播，至少覆盖：
 
-- `getAccountConfig`、`updateLeverage`、`LeverageUpdated` 和 `placeReverseOrder` 固定 ABI 向量。
+- `getAccountConfig`、`updateLeverage`、`LeverageUpdated` 和官方 reduce-only market `placeOrder` 固定 ABI 向量，包括与成功网页交易逐字节一致的 calldata。
 - Category、PositionSide、symbolId 和 1x 杠杆的允许值及拒绝值。
 - tick、lot、`minQty`、最低名义价值和 `0.3%` 价格保护。
 - 已为 1x、杠杆设置成功、事件失败、回读不一致。
@@ -226,7 +229,7 @@ COMPLETED
 - 1x 杠杆事件和回读形成闭环。
 - 一笔最小 BTCUSDT 买入的订单、成交和仓位事实可唯一追踪。
 - 部分成交的剩余委托能够安全撤销。
-- `placeReverseOrder` 平仓后能够严格证明无订单、无多仓、无空仓。
+- 官方 reduce-only market 平仓单的精确成交量得到确认，并严格证明无订单、无多仓、无空仓。
 - 任意中断阶段都不会自动重复交易。
 - 全量测试通过，Decibel、RISEx 和现有 PopDEX 功能无回归。
 - 用户批准的主网测试最终输出 `completed-flat`。

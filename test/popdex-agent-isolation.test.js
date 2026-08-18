@@ -56,6 +56,16 @@ test('PopDEX write probe stays CLI-only and is not exposed as a grid or server r
   assert.doesNotMatch(server, /\/api\/px\/(?:start|stop|orders|cancel|leverage|close)/i);
 });
 
+test('PopDEX Stage 5 close stays CLI-only and contains no reverse-order primitive', () => {
+  const serverSource = readProject('src/server.js');
+  const codec = readProject('src/exchange/px/fill-close-codec.js');
+  const trading = readProject('src/exchange/px/trading-client.js');
+  assert.doesNotMatch(codec, /POPDEX_REVERSE_INTERFACE|placeReverseOrder/);
+  assert.doesNotMatch(trading, /POPDEX_REVERSE_INTERFACE|placeReverseOrder/);
+  assert.doesNotMatch(serverSource, /fill-close-probe|closeFillCloseLong/);
+  assert.doesNotMatch(serverSource, /\/api\/px\/(?:start|stop|orders|cancel|leverage|close)/i);
+});
+
 test('only the isolated PopDEX write RPC boundary can broadcast raw transactions', () => {
   const pxFiles = fs.readdirSync(new URL('src/exchange/px/', root))
     .filter((file) => file.endsWith('.js'));

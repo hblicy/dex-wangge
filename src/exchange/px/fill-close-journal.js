@@ -10,6 +10,7 @@ const STAGES = new Set([
   'REMAINDER_CANCEL_BROADCAST',
   'POSITION_CONFIRMED',
   'CLOSE_BROADCAST',
+  'CLOSE_SETTLING',
   'COMPLETED',
 ]);
 const NEXT = Object.freeze({
@@ -20,9 +21,15 @@ const NEXT = Object.freeze({
   ENTRY_SETTLING: new Set(['REMAINDER_CANCEL_BROADCAST', 'POSITION_CONFIRMED', 'COMPLETED']),
   REMAINDER_CANCEL_BROADCAST: new Set(['POSITION_CONFIRMED', 'COMPLETED']),
   POSITION_CONFIRMED: new Set(['CLOSE_BROADCAST']),
-  CLOSE_BROADCAST: new Set(['COMPLETED']),
+  CLOSE_BROADCAST: new Set(['CLOSE_SETTLING', 'COMPLETED']),
+  CLOSE_SETTLING: new Set(['COMPLETED']),
 });
-const OUTCOMES = new Set(['completed-flat', 'zero-fill-cleared', 'safe-no-exposure']);
+const OUTCOMES = new Set([
+  'completed-flat',
+  'completed-flat-manual',
+  'zero-fill-cleared',
+  'safe-no-exposure',
+]);
 const RECORD_KEYS = Object.freeze([
   'version',
   'stage',
@@ -35,7 +42,10 @@ const RECORD_KEYS = Object.freeze([
   'priceWad',
   'qtyWad',
   'clientOrderId',
+  'closeKind',
+  'closeClientOrderId',
   'orderId',
+  'closeOrderId',
   'positionId',
   'leverageTxHash',
   'entryTxHash',
@@ -44,6 +54,7 @@ const RECORD_KEYS = Object.freeze([
   'filledQtyWad',
   'remainingQtyWad',
   'positionQtyWad',
+  'closeQtyWad',
   'outcome',
   'lastError',
   'updatedAt',
@@ -58,9 +69,12 @@ const CREATE_KEYS = new Set([
   'priceWad',
   'qtyWad',
   'clientOrderId',
+  'closeClientOrderId',
 ]);
 const ADVANCE_KEYS = new Set([
   'orderId',
+  'closeKind',
+  'closeOrderId',
   'positionId',
   'leverageTxHash',
   'entryTxHash',
@@ -69,6 +83,7 @@ const ADVANCE_KEYS = new Set([
   'filledQtyWad',
   'remainingQtyWad',
   'positionQtyWad',
+  'closeQtyWad',
   'outcome',
   'lastError',
 ]);
@@ -121,14 +136,31 @@ function sanitizedError(value) {
   return message.replace(/[\r\n]+/g, ' ').slice(0, 500);
 }
 
+function normalizeLoadedRecord(value) {
+  if (value?.version !== 1) return value;
+  if (value.stage !== 'CLOSE_BROADCAST' || value.closeTxHash === null) {
+    throw new Error(
+      'PopDEX fill-close journal version 1 只允许恢复 CLOSE_BROADCAST 失败平仓记录。',
+    );
+  }
+  return {
+    ...value,
+    version: 2,
+    closeKind: 'legacy-reverse',
+    closeClientOrderId: null,
+    closeOrderId: null,
+    closeQtyWad: null,
+  };
+}
+
 function validateRecord(value) {
   rejectUnknownKeys(value, new Set(RECORD_KEYS), 'record');
+  if (value.version !== 2) throw new Error('PopDEX fill-close journal version 必须是 2。');
   for (const key of RECORD_KEYS) {
     if (!Object.hasOwn(value, key)) {
       throw new Error(`PopDEX fill-close journal record 缺少字段 ${key}。`);
     }
   }
-  if (value.version !== 1) throw new Error('PopDEX fill-close journal version 必须是 1。');
   if (!STAGES.has(value.stage)) {
     throw new Error(`PopDEX fill-close journal stage 无效：${String(value.stage)}。`);
   }
@@ -149,13 +181,25 @@ function validateRecord(value) {
     throw new Error('PopDEX fill-close journal priceWad 和 qtyWad 必须大于 0。');
   }
   value.clientOrderId = hex32(value.clientOrderId, 'clientOrderId');
+  if (value.closeClientOrderId !== null) {
+    value.closeClientOrderId = hex32(value.closeClientOrderId, 'closeClientOrderId');
+  }
   if (value.orderId !== null) value.orderId = positiveUint128(value.orderId, 'orderId');
+  if (value.closeOrderId !== null) {
+    value.closeOrderId = positiveUint128(value.closeOrderId, 'closeOrderId');
+  }
   if (value.positionId !== null) value.positionId = positiveUint128(value.positionId, 'positionId');
   for (const field of ['leverageTxHash', 'entryTxHash', 'cancelTxHash', 'closeTxHash']) {
     if (value[field] !== null) value[field] = hex32(value[field], field);
   }
   for (const field of ['filledQtyWad', 'remainingQtyWad', 'positionQtyWad']) {
     if (value[field] !== null) value[field] = wad(value[field], field);
+  }
+  if (value.closeQtyWad !== null) {
+    value.closeQtyWad = wad(value.closeQtyWad, 'closeQtyWad');
+    if (BigInt(value.closeQtyWad) <= 0n) {
+      throw new Error('PopDEX fill-close journal closeQtyWad 必须大于 0。');
+    }
   }
   if (value.outcome !== null && !OUTCOMES.has(value.outcome)) {
     throw new Error(`PopDEX fill-close journal outcome 无效：${String(value.outcome)}。`);
@@ -168,6 +212,39 @@ function validateRecord(value) {
   }
   timestamp(value.updatedAt);
 
+  const isNewClose = value.closeKind === 'reduce-only-market';
+  const isLegacyClose = value.closeKind === 'legacy-reverse';
+  if (value.closeKind !== null && !isNewClose && !isLegacyClose) {
+    throw new Error(`PopDEX fill-close journal closeKind 无效：${String(value.closeKind)}。`);
+  }
+  if (isLegacyClose) {
+    if (!['CLOSE_BROADCAST', 'COMPLETED'].includes(value.stage)
+        || value.closeTxHash === null
+        || value.closeClientOrderId !== null
+        || value.closeOrderId !== null
+        || value.closeQtyWad !== null) {
+      throw new Error('PopDEX legacy-reverse 只允许保留旧失败平仓恢复事实。');
+    }
+    if (value.stage === 'COMPLETED'
+        && (value.outcome !== 'completed-flat-manual' || value.positionQtyWad !== '0')) {
+      throw new Error('PopDEX legacy-reverse 只允许以人工空仓事实完成。');
+    }
+  }
+  if (isNewClose && ['CLOSE_BROADCAST', 'CLOSE_SETTLING', 'COMPLETED'].includes(value.stage)) {
+    if (value.closeClientOrderId === null
+        || value.closeQtyWad === null
+        || value.closeTxHash === null) {
+      throw new Error(`PopDEX fill-close journal ${value.stage} 缺少平仓订单事实。`);
+    }
+    if (value.closeQtyWad !== value.filledQtyWad) {
+      throw new Error('PopDEX fill-close journal 平仓量与已确认成交量不一致。');
+    }
+    if (['CLOSE_BROADCAST', 'CLOSE_SETTLING'].includes(value.stage)
+        && value.closeQtyWad !== value.positionQtyWad) {
+      throw new Error('PopDEX fill-close journal 平仓量与已确认持仓量不一致。');
+    }
+  }
+
   if (value.stage === 'LEVERAGE_BROADCAST' && value.leverageTxHash === null) {
     throw new Error('PopDEX fill-close journal LEVERAGE_BROADCAST 缺少 leverageTxHash。');
   }
@@ -177,6 +254,7 @@ function validateRecord(value) {
     'REMAINDER_CANCEL_BROADCAST',
     'POSITION_CONFIRMED',
     'CLOSE_BROADCAST',
+    'CLOSE_SETTLING',
   ]);
   if (afterEntry.has(value.stage) && value.entryTxHash === null) {
     throw new Error(`PopDEX fill-close journal ${value.stage} 缺少 entryTxHash。`);
@@ -186,6 +264,7 @@ function validateRecord(value) {
     'REMAINDER_CANCEL_BROADCAST',
     'POSITION_CONFIRMED',
     'CLOSE_BROADCAST',
+    'CLOSE_SETTLING',
   ]);
   if (afterOrder.has(value.stage) && value.orderId === null) {
     throw new Error(`PopDEX fill-close journal ${value.stage} 缺少 orderId。`);
@@ -193,7 +272,7 @@ function validateRecord(value) {
   if (value.stage === 'REMAINDER_CANCEL_BROADCAST' && value.cancelTxHash === null) {
     throw new Error('PopDEX fill-close journal REMAINDER_CANCEL_BROADCAST 缺少 cancelTxHash。');
   }
-  if (['POSITION_CONFIRMED', 'CLOSE_BROADCAST'].includes(value.stage)) {
+  if (['POSITION_CONFIRMED', 'CLOSE_BROADCAST', 'CLOSE_SETTLING'].includes(value.stage)) {
     if (value.positionId === null || value.filledQtyWad === null || value.positionQtyWad === null) {
       throw new Error(`PopDEX fill-close journal ${value.stage} 缺少持仓事实。`);
     }
@@ -201,18 +280,34 @@ function validateRecord(value) {
       throw new Error(`PopDEX fill-close journal ${value.stage} 成交量与持仓量不一致。`);
     }
   }
-  if (value.stage === 'CLOSE_BROADCAST' && value.closeTxHash === null) {
-    throw new Error('PopDEX fill-close journal CLOSE_BROADCAST 缺少 closeTxHash。');
+  if (['CLOSE_BROADCAST', 'CLOSE_SETTLING'].includes(value.stage)
+      && value.closeTxHash === null) {
+    throw new Error(`PopDEX fill-close journal ${value.stage} 缺少 closeTxHash。`);
+  }
+  if (value.stage === 'CLOSE_BROADCAST' && value.closeKind === null) {
+    throw new Error('PopDEX fill-close journal CLOSE_BROADCAST 缺少 closeKind。');
+  }
+  if (value.stage === 'CLOSE_SETTLING') {
+    if (!isNewClose || value.closeOrderId === null) {
+      throw new Error('PopDEX fill-close journal CLOSE_SETTLING 缺少 closeOrderId。');
+    }
   }
   if (value.stage === 'COMPLETED') {
     if (value.outcome === null) {
       throw new Error('PopDEX fill-close journal COMPLETED 缺少合法 outcome。');
     }
     if (value.outcome === 'completed-flat'
-        && (value.closeTxHash === null || value.positionId === null
+        && (!isNewClose || value.closeTxHash === null || value.closeOrderId === null
+          || value.positionId === null
           || value.filledQtyWad === null || BigInt(value.filledQtyWad) <= 0n
           || value.positionQtyWad !== '0')) {
       throw new Error('PopDEX fill-close journal completed-flat 缺少平仓完成事实。');
+    }
+    if (value.outcome === 'completed-flat-manual'
+        && (value.closeTxHash === null || value.positionId === null
+          || value.filledQtyWad === null || BigInt(value.filledQtyWad) <= 0n
+          || value.positionQtyWad !== '0')) {
+      throw new Error('PopDEX fill-close journal completed-flat-manual 缺少人工空仓事实。');
     }
     if (value.outcome === 'zero-fill-cleared'
         && (value.entryTxHash === null || value.orderId === null
@@ -305,7 +400,7 @@ export class PopdexFillCloseJournal {
         { cause },
       );
     }
-    return validateRecord(parsed);
+    return validateRecord(normalizeLoadedRecord(parsed));
   }
 
   create(initial) {
@@ -314,10 +409,12 @@ export class PopdexFillCloseJournal {
       throw new Error(`PopDEX 已有 fill-close 恢复记录 ${this.file}，拒绝覆盖。`);
     }
     return this.#persist({
-      version: 1,
+      version: 2,
       stage: 'PREPARED',
       ...initial,
+      closeKind: null,
       orderId: null,
+      closeOrderId: null,
       positionId: null,
       leverageTxHash: null,
       entryTxHash: null,
@@ -326,6 +423,7 @@ export class PopdexFillCloseJournal {
       filledQtyWad: null,
       remainingQtyWad: null,
       positionQtyWad: null,
+      closeQtyWad: null,
       outcome: null,
       lastError: null,
       updatedAt: this.#timestamp(),
@@ -354,8 +452,12 @@ export class PopdexFillCloseJournal {
           && !['PREPARED', 'LEVERAGE_BROADCAST', 'LEVERAGE_CONFIRMED'].includes(expectedStage)) {
         throw new Error('PopDEX ENTRY_BROADCAST 只有精确失败回执才能标记 safe-no-exposure。');
       }
-      if (fields.outcome === 'completed-flat' && expectedStage !== 'CLOSE_BROADCAST') {
-        throw new Error('PopDEX completed-flat 只允许从 CLOSE_BROADCAST 完成。');
+      if (fields.outcome === 'completed-flat' && expectedStage !== 'CLOSE_SETTLING') {
+        throw new Error('PopDEX completed-flat 只允许从 CLOSE_SETTLING 完成。');
+      }
+      if (fields.outcome === 'completed-flat-manual'
+          && expectedStage !== 'CLOSE_BROADCAST') {
+        throw new Error('PopDEX completed-flat-manual 只允许从 CLOSE_BROADCAST 完成。');
       }
       if (fields.outcome === 'zero-fill-cleared'
           && !['ENTRY_SETTLING', 'REMAINDER_CANCEL_BROADCAST'].includes(expectedStage)) {

@@ -134,7 +134,8 @@ test('fill-close dry-run verifies all facts and never signs broadcasts or writes
   assert.equal(result.qty, '0.0002');
   assert.match(result.calldataHashes.leverage, /^0x[0-9a-f]{64}$/);
   assert.match(result.calldataHashes.entry, /^0x[0-9a-f]{64}$/);
-  assert.match(result.calldataHashes.close, /^0x[0-9a-f]{64}$/);
+  assert.match(result.calldataHashes.closePreview, /^0x[0-9a-f]{64}$/);
+  assert.notEqual(result.clientOrderId, result.closeClientOrderId);
   assert.equal(deps.broadcasts, 0);
   assert.equal(deps.journalCreates, 0);
   assert.equal(deps.calls.filter((call) => call.startsWith('write:simulate:')).length, 3);
@@ -273,7 +274,7 @@ function liveDependencies({
   };
   deps.accountClient.getAllFills = async () => {
     if (phase === 'initial' || kind === 'zero') return [];
-    return [{
+    const fills = [{
       fillId: '1',
       orderId: '9',
       symbol: 'BTCUSDT',
@@ -281,6 +282,17 @@ function liveDependencies({
       execPrice: '63000',
       execQty: kind === 'full' ? '0.0002' : '0.0001',
     }];
+    if (phase === 'closed') {
+      fills.push({
+        fillId: '2',
+        orderId: '10',
+        symbol: 'BTCUSDT',
+        side: 'Sell',
+        execPrice: '63000',
+        execQty: kind === 'full' ? '0.0002' : '0.0001',
+      });
+    }
+    return fills;
   };
   deps.accountClient.getAllOpenOrders = async () => {
     if (phase === 'active' && kind !== 'full') return [order()];
@@ -321,14 +333,22 @@ function liveDependencies({
       phase = 'cancelled';
       return { orderId: '9' };
     },
-    async closeFillCloseLong(_plan, targetJournal) {
+    async closeFillCloseLong(_plan, positionFacts, targetJournal) {
       closeCalls += 1;
       flow.push('trading:close');
+      assert.equal(positionFacts.closeClientOrderId, _plan.closeClientOrderId);
+      assert.equal(positionFacts.closeQtyWad, positionFacts.positionQtyWad);
+      assert.equal(positionFacts.positionId, '7');
       targetJournal.advance('POSITION_CONFIRMED', 'CLOSE_BROADCAST', {
+        closeKind: 'reduce-only-market',
         closeTxHash: `0x${'44'.repeat(32)}`,
+        closeQtyWad: positionFacts.closeQtyWad,
+      });
+      targetJournal.advance('CLOSE_BROADCAST', 'CLOSE_SETTLING', {
+        closeOrderId: '10',
       });
       phase = 'closed';
-      return { status: '0x1' };
+      return { orderId: '10' };
     },
   };
   let clock = NOW;
@@ -352,6 +372,7 @@ test('fill-close live orchestration completes a full fill and flat close once', 
   const scenario = liveDependencies({ kind: 'full' });
   const result = await runProbe({ mode: 'fill-close' }, scenario.deps);
   assert.equal(result.status, 'completed-flat');
+  assert.equal(result.closeOrderId, '10');
   assert.deepEqual(scenario.counts, {
     leverageCalls: 0,
     entryCalls: 1,
@@ -367,6 +388,7 @@ test('fill-close live orchestration completes a full fill and flat close once', 
     'journal:POSITION_CONFIRMED',
     'trading:close',
     'journal:CLOSE_BROADCAST',
+    'journal:CLOSE_SETTLING',
     'journal:COMPLETED',
     'journal:clear',
   ]);
@@ -415,11 +437,14 @@ test('fill-close live orchestration retains recovery state and never retries wri
     /平仓终态确认.*超过/,
   );
   assert.equal(residual.counts.closeCalls, 1);
-  assert.equal(residual.journal.load().stage, 'CLOSE_BROADCAST');
+  assert.equal(residual.journal.load().stage, 'CLOSE_SETTLING');
 });
 
 function recoveryRecord(stage, overrides = {}) {
+  const afterPosition = ['POSITION_CONFIRMED', 'CLOSE_BROADCAST', 'CLOSE_SETTLING']
+    .includes(stage);
   return {
+    version: 2,
     stage,
     mainAccount: MAIN_ACCOUNT,
     agentAddress: AGENT,
@@ -430,18 +455,26 @@ function recoveryRecord(stage, overrides = {}) {
     priceWad: '63189000000000000000000',
     qtyWad: '200000000000000',
     clientOrderId: '0x64772d62622d3031303230333034303530363037303830393061306230630000',
+    closeKind: ['CLOSE_BROADCAST', 'CLOSE_SETTLING'].includes(stage)
+      ? 'reduce-only-market' : null,
+    closeClientOrderId:
+      '0x64772d62632d3031303230333034303530363037303830393061306230630000',
+    closeOrderId: stage === 'CLOSE_SETTLING' ? '10' : null,
     orderId: ['PREPARED', 'LEVERAGE_BROADCAST', 'LEVERAGE_CONFIRMED', 'ENTRY_BROADCAST']
       .includes(stage) ? null : '9',
-    positionId: ['POSITION_CONFIRMED', 'CLOSE_BROADCAST'].includes(stage) ? '7' : null,
+    positionId: afterPosition ? '7' : null,
     leverageTxHash: stage === 'LEVERAGE_BROADCAST' ? `0x${'11'.repeat(32)}` : null,
-    entryTxHash: ['ENTRY_BROADCAST', 'ENTRY_SETTLING', 'REMAINDER_CANCEL_BROADCAST', 'POSITION_CONFIRMED', 'CLOSE_BROADCAST']
+    entryTxHash: ['ENTRY_BROADCAST', 'ENTRY_SETTLING', 'REMAINDER_CANCEL_BROADCAST', 'POSITION_CONFIRMED', 'CLOSE_BROADCAST', 'CLOSE_SETTLING']
       .includes(stage) ? `0x${'22'.repeat(32)}` : null,
     cancelTxHash: stage === 'REMAINDER_CANCEL_BROADCAST' ? `0x${'33'.repeat(32)}` : null,
-    closeTxHash: stage === 'CLOSE_BROADCAST' ? `0x${'44'.repeat(32)}` : null,
-    filledQtyWad: ['POSITION_CONFIRMED', 'CLOSE_BROADCAST'].includes(stage)
+    closeTxHash: ['CLOSE_BROADCAST', 'CLOSE_SETTLING'].includes(stage)
+      ? `0x${'44'.repeat(32)}` : null,
+    filledQtyWad: afterPosition
       ? '100000000000000' : null,
-    remainingQtyWad: ['POSITION_CONFIRMED', 'CLOSE_BROADCAST'].includes(stage) ? '0' : null,
-    positionQtyWad: ['POSITION_CONFIRMED', 'CLOSE_BROADCAST'].includes(stage)
+    remainingQtyWad: afterPosition ? '0' : null,
+    positionQtyWad: afterPosition
+      ? '100000000000000' : null,
+    closeQtyWad: ['CLOSE_BROADCAST', 'CLOSE_SETTLING'].includes(stage)
       ? '100000000000000' : null,
     outcome: null,
     lastError: null,
@@ -494,6 +527,27 @@ function recoveryOrder({ filled = '0', remaining = '0.0002', cancelled = '0' } =
     remainingQty: remaining,
     cancelledQty: cancelled,
     reduceOnly: false,
+  };
+}
+
+function recoveryCloseFill(execQty) {
+  return {
+    fillId: '2',
+    orderId: '10',
+    symbol: 'BTCUSDT',
+    side: 'Sell',
+    execQty,
+  };
+}
+
+function recoveryLong(holdSizeWad) {
+  return {
+    walletId: MAIN_ACCOUNT,
+    positionId: '7',
+    symbol: 'BTCUSDT',
+    symbolId: '20000',
+    side: '1',
+    holdSizeWad,
   };
 }
 
@@ -550,11 +604,16 @@ function recoveryDependencies(stage, {
           cancelTxHash: `0x${'33'.repeat(32)}`,
         });
       },
-      async closeFillCloseLong(_plan, targetJournal) {
+      async closeFillCloseLong(_plan, positionFacts, targetJournal) {
         closeCalls += 1;
+        assert.equal(positionFacts.closeClientOrderId, _plan.closeClientOrderId);
+        assert.equal(positionFacts.closeQtyWad, positionFacts.positionQtyWad);
         targetJournal.advance('POSITION_CONFIRMED', 'CLOSE_BROADCAST', {
+          closeKind: 'reduce-only-market',
           closeTxHash: `0x${'44'.repeat(32)}`,
+          closeQtyWad: positionFacts.closeQtyWad,
         });
+        return { orderId: '10' };
       },
     },
   };
@@ -601,6 +660,55 @@ test('plain recovery safely clears pre-entry and exact failed-entry records only
   const failedEntry = recoveryDependencies('ENTRY_BROADCAST', { receiptStatus: '0x0' });
   assert.equal((await runProbe({ mode: 'resume' }, failedEntry.deps)).status, 'safe-no-exposure');
   assert.equal(failedEntry.journal.load(), null);
+});
+
+test('failed close receipt clears the journal only after read-only facts prove manual flat', async () => {
+  const flat = recoveryDependencies('CLOSE_BROADCAST', { receiptStatus: '0x0' });
+  const result = await runProbe({ mode: 'resume' }, flat.deps);
+  assert.equal(result.status, 'completed-flat-manual');
+  assert.equal(flat.closeCalls, 0);
+  assert.equal(flat.journal.load(), null);
+
+  const long = recoveryDependencies('CLOSE_BROADCAST', {
+    receiptStatus: '0x0',
+    positions: [{
+      walletId: MAIN_ACCOUNT,
+      positionId: '7',
+      symbolId: '20000',
+      side: '1',
+      holdSizeWad: '100000000000000',
+    }],
+  });
+  const unresolved = await runProbe({ mode: 'resume' }, long.deps);
+  assert.equal(unresolved.status, 'close-receipt-failed');
+  assert.equal(long.closeCalls, 0);
+  assert.equal(long.journal.load().stage, 'CLOSE_BROADCAST');
+});
+
+test('plain recovery settles the exact close without broadcasting again', async () => {
+  const pending = recoveryDependencies('CLOSE_BROADCAST', { receiptStatus: null });
+  assert.equal((await runProbe({ mode: 'resume' }, pending.deps)).status,
+    'close-receipt-pending');
+  assert.equal(pending.closeCalls, 0);
+
+  const partial = recoveryDependencies('CLOSE_SETTLING', {
+    fills: [recoveryCloseFill('0.00005')],
+    positions: [recoveryLong('50000000000000')],
+  });
+  const partialResult = await runProbe({ mode: 'resume' }, partial.deps);
+  assert.equal(partialResult.status, 'partial-close-unresolved');
+  assert.equal(partial.closeCalls, 0);
+  assert.equal(partial.journal.load().stage, 'CLOSE_SETTLING');
+
+  const complete = recoveryDependencies('CLOSE_SETTLING', {
+    fills: [recoveryCloseFill('0.0001')],
+    positions: [],
+    openOrders: [],
+  });
+  const completeResult = await runProbe({ mode: 'resume' }, complete.deps);
+  assert.equal(completeResult.status, 'completed-flat');
+  assert.equal(complete.closeCalls, 0);
+  assert.equal(complete.journal.load(), null);
 });
 
 test('leverage broadcast recovery waits for its receipt and verifies success before clearing', async () => {
@@ -692,5 +800,24 @@ test('recovery CLI renders no-record without accessing dry-run-only fields', asy
   });
   assert.deepEqual(result, { mode: 'resume', status: 'no-record' });
   assert.match(lines.join('\n'), /resume.*no-record/);
+  process.exitCode = 0;
+});
+
+test('recovery CLI renders exact unresolved close diagnostics', async () => {
+  const scenario = recoveryDependencies('CLOSE_SETTLING', {
+    fills: [recoveryCloseFill('0.00005')],
+    positions: [recoveryLong('50000000000000')],
+  });
+  const lines = [];
+  const result = await main(['--resume'], {
+    ...scenario.deps,
+    log: (line) => lines.push(line),
+    error: (line) => lines.push(line),
+  });
+  assert.equal(result.status, 'partial-close-unresolved');
+  assert.match(lines.join('\n'), /closeTxHash=0x(?:44){32}/);
+  assert.match(lines.join('\n'), /closeOrderId=10/);
+  assert.match(lines.join('\n'), /filledQtyWad=50000000000000/);
+  assert.match(lines.join('\n'), /remainingPositionQtyWad=50000000000000/);
   process.exitCode = 0;
 });
