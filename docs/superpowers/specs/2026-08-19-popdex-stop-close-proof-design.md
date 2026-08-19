@@ -63,12 +63,12 @@ ownership 根记录增加 `settledExposureEvents`，每条记录至少包含：
 
 变化如下：
 
-1. `GridBot.stop()` 在确认平仓成功后，要求支持该能力的交易所把本次已 suppression 的 opening 成交事件记录为已结算敞口。
-2. PopDEX 必须先确认官方零挂单和零持仓，再持久化结算证明。
+1. PopDEX 在广播平仓前计算本次需要结算的精确 opening 成交事件，并要求其总量与已确认持仓完全一致。
+2. PopDEX 必须先确认官方零挂单和零持仓，再持久化结算证明；operation journal 在证明落盘前不得清理。
 3. reconciler 计算最低所需 Long 数量时，只排除具有完全匹配结算证明的 opening 成交；缺失、重复或冲突证明立即报错。
 4. 最终对账成功后仍按现有规则删除验收状态文件。
 
-`closePosition()` 返回 `true` 的旧接口保持不变；新增能力使用可选的适配器方法，避免改变 Decibel、RISEx 和 Paper 路径。
+`closePosition()` 返回 `true` 的旧接口保持不变。结算证明由 `PopdexExchange.closePosition()` 及其 operation journal 恢复路径在内部完成，不修改 GridBot、Decibel、RISEx 和 Paper 的接口或行为。进程若在平仓确认后、证明落盘前退出，重启会根据保留的 `CONFIRMED close` journal 和官方空仓快照补写同一证明，不会再次广播平仓。
 
 ## CLI 失败清理
 
@@ -129,4 +129,3 @@ ownership 根记录增加 `settledExposureEvents`，每条记录至少包含：
 - suppression 不再被误当作平仓证明。
 - stop 任何失败都不会让 CLI 因定时器或锁继续卡住。
 - 当前事故能通过显式、只读、零链上写入命令安全归档。
-
