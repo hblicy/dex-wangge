@@ -747,6 +747,11 @@ export async function runGridProbe({
   });
 }
 
+export function printManualFlatRecoveryResult(result, output = console.log) {
+  output(`PopDEX 人工平仓恢复完成：orderId=${result.orderId}，链上写入=0。`);
+  for (const file of result.archivedFiles) output(`已归档：${file}`);
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   runGridProbe().then((result) => {
     if (result?.mode === 'dry-run') {
@@ -757,6 +762,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     } else if (result?.mode === 'manual-cancel-recovered') {
       console.log(`PopDEX 人工撤单恢复完成：orderId=${result.orderId}，链上写入=0。`);
       for (const file of result.archivedFiles) console.log(`已归档：${file}`);
+    } else if (result?.mode === 'manual-flat-recovered') {
+      printManualFlatRecoveryResult(result);
     }
   }).catch((error) => {
     console.error(`PopDEX grid-probe 失败：${error?.message || error}`);

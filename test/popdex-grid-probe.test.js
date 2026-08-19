@@ -8,6 +8,7 @@ import test from 'node:test';
 import {
   buildBtcLongThreeGridPlan,
   parseGridProbeArgs,
+  printManualFlatRecoveryResult,
   runGridProbe,
 } from '../src/exchange/px/grid-probe.js';
 
@@ -431,6 +432,21 @@ test('manual flat recovery archives the exact filled incident without writes', a
     assert.match(file, /\.manual-flat-/);
     assert.equal(fs.existsSync(file), true);
   }
+});
+
+test('manual flat recovery CLI output identifies zero writes and every archive', () => {
+  const output = [];
+  printManualFlatRecoveryResult({
+    mode: 'manual-flat-recovered',
+    orderId: '245591159265558528',
+    writes: 0,
+    archivedFiles: ['/tmp/state.manual-flat.bak', '/tmp/ownership.manual-flat.bak'],
+  }, (message) => output.push(String(message)));
+  assert.deepEqual(output, [
+    'PopDEX 人工平仓恢复完成：orderId=245591159265558528，链上写入=0。',
+    '已归档：/tmp/state.manual-flat.bak',
+    '已归档：/tmp/ownership.manual-flat.bak',
+  ]);
 });
 
 test('manual flat recovery rejects official exposure or mismatched fills and preserves facts', async (t) => {
