@@ -343,18 +343,35 @@ function archiveRecoveryFiles(files, fsImpl, now, { suffix, label }) {
   return entries.map((entry) => entry.archived);
 }
 
+function validateRunningManualCancelActive(activeEntry, owned, orderId) {
+  if (!Array.isArray(activeEntry) || activeEntry.length !== 2) {
+    throw new Error('PopDEX grid-probe 运行中人工撤单 active 条目格式无效。');
+  }
+  const [activeOrderId, metadata] = activeEntry;
+  const priceWad = parseUnits(String(metadata?.price), 18).toString();
+  const qtyWad = parseUnits(String(metadata?.sizeBase), 18).toString();
+  if (String(activeOrderId) !== orderId
+      || metadata?.clientOrderId?.toLowerCase() !== owned.clientOrderId
+      || metadata?.levelIndex !== owned.levelIndex
+      || metadata?.side !== owned.side
+      || priceWad !== owned.priceWad
+      || qtyWad !== owned.qtyWad
+      || metadata?.opening !== owned.opening
+      || metadata?.reduceOnly !== owned.reduceOnly
+      || metadata?.recovery !== false
+      || metadata?.parentFillEventId !== owned.parentFillEventId) {
+    throw new Error('PopDEX grid-probe 运行中人工撤单活动订单身份与 ownership 不匹配。');
+  }
+}
+
 function validateManualCancelState({ files, fsImpl, preflight, orderId }) {
   const record = readJson(files.state, fsImpl);
+  if (record === null) {
+    throw new Error('PopDEX grid-probe 没有可恢复的人工撤单状态。');
+  }
   if (record?.version !== 1
       || record.mainAccount?.toLowerCase() !== preflight.mainAccount.toLowerCase()) {
     throw new Error('PopDEX grid-probe 人工撤单恢复的状态文件版本或账户不匹配。');
-  }
-  if (record.snapshot?.running !== false
-      || !Array.isArray(record.snapshot?.active)
-      || record.snapshot.active.length !== 0
-      || !Array.isArray(record.snapshot?.processedFillEventIds)
-      || record.snapshot.processedFillEventIds.length !== 0) {
-    throw new Error('PopDEX grid-probe 人工撤单恢复只允许 stopped、0 active、0 已处理成交事件的快照。');
   }
   if (readJson(files.operation, fsImpl) !== null) {
     throw new Error('PopDEX grid-probe 仍有未完成写操作，拒绝人工撤单恢复。');
@@ -369,9 +386,28 @@ function validateManualCancelState({ files, fsImpl, preflight, orderId }) {
     throw new Error('PopDEX grid-probe 人工确认的订单号与本地事实不一致。');
   }
   const owned = orders[0];
-  if (owned.state !== 'UNKNOWN_TERMINAL' || owned.filledQtyWad !== '0'
-      || owned.fillIds.length !== 0 || owned.terminalEvent !== null) {
-    throw new Error('PopDEX grid-probe 本地订单不是可人工确认的 UNKNOWN_TERMINAL 零成交状态。');
+  const active = record.snapshot?.active;
+  const processed = record.snapshot?.processedFillEventIds;
+  let recoveryShape;
+  if (record.snapshot?.running === false
+      && Array.isArray(active) && active.length === 0
+      && Array.isArray(processed) && processed.length === 0
+      && owned.state === 'UNKNOWN_TERMINAL') {
+    recoveryShape = 'stopped-unknown-terminal';
+  } else if (record.snapshot?.running === true
+      && Array.isArray(active) && active.length === 1
+      && Array.isArray(processed) && processed.length === 0
+      && ['OPEN', 'UNKNOWN_TERMINAL'].includes(owned.state)) {
+    recoveryShape = 'aborted-running-zero-fill-open';
+    validateRunningManualCancelActive(active[0], owned, orderId);
+  } else {
+    throw new Error('PopDEX grid-probe 人工撤单恢复状态形态不受支持。');
+  }
+  if (owned.filledQtyWad !== '0'
+      || owned.fillIds.length !== 0
+      || owned.terminalEvent !== null
+      || owned.cancelProof !== null) {
+    throw new Error('PopDEX grid-probe 本地订单不是可人工确认的零成交状态。');
   }
   if (preflight.openOrders.length !== 0 || preflight.chainActiveOrders.length !== 0) {
     throw new Error('PopDEX BTCUSDT 仍有活动挂单，拒绝人工撤单恢复。');
@@ -382,7 +418,7 @@ function validateManualCancelState({ files, fsImpl, preflight, orderId }) {
   if (preflight.fills.some((fill) => String(fill?.orderId) === orderId)) {
     throw new Error(`PopDEX orderId=${orderId} 存在成交事实，拒绝人工撤单恢复。`);
   }
-  return owned;
+  return { owned, recoveryShape };
 }
 
 function recoverManualCancel({ args, preflight, deps, files, fsImpl }) {
@@ -395,7 +431,7 @@ function recoverManualCancel({ args, preflight, deps, files, fsImpl }) {
     processKill: deps.processKill ?? process.kill.bind(process),
   });
   try {
-    validateManualCancelState({
+    const validated = validateManualCancelState({
       files,
       fsImpl,
       preflight,
@@ -408,6 +444,7 @@ function recoverManualCancel({ args, preflight, deps, files, fsImpl }) {
     return {
       mode: 'manual-cancel-recovered',
       orderId: args.manualCancelOrderId,
+      recoveryShape: validated.recoveryShape,
       archivedFiles,
       writes: 0,
     };
@@ -418,6 +455,9 @@ function recoverManualCancel({ args, preflight, deps, files, fsImpl }) {
 
 function validateManualFlatState({ files, fsImpl, preflight, orderId }) {
   const record = readJson(files.state, fsImpl);
+  if (record === null) {
+    throw new Error('PopDEX grid-probe 没有可恢复的人工平仓状态。');
+  }
   if (record?.version !== 1
       || record.mainAccount?.toLowerCase() !== preflight.mainAccount.toLowerCase()) {
     throw new Error('PopDEX grid-probe 人工平仓恢复的状态文件版本或账户不匹配。');
@@ -588,6 +628,31 @@ async function createSession({ args, preflight, plan, env, deps, files, fsImpl }
 
   let closed = false;
   const output = deps.output ?? console.log;
+  const closeAfterControlFailure = (command, error) => {
+    if (closed) return error;
+    const cleanupErrors = [];
+    try {
+      exchange.stop();
+    } catch (cleanupError) {
+      cleanupErrors.push(cleanupError);
+    }
+    try {
+      releaseLock();
+    } catch (cleanupError) {
+      cleanupErrors.push(cleanupError);
+    }
+    closed = true;
+    if (cleanupErrors.length === 0) {
+      output(
+        `[PopDEX ${command}] 失败后已关闭交易所刷新并释放进程锁；恢复事实已保留。`,
+      );
+      return error;
+    }
+    return new AggregateError(
+      [error, ...cleanupErrors],
+      `PopDEX 控制命令 ${command} 失败，且会话资源清理失败。`,
+    );
+  };
   const session = {
     exchange,
     bot,
@@ -652,26 +717,7 @@ async function createSession({ args, preflight, plan, env, deps, files, fsImpl }
           return { status: 'stopped-flat' };
         } catch (error) {
           output(`[PopDEX stop] 失败：阶段=${stopStage}，耗时=${elapsed()}ms。`);
-          const cleanupErrors = [];
-          try {
-            exchange.stop();
-          } catch (cleanupError) {
-            cleanupErrors.push(cleanupError);
-          }
-          try {
-            releaseLock();
-          } catch (cleanupError) {
-            cleanupErrors.push(cleanupError);
-          }
-          closed = true;
-          if (cleanupErrors.length === 0) {
-            output('[PopDEX stop] 失败后已关闭交易所刷新并释放进程锁。');
-            throw error;
-          }
-          throw new AggregateError(
-            [error, ...cleanupErrors],
-            `PopDEX stop ${stopStage}失败，且会话资源清理失败。`,
-          );
+          throw error;
         }
       }
       throw new Error(`PopDEX grid-probe 不支持控制命令 ${String(command)}。`);
@@ -701,6 +747,8 @@ async function createSession({ args, preflight, plan, env, deps, files, fsImpl }
     activeCommand = command;
     try {
       return await executeCommandUnlocked(command);
+    } catch (error) {
+      throw closeAfterControlFailure(command, error);
     } finally {
       activeCommand = null;
     }
@@ -799,6 +847,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       console.log('writes=0；加入 --confirm-mainnet-grid 才会启动主网三格验收。');
     } else if (result?.mode === 'manual-cancel-recovered') {
       console.log(`PopDEX 人工撤单恢复完成：orderId=${result.orderId}，链上写入=0。`);
+      console.log(`恢复形态：${result.recoveryShape}。`);
       for (const file of result.archivedFiles) console.log(`已归档：${file}`);
     } else if (result?.mode === 'manual-flat-recovered') {
       printManualFlatRecoveryResult(result);

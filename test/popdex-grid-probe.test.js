@@ -49,6 +49,7 @@ class FakeStrictAdapter extends EventEmitter {
     this.cancelCalls = 0;
     this.closeCalls = 0;
     this.stopCalls = 0;
+    this.reconnectFailure = null;
     this.reconcileFailure = null;
     this.reconcileStatus = 'READY';
     this.position = null;
@@ -116,7 +117,11 @@ class FakeStrictAdapter extends EventEmitter {
     this.pending.delete(fillEventId);
   }
   haltFromBot(error) { this.state = 'HALTED'; this.haltReason = error.message; }
-  async reconnect() { this.reconcileFailure = null; return this.reconcileOwnedOrders(); }
+  async reconnect() {
+    if (this.reconnectFailure !== null) throw this.reconnectFailure;
+    this.reconcileFailure = null;
+    return this.reconcileOwnedOrders();
+  }
   getHealth() { return { state: this.state, status: this.state === 'READY' ? 'ok' : 'error' }; }
   terminalFill(orderId, { offline = false } = {}) {
     const order = this.orders.get(String(orderId));
@@ -182,6 +187,60 @@ function writeManualCancelIncident(files, orderId = '244656875029659648') {
       terminalEvent: null,
     }],
     updatedAt: '2026-08-19T04:16:00.000Z',
+  }), { mode: 0o600 });
+}
+
+function writeRunningManualCancelIncident(
+  files,
+  orderId = '246940766838980608',
+  state = 'OPEN',
+) {
+  const mainAccount = '0x1111111111111111111111111111111111111111';
+  const clientOrderId = `0x${'24'.repeat(32)}`;
+  fs.writeFileSync(files.state, JSON.stringify({
+    version: 1,
+    mainAccount,
+    snapshot: {
+      running: true,
+      active: [[orderId, {
+        levelIndex: 0,
+        side: 'buy',
+        price: 64435,
+        sizeBase: 0.0002,
+        clientOrderId,
+        reduceOnly: false,
+        opening: true,
+        recovery: false,
+        parentFillEventId: null,
+        placedAt: 1787143463083,
+      }]],
+      processedFillEventIds: [],
+    },
+    updatedAt: '2026-08-19T12:44:23.083Z',
+  }), { mode: 0o600 });
+  fs.writeFileSync(files.ownership, JSON.stringify({
+    version: 1,
+    mainAccount,
+    symbol: 'BTCUSDT',
+    symbolId: '20000',
+    orders: [{
+      orderId,
+      clientOrderId,
+      marketId: 20000,
+      levelIndex: 0,
+      side: 'buy',
+      priceWad: '64435000000000000000000',
+      qtyWad: '200000000000000',
+      opening: true,
+      reduceOnly: false,
+      parentFillEventId: null,
+      state,
+      filledQtyWad: '0',
+      fillIds: [],
+      terminalEvent: null,
+      cancelProof: null,
+    }],
+    updatedAt: '2026-08-19T12:44:23.083Z',
   }), { mode: 0o600 });
 }
 
@@ -393,6 +452,7 @@ test('manual cancel recovery requires exact stopped zero-fill incident and archi
   });
   assert.equal(result.mode, 'manual-cancel-recovered');
   assert.equal(result.orderId, orderId);
+  assert.equal(result.recoveryShape, 'stopped-unknown-terminal');
   assert.equal(result.writes, 0);
   assert.equal(fs.existsSync(files.state), false);
   assert.equal(fs.existsSync(files.ownership), false);
@@ -722,7 +782,244 @@ test('stop retains recovery facts when final reconciliation is not READY', async
   assert.equal(adapter.stopCalls, 1);
   assert.equal(fs.existsSync(files.lock), false);
   await assert.rejects(started.session.executeCommand('status'), /会话已结束/);
-  assert.ok(output.includes('[PopDEX stop] 失败后已关闭交易所刷新并释放进程锁。'));
+  assert.ok(output.includes(
+    '[PopDEX stop] 失败后已关闭交易所刷新并释放进程锁；恢复事实已保留。',
+  ));
+});
+
+test('manual cancel recovery archives an aborted running zero-fill order', async (t) => {
+  for (const ownershipState of ['OPEN', 'UNKNOWN_TERMINAL']) {
+    await t.test(ownershipState, async (t2) => {
+      const files = temporaryFiles(t2);
+      const orderId = '246940766838980608';
+      writeRunningManualCancelIncident(files, orderId, ownershipState);
+
+      const result = await runGridProbe({
+        argv: ['--confirm-manual-cancel-order', orderId],
+        deps: {
+          preflight: fakePreflight(),
+          files,
+          now: () => Date.parse('2026-08-19T13:00:00.000Z'),
+          processKill() { const error = new Error('missing'); error.code = 'ESRCH'; throw error; },
+        },
+      });
+
+      assert.equal(result.mode, 'manual-cancel-recovered');
+      assert.equal(result.recoveryShape, 'aborted-running-zero-fill-open');
+      assert.equal(result.writes, 0);
+      assert.equal(fs.existsSync(files.state), false);
+      assert.equal(fs.existsSync(files.ownership), false);
+      assert.equal(result.archivedFiles.length, 2);
+    });
+  }
+});
+
+test('running manual cancel recovery rejects active identity conflicts', async (t) => {
+  const orderId = '246940766838980608';
+  for (const [label, mutate, expected] of [
+    ['active order id', (state) => { state.snapshot.active[0][0] = '246940766838980609'; }, /身份.*不匹配/],
+    ['client order id', (state) => { state.snapshot.active[0][1].clientOrderId = `0x${'99'.repeat(32)}`; }, /身份.*不匹配/],
+    ['level index', (state) => { state.snapshot.active[0][1].levelIndex = 1; }, /身份.*不匹配/],
+    ['price', (state) => { state.snapshot.active[0][1].price = 64436; }, /身份.*不匹配/],
+    ['quantity', (state) => { state.snapshot.active[0][1].sizeBase = 0.0001; }, /身份.*不匹配/],
+    ['side', (state) => { state.snapshot.active[0][1].side = 'sell'; }, /身份.*不匹配/],
+    ['opening', (state) => { state.snapshot.active[0][1].opening = false; }, /身份.*不匹配/],
+    ['reduce only', (state) => { state.snapshot.active[0][1].reduceOnly = true; }, /身份.*不匹配/],
+    ['recovery', (state) => { state.snapshot.active[0][1].recovery = true; }, /身份.*不匹配/],
+    ['parent fill', (state) => { state.snapshot.active[0][1].parentFillEventId = `px-fill-${'11'.repeat(32)}`; }, /身份.*不匹配/],
+    ['processed fill', (state) => { state.snapshot.processedFillEventIds = [`px-fill-${'11'.repeat(32)}`]; }, /形态不受支持/],
+  ]) {
+    await t.test(label, async (t2) => {
+      const files = temporaryFiles(t2);
+      writeRunningManualCancelIncident(files, orderId);
+      const state = JSON.parse(fs.readFileSync(files.state, 'utf8'));
+      mutate(state);
+      fs.writeFileSync(files.state, JSON.stringify(state), { mode: 0o600 });
+
+      await assert.rejects(runGridProbe({
+        argv: ['--confirm-manual-cancel-order', orderId],
+        deps: { preflight: fakePreflight(), files },
+      }), expected);
+      assert.equal(fs.existsSync(files.state), true);
+      assert.equal(fs.existsSync(files.ownership), true);
+    });
+  }
+});
+
+test('running manual cancel recovery rejects unsafe ownership and operation facts', async (t) => {
+  const orderId = '246940766838980608';
+  for (const [label, mutate, expected] of [
+    ['partial state', (files, owned) => {
+      owned.orders[0].state = 'PARTIAL';
+      owned.orders[0].filledQtyWad = '1';
+    }, /形态不受支持/],
+    ['filled quantity', (files, owned) => { owned.orders[0].filledQtyWad = '1'; }, /零成交状态/],
+    ['fill ids', (files, owned) => { owned.orders[0].fillIds = ['246940766838980609']; }, /零成交状态/],
+    ['terminal event', (files, owned) => {
+      owned.orders[0].state = 'CANCELLED';
+      owned.orders[0].filledQtyWad = '1';
+      owned.orders[0].fillIds = ['246940766838980609'];
+      owned.orders[0].terminalEvent = {
+        fillEventId: `px-fill-${'33'.repeat(32)}`,
+        stage: 'EVENT_PENDING',
+        terminalState: 'CANCELLED',
+        filledQtyWad: '1',
+        priceWad: '64435000000000000000000',
+        fillIds: ['246940766838980609'],
+        suppressRequote: true,
+        replacementOrderId: null,
+      };
+    }, /形态不受支持/],
+    ['cancel proof', (files, owned) => {
+      owned.orders[0].cancelProof = {
+        orderId,
+        clientOrderId: owned.orders[0].clientOrderId,
+        filledQtyWad: '0',
+      };
+    }, /零成交状态/],
+    ['operation journal', (files) => {
+      fs.writeFileSync(files.operation, JSON.stringify({ stage: 'BROADCAST' }), { mode: 0o600 });
+    }, /未完成写操作/],
+  ]) {
+    await t.test(label, async (t2) => {
+      const files = temporaryFiles(t2);
+      writeRunningManualCancelIncident(files, orderId);
+      const owned = JSON.parse(fs.readFileSync(files.ownership, 'utf8'));
+      mutate(files, owned);
+      fs.writeFileSync(files.ownership, JSON.stringify(owned), { mode: 0o600 });
+
+      await assert.rejects(runGridProbe({
+        argv: ['--confirm-manual-cancel-order', orderId],
+        deps: { preflight: fakePreflight(), files },
+      }), expected);
+      assert.equal(fs.existsSync(files.state), true);
+      assert.equal(fs.existsSync(files.ownership), true);
+    });
+  }
+});
+
+test('manual recovery reports the exact missing state kind', async (t) => {
+  await assert.rejects(runGridProbe({
+    argv: ['--confirm-manual-cancel-order', '246940766838980608'],
+    deps: { preflight: fakePreflight(), files: temporaryFiles(t) },
+  }), /没有可恢复的人工撤单状态/);
+
+  await assert.rejects(runGridProbe({
+    argv: ['--confirm-manual-flat-order', '246022657449918464'],
+    deps: { preflight: fakePreflight(), files: temporaryFiles(t) },
+  }), /没有可恢复的人工平仓状态/);
+});
+
+test('running manual cancel archive failure rolls back every recovery fact', async (t) => {
+  const files = temporaryFiles(t);
+  const orderId = '246940766838980608';
+  writeRunningManualCancelIncident(files, orderId);
+  let archiveMoves = 0;
+  const fsImpl = {
+    readFileSync: fs.readFileSync.bind(fs),
+    writeFileSync: fs.writeFileSync.bind(fs),
+    chmodSync: fs.chmodSync.bind(fs),
+    existsSync: fs.existsSync.bind(fs),
+    statSync: fs.statSync.bind(fs),
+    unlinkSync: fs.unlinkSync.bind(fs),
+    renameSync(source, destination) {
+      if (String(destination).includes('.manual-cancel-') && ++archiveMoves === 2) {
+        const error = new Error('archive failed');
+        error.code = 'EIO';
+        throw error;
+      }
+      fs.renameSync(source, destination);
+    },
+  };
+
+  await assert.rejects(runGridProbe({
+    argv: ['--confirm-manual-cancel-order', orderId],
+    deps: {
+      preflight: fakePreflight(),
+      files,
+      fsImpl,
+      now: () => Date.parse('2026-08-19T13:00:00.000Z'),
+    },
+  }), /归档人工撤单事实失败/);
+  assert.equal(fs.existsSync(files.state), true);
+  assert.equal(fs.existsSync(files.ownership), true);
+  assert.equal(fs.readdirSync(path.dirname(files.state)).some((name) => name.includes('.manual-cancel-')), false);
+});
+
+test('reconnect failure closes refresh releases lock and preserves recovery facts', async (t) => {
+  const files = temporaryFiles(t);
+  const adapter = new FakeStrictAdapter();
+  const output = [];
+  const started = await runGridProbe({
+    argv: ['--confirm-mainnet-grid'],
+    env: { POPDEX_AGENT_PRIVATE_KEY: `0x${'11'.repeat(32)}` },
+    deps: {
+      preflight: fakePreflight(),
+      createLiveExchange: () => adapter,
+      interactive: false,
+      files,
+      output(message) { output.push(String(message)); },
+    },
+  });
+  fs.writeFileSync(files.ownership, '{}', { mode: 0o600 });
+  adapter.reconnectFailure = new Error(
+    'PopDEX POPDEX_UNKNOWN_TERMINAL：orderId=246940766838980608 对账超过 30000ms 仍无法闭合。',
+  );
+
+  await assert.rejects(
+    started.session.executeCommand('reconnect'),
+    /POPDEX_UNKNOWN_TERMINAL/,
+  );
+  assert.equal(adapter.stopCalls, 1);
+  assert.equal(fs.existsSync(files.lock), false);
+  assert.equal(fs.existsSync(files.state), true);
+  assert.equal(fs.existsSync(files.ownership), true);
+  await assert.rejects(started.session.executeCommand('status'), /会话已结束/);
+  assert.ok(output.includes(
+    '[PopDEX reconnect] 失败后已关闭交易所刷新并释放进程锁；恢复事实已保留。',
+  ));
+});
+
+test('reconnect failure preserves original and cleanup errors', async (t) => {
+  const files = temporaryFiles(t);
+  const adapter = new FakeStrictAdapter();
+  adapter.stop = () => {
+    adapter.stopCalls++;
+    throw new Error('adapter cleanup failed');
+  };
+  const fsImpl = {
+    readFileSync: fs.readFileSync.bind(fs),
+    writeFileSync: fs.writeFileSync.bind(fs),
+    chmodSync: fs.chmodSync.bind(fs),
+    existsSync: fs.existsSync.bind(fs),
+    statSync: fs.statSync.bind(fs),
+    renameSync: fs.renameSync.bind(fs),
+    unlinkSync(file) {
+      if (file === files.lock) throw new Error('lock cleanup failed');
+      fs.unlinkSync(file);
+    },
+  };
+  const started = await runGridProbe({
+    argv: ['--confirm-mainnet-grid'],
+    env: { POPDEX_AGENT_PRIVATE_KEY: `0x${'11'.repeat(32)}` },
+    deps: {
+      preflight: fakePreflight(),
+      createLiveExchange: () => adapter,
+      interactive: false,
+      files,
+      fsImpl,
+      output() {},
+    },
+  });
+  adapter.reconnectFailure = new Error('POPDEX_UNKNOWN_TERMINAL');
+
+  await assert.rejects(
+    started.session.executeCommand('reconnect'),
+    (error) => error instanceof AggregateError
+      && error.errors.some((item) => /POPDEX_UNKNOWN_TERMINAL/.test(item.message))
+      && error.errors.some((item) => /adapter cleanup failed/.test(item.message))
+      && error.errors.some((item) => /lock cleanup failed/.test(item.message)),
+  );
 });
 
 test('a running stop rejects concurrent control commands without another cancel', async (t) => {
