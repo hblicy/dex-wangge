@@ -447,7 +447,9 @@ export class RisexPrivateStream extends EventEmitter {
     this._clearConnectDeadline();
     this._connectDeadline = this._setDeadline(() => {
       this._connectDeadline = null;
-      this._fatal(new Error(`RISEx 私有 WebSocket 认证 ${this._connectTimeoutMs}ms 超时。`));
+      this._handleConnectionFailure(
+        new Error(`RISEx 私有 WebSocket 认证 ${this._connectTimeoutMs}ms 超时。`),
+      );
     }, this._connectTimeoutMs);
   }
 

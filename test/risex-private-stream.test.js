@@ -298,13 +298,40 @@ test('private stream connect timeout rejects and closes the socket', async () =>
     setDeadline: (fn, ms) => { deadlines.push({ fn, ms }); return deadlines.length; },
     clearDeadline() {},
   });
+  let initialFatal = null;
+  harness.stream.once('fatal', (error) => { initialFatal = error; });
   const connecting = harness.stream.connect();
   const deadline = deadlines.find((entry) => entry.ms === 20);
   assert.ok(deadline, 'connect deadline was not scheduled');
   deadline.fn();
 
   await assert.rejects(connecting, /认证 20ms 超时/);
+  assert.match(initialFatal?.message || '', /认证 20ms 超时/);
   assert.equal(FakeSocket.instances[0].readyState, 3);
+});
+
+test('runtime authentication timeout reconnects while initial timeout remains fatal', async () => {
+  const deadlines = [];
+  const harness = makeHarness({
+    connectTimeoutMs: 20,
+    setDeadline: (fn, ms) => { deadlines.push({ fn, ms }); return deadlines.length; },
+    clearDeadline() {},
+  });
+  let fatals = 0;
+  harness.stream.on('fatal', () => { fatals += 1; });
+  const firstSocket = await openAndAuthenticate(harness);
+  firstSocket.emit('close', { code: 1006, reason: 'network' });
+
+  const reconnecting = harness.scheduled.at(-1).fn();
+  const runtimeConnect = harness.stream._connectPromise;
+  const runtimeDeadline = deadlines.at(-1);
+  runtimeDeadline.fn();
+  await assert.rejects(runtimeConnect, /认证 20ms 超时/);
+  await reconnecting;
+  await waitFor(() => harness.scheduled.length >= 2);
+
+  assert.equal(fatals, 0);
+  assert.equal(harness.stream.authenticated, false);
 });
 
 test('private stream order snapshot timeout removes its waiter', async () => {
