@@ -366,6 +366,9 @@ function validateRunningManualCancelActive(activeEntry, owned, orderId) {
 
 function validateManualCancelState({ files, fsImpl, preflight, orderId }) {
   const record = readJson(files.state, fsImpl);
+  if (record === null) {
+    throw new Error('PopDEX grid-probe 没有可恢复的人工撤单状态。');
+  }
   if (record?.version !== 1
       || record.mainAccount?.toLowerCase() !== preflight.mainAccount.toLowerCase()) {
     throw new Error('PopDEX grid-probe 人工撤单恢复的状态文件版本或账户不匹配。');
@@ -452,6 +455,9 @@ function recoverManualCancel({ args, preflight, deps, files, fsImpl }) {
 
 function validateManualFlatState({ files, fsImpl, preflight, orderId }) {
   const record = readJson(files.state, fsImpl);
+  if (record === null) {
+    throw new Error('PopDEX grid-probe 没有可恢复的人工平仓状态。');
+  }
   if (record?.version !== 1
       || record.mainAccount?.toLowerCase() !== preflight.mainAccount.toLowerCase()) {
     throw new Error('PopDEX grid-probe 人工平仓恢复的状态文件版本或账户不匹配。');
