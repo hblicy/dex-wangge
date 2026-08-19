@@ -190,6 +190,60 @@ function writeManualCancelIncident(files, orderId = '244656875029659648') {
   }), { mode: 0o600 });
 }
 
+function writeRunningManualCancelIncident(
+  files,
+  orderId = '246940766838980608',
+  state = 'OPEN',
+) {
+  const mainAccount = '0x1111111111111111111111111111111111111111';
+  const clientOrderId = `0x${'24'.repeat(32)}`;
+  fs.writeFileSync(files.state, JSON.stringify({
+    version: 1,
+    mainAccount,
+    snapshot: {
+      running: true,
+      active: [[orderId, {
+        levelIndex: 0,
+        side: 'buy',
+        price: 64435,
+        sizeBase: 0.0002,
+        clientOrderId,
+        reduceOnly: false,
+        opening: true,
+        recovery: false,
+        parentFillEventId: null,
+        placedAt: 1787143463083,
+      }]],
+      processedFillEventIds: [],
+    },
+    updatedAt: '2026-08-19T12:44:23.083Z',
+  }), { mode: 0o600 });
+  fs.writeFileSync(files.ownership, JSON.stringify({
+    version: 1,
+    mainAccount,
+    symbol: 'BTCUSDT',
+    symbolId: '20000',
+    orders: [{
+      orderId,
+      clientOrderId,
+      marketId: 20000,
+      levelIndex: 0,
+      side: 'buy',
+      priceWad: '64435000000000000000000',
+      qtyWad: '200000000000000',
+      opening: true,
+      reduceOnly: false,
+      parentFillEventId: null,
+      state,
+      filledQtyWad: '0',
+      fillIds: [],
+      terminalEvent: null,
+      cancelProof: null,
+    }],
+    updatedAt: '2026-08-19T12:44:23.083Z',
+  }), { mode: 0o600 });
+}
+
 function writeManualFlatIncident(files, orderId = '245591159265558528') {
   const mainAccount = '0x1111111111111111111111111111111111111111';
   const fillId = '245614705081581571';
@@ -398,6 +452,7 @@ test('manual cancel recovery requires exact stopped zero-fill incident and archi
   });
   assert.equal(result.mode, 'manual-cancel-recovered');
   assert.equal(result.orderId, orderId);
+  assert.equal(result.recoveryShape, 'stopped-unknown-terminal');
   assert.equal(result.writes, 0);
   assert.equal(fs.existsSync(files.state), false);
   assert.equal(fs.existsSync(files.ownership), false);
@@ -730,6 +785,33 @@ test('stop retains recovery facts when final reconciliation is not READY', async
   assert.ok(output.includes(
     '[PopDEX stop] 失败后已关闭交易所刷新并释放进程锁；恢复事实已保留。',
   ));
+});
+
+test('manual cancel recovery archives an aborted running zero-fill order', async (t) => {
+  for (const ownershipState of ['OPEN', 'UNKNOWN_TERMINAL']) {
+    await t.test(ownershipState, async (t2) => {
+      const files = temporaryFiles(t2);
+      const orderId = '246940766838980608';
+      writeRunningManualCancelIncident(files, orderId, ownershipState);
+
+      const result = await runGridProbe({
+        argv: ['--confirm-manual-cancel-order', orderId],
+        deps: {
+          preflight: fakePreflight(),
+          files,
+          now: () => Date.parse('2026-08-19T13:00:00.000Z'),
+          processKill() { const error = new Error('missing'); error.code = 'ESRCH'; throw error; },
+        },
+      });
+
+      assert.equal(result.mode, 'manual-cancel-recovered');
+      assert.equal(result.recoveryShape, 'aborted-running-zero-fill-open');
+      assert.equal(result.writes, 0);
+      assert.equal(fs.existsSync(files.state), false);
+      assert.equal(fs.existsSync(files.ownership), false);
+      assert.equal(result.archivedFiles.length, 2);
+    });
+  }
 });
 
 test('reconnect failure closes refresh releases lock and preserves recovery facts', async (t) => {
