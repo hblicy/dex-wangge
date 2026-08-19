@@ -199,7 +199,9 @@ function genericJournal(initialStage = 'PREPARED') {
     advances: [],
     errors: [],
     advance(expected, next, fields = {}) {
-      assert.equal(this.stage, expected);
+      if (this.stage !== expected) {
+        throw new Error(`PopDEX operation journal 当前阶段 ${this.stage}，不是 ${expected}。`);
+      }
       this.stage = next;
       this.advances.push({ expected, next, fields });
       return { stage: next, ...fields };
@@ -212,7 +214,9 @@ function genericJournal(initialStage = 'PREPARED') {
       return { stage: this.stage, outcome, txHash: null };
     },
     recordError(expected, error) {
-      assert.equal(this.stage, expected);
+      if (this.stage !== expected) {
+        throw new Error(`PopDEX operation journal 当前阶段 ${this.stage}，不是 ${expected}。`);
+      }
       this.errors.push(String(error?.message ?? error));
     },
   };
