@@ -336,6 +336,7 @@ test('manual cancel recovery rejects mismatched identity or any fill/open exposu
 test('mainnet probe handles one fill, offline resume, reconnect and verified stop', async (t) => {
   const files = temporaryFiles(t);
   const adapter = new FakeStrictAdapter();
+  const output = [];
   const common = {
     env: { POPDEX_AGENT_PRIVATE_KEY: `0x${'11'.repeat(32)}` },
     deps: {
@@ -343,7 +344,8 @@ test('mainnet probe handles one fill, offline resume, reconnect and verified sto
       createLiveExchange: () => adapter,
       interactive: false,
       files,
-      output() {},
+      now: () => 1787119200000,
+      output(message) { output.push(String(message)); },
     },
   };
   const started = await runGridProbe({ argv: ['--confirm-mainnet-grid'], ...common });
@@ -389,11 +391,21 @@ test('mainnet probe handles one fill, offline resume, reconnect and verified sto
   assert.equal(adapter.position, null);
   assert.equal(fs.existsSync(files.state), false);
   assert.equal(fs.existsSync(files.lock), false);
+  assert.deepEqual(output.slice(-7), [
+    '[PopDEX stop] 开始：活动挂单=1，持仓=无。',
+    '[PopDEX stop] 正在撤销挂单并确认终态/平仓。',
+    '[PopDEX stop] 撤单与持仓处理完成。',
+    '[PopDEX stop] 正在执行最终订单/仓位对账。',
+    '[PopDEX stop] 最终对账完成：活动挂单=0，pending=0，持仓=无。',
+    '[PopDEX stop] 正在清理本地恢复文件。',
+    '[PopDEX stop] 已安全停止：本地恢复文件已清理，耗时=0ms。',
+  ]);
 });
 
 test('stop retains recovery facts when final reconciliation is not READY', async (t) => {
   const files = temporaryFiles(t);
   const adapter = new FakeStrictAdapter();
+  const output = [];
   const started = await runGridProbe({
     argv: ['--confirm-mainnet-grid'],
     env: { POPDEX_AGENT_PRIVATE_KEY: `0x${'11'.repeat(32)}` },
@@ -402,12 +414,15 @@ test('stop retains recovery facts when final reconciliation is not READY', async
       createLiveExchange: () => adapter,
       interactive: false,
       files,
-      output() {},
+      now: () => 1787119200000,
+      output(message) { output.push(String(message)); },
     },
   });
   fs.writeFileSync(files.ownership, '{}', { mode: 0o600 });
   adapter.reconcileStatus = 'RECONCILING';
   await assert.rejects(started.session.executeCommand('stop'), /RECONCILING|终态/);
+  assert.ok(output.includes('[PopDEX stop] 失败：阶段=最终对账，耗时=0ms。'));
+  assert.equal(output.some((line) => line.includes('已安全停止')), false);
   assert.equal(fs.existsSync(files.state), true);
   assert.equal(fs.existsSync(files.ownership), true);
 });

@@ -469,24 +469,50 @@ async function createSession({ args, preflight, plan, env, deps, files, fsImpl }
         return { state: exchange.getHealth().state };
       }
       if (command === 'stop') {
-        await bot.stop({ closePosition: exchange.getPosition(20000) !== null });
-        const reconciled = await exchange.reconcileOwnedOrders({
-          marketId: 20000,
-          reason: 'probe-stop-final',
-          suppressRequote: true,
-        });
-        if (reconciled.status !== 'READY') {
-          throw new Error(`PopDEX grid-probe stop 后订单终态仍为 ${String(reconciled.status)}。`);
+        const stopStartedAt = now();
+        let stopStage = '撤单与持仓处理';
+        const elapsed = () => Math.max(0, now() - stopStartedAt);
+        output(
+          `[PopDEX stop] 开始：活动挂单=${exchange.getOpenOrders(20000).length}，`
+          + `持仓=${exchange.getPosition(20000) === null ? '无' : '有'}。`,
+        );
+        try {
+          output('[PopDEX stop] 正在撤销挂单并确认终态/平仓。');
+          await bot.stop({ closePosition: exchange.getPosition(20000) !== null });
+          output('[PopDEX stop] 撤单与持仓处理完成。');
+
+          stopStage = '最终对账';
+          output('[PopDEX stop] 正在执行最终订单/仓位对账。');
+          const reconciled = await exchange.reconcileOwnedOrders({
+            marketId: 20000,
+            reason: 'probe-stop-final',
+            suppressRequote: true,
+          });
+          if (reconciled.status !== 'READY') {
+            throw new Error(`PopDEX grid-probe stop 后订单终态仍为 ${String(reconciled.status)}。`);
+          }
+          const pending = exchange.pendingFillEvents();
+          const position = exchange.getPosition(20000);
+          output(
+            `[PopDEX stop] 最终对账完成：活动挂单=${reconciled.activeOrders.length}，`
+            + `pending=${pending.length}，持仓=${position === null ? '无' : '有'}。`,
+          );
+          if (reconciled.activeOrders.length !== 0 || pending.length !== 0 || position !== null) {
+            throw new Error('PopDEX grid-probe stop 后未确认 0 挂单、0 pending event、0 持仓。');
+          }
+
+          stopStage = '本地清理';
+          output('[PopDEX stop] 正在清理本地恢复文件。');
+          exchange.stop();
+          removeCompletedFiles(files, fsImpl);
+          releaseLock();
+          closed = true;
+          output(`[PopDEX stop] 已安全停止：本地恢复文件已清理，耗时=${elapsed()}ms。`);
+          return { status: 'stopped-flat' };
+        } catch (error) {
+          output(`[PopDEX stop] 失败：阶段=${stopStage}，耗时=${elapsed()}ms。`);
+          throw error;
         }
-        if (reconciled.activeOrders.length !== 0 || exchange.pendingFillEvents().length !== 0
-            || exchange.getPosition(20000) !== null) {
-          throw new Error('PopDEX grid-probe stop 后未确认 0 挂单、0 pending event、0 持仓。');
-        }
-        exchange.stop();
-        removeCompletedFiles(files, fsImpl);
-        releaseLock();
-        closed = true;
-        return { status: 'stopped-flat' };
       }
       throw new Error(`PopDEX grid-probe 不支持控制命令 ${String(command)}。`);
     },

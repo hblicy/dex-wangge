@@ -39,7 +39,7 @@ const common = {
 const stopped = await resumed.session.executeCommand('stop');
 assert.deepEqual(stopped, { status: 'stopped-flat' });
 assert.deepEqual(output.slice(-7), [
-  '[PopDEX stop] 开始：活动挂单=1，持仓=有。',
+  '[PopDEX stop] 开始：活动挂单=1，持仓=无。',
   '[PopDEX stop] 正在撤销挂单并确认终态/平仓。',
   '[PopDEX stop] 撤单与持仓处理完成。',
   '[PopDEX stop] 正在执行最终订单/仓位对账。',
