@@ -161,6 +161,14 @@ npm run popdex:grid-probe -- --resume
 
 The `stop` command must confirm zero owned open orders, zero pending terminal events and a flat BTCUSDT position before clearing the isolated probe files. Any identity conflict, unresolved terminal fact, replacement failure or persistence failure stops acceptance and retains recovery facts.
 
+If an operator cancels the sole probe order in the PopDEX web page, the exchange may expose neither an active row nor an exact terminal row. In that case the probe deliberately retains an `UNKNOWN_TERMINAL` ownership record and does not guess that disappearance means cancellation. After `popdex:verify` independently reports zero BTCUSDT open orders and zero positions, the operator may attest the exact order identity with the following read-only recovery command:
+
+```bash
+npm run popdex:grid-probe -- --confirm-manual-cancel-order <exact-order-id>
+```
+
+This command sends no chain transaction. It succeeds only for a stopped snapshot with zero active orders and zero processed fill events, exactly one matching `UNKNOWN_TERMINAL` zero-fill ownership record, no operation journal, no REST or on-chain BTCUSDT active order, no matching fill and no BTCUSDT position. The original state and ownership files are renamed to timestamped `manual-cancel` backups instead of being deleted. Any mismatch fails without changing the recovery facts.
+
 ## Required write probes
 
 The first bounded probe is complete: a newly authorized Agent was verified on chain, one non-marketable minimum-value BTCUSDT order was signed and broadcast by that Agent, the exact `OrderCreate` receipt mapped the deterministic `clientOrderId` to the official `orderId`, REST and the web UI confirmed the live order, and a single Agent cancellation produced the exact `OrderCancel` receipt. The official UI close transaction has also supplied the exact final-close calldata described above. The corrected Stage 5 Agent implementation has passed offline state-machine and regression tests only. The remaining separately approved probes are:

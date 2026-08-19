@@ -25,6 +25,8 @@ function fakePreflight(overrides = {}) {
       minNotional: 10,
     },
     openOrders: [],
+    fills: [],
+    chainActiveOrders: [],
     positions: [],
     availableMargin: 799,
     ...overrides,
@@ -45,6 +47,7 @@ class FakeStrictAdapter extends EventEmitter {
     this.cancelCalls = 0;
     this.closeCalls = 0;
     this.reconcileFailure = null;
+    this.reconcileStatus = 'READY';
     this.position = null;
     this.released = new Set();
   }
@@ -84,9 +87,9 @@ class FakeStrictAdapter extends EventEmitter {
       this.state = 'RECONCILING';
       throw this.reconcileFailure;
     }
-    this.state = 'READY';
+    this.state = this.reconcileStatus;
     return {
-      status: 'READY',
+      status: this.reconcileStatus,
       activeOrders: this.getOpenOrders(),
       pendingEvents: this.pendingFillEvents(),
       positions: this.position === null ? [] : [structuredClone(this.position)],
@@ -140,6 +143,43 @@ function temporaryFiles(t) {
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   return Object.fromEntries(['state', 'ownership', 'operation', 'lock']
     .map((name) => [name, path.join(directory, `${name}.json`)]));
+}
+
+function writeManualCancelIncident(files, orderId = '244656875029659648') {
+  const mainAccount = '0x1111111111111111111111111111111111111111';
+  fs.writeFileSync(files.state, JSON.stringify({
+    version: 1,
+    mainAccount,
+    snapshot: {
+      running: false,
+      active: [],
+      processedFillEventIds: [],
+    },
+    updatedAt: '2026-08-19T04:16:00.000Z',
+  }), { mode: 0o600 });
+  fs.writeFileSync(files.ownership, JSON.stringify({
+    version: 1,
+    mainAccount,
+    symbol: 'BTCUSDT',
+    symbolId: '20000',
+    orders: [{
+      orderId,
+      clientOrderId: `0x${'11'.repeat(32)}`,
+      marketId: 20000,
+      levelIndex: 0,
+      side: 'buy',
+      priceWad: '64290000000000000000000',
+      qtyWad: '200000000000000',
+      opening: true,
+      reduceOnly: false,
+      parentFillEventId: null,
+      state: 'UNKNOWN_TERMINAL',
+      filledQtyWad: '0',
+      fillIds: [],
+      terminalEvent: null,
+    }],
+    updatedAt: '2026-08-19T04:16:00.000Z',
+  }), { mode: 0o600 });
 }
 
 test('grid probe defaults to read-only preflight', async () => {
@@ -231,12 +271,66 @@ test('argument parser keeps resume exclusive from a new mainnet start', () => {
     leverage: 1,
     confirmMainnetGrid: false,
     resume: false,
+    manualCancelOrderId: null,
   });
   assert.throws(
     () => parseGridProbeArgs(['--resume', '--confirm-mainnet-grid']),
     /互斥/,
   );
   assert.throws(() => parseGridProbeArgs(['--unknown']), /不支持参数/);
+  assert.equal(
+    parseGridProbeArgs(['--confirm-manual-cancel-order', '244656875029659648'])
+      .manualCancelOrderId,
+    '244656875029659648',
+  );
+  assert.throws(
+    () => parseGridProbeArgs(['--resume', '--confirm-manual-cancel-order', '244656875029659648']),
+    /互斥/,
+  );
+});
+
+test('manual cancel recovery requires exact stopped zero-fill incident and archives facts', async (t) => {
+  const files = temporaryFiles(t);
+  const orderId = '244656875029659648';
+  writeManualCancelIncident(files, orderId);
+  const result = await runGridProbe({
+    argv: ['--confirm-manual-cancel-order', orderId],
+    deps: {
+      preflight: fakePreflight(),
+      files,
+      now: () => Date.parse('2026-08-19T05:00:00.000Z'),
+      processKill() { const error = new Error('missing'); error.code = 'ESRCH'; throw error; },
+    },
+  });
+  assert.equal(result.mode, 'manual-cancel-recovered');
+  assert.equal(result.orderId, orderId);
+  assert.equal(result.writes, 0);
+  assert.equal(fs.existsSync(files.state), false);
+  assert.equal(fs.existsSync(files.ownership), false);
+  assert.equal(result.archivedFiles.length, 2);
+  for (const file of result.archivedFiles) assert.equal(fs.existsSync(file), true);
+});
+
+test('manual cancel recovery rejects mismatched identity or any fill/open exposure', async (t) => {
+  const orderId = '244656875029659648';
+  for (const [label, requestedId, overrides, message] of [
+    ['wrong identity', '244656875029659649', {}, /订单号与本地事实不一致/],
+    ['matching fill', orderId, { fills: [{ orderId }] }, /存在成交事实/],
+    ['open order', orderId, { openOrders: [{ orderId }] }, /仍有活动挂单/],
+    ['chain active', orderId, { chainActiveOrders: [{ orderId }] }, /仍有活动挂单/],
+    ['position', orderId, { positions: [{ symbolId: '20000' }] }, /仍有持仓/],
+  ]) {
+    await t.test(label, async (t2) => {
+      const files = temporaryFiles(t2);
+      writeManualCancelIncident(files, orderId);
+      await assert.rejects(runGridProbe({
+        argv: ['--confirm-manual-cancel-order', requestedId],
+        deps: { preflight: fakePreflight(overrides), files },
+      }), message);
+      assert.equal(fs.existsSync(files.state), true);
+      assert.equal(fs.existsSync(files.ownership), true);
+    });
+  }
 });
 
 test('mainnet probe handles one fill, offline resume, reconnect and verified stop', async (t) => {
@@ -290,10 +384,32 @@ test('mainnet probe handles one fill, offline resume, reconnect and verified sto
 
   const stopped = await resumed.session.executeCommand('stop');
   assert.deepEqual(stopped, { status: 'stopped-flat' });
+  assert.equal(adapter.closeCalls, 0);
   assert.equal(adapter.orders.size, 0);
   assert.equal(adapter.position, null);
   assert.equal(fs.existsSync(files.state), false);
   assert.equal(fs.existsSync(files.lock), false);
+});
+
+test('stop retains recovery facts when final reconciliation is not READY', async (t) => {
+  const files = temporaryFiles(t);
+  const adapter = new FakeStrictAdapter();
+  const started = await runGridProbe({
+    argv: ['--confirm-mainnet-grid'],
+    env: { POPDEX_AGENT_PRIVATE_KEY: `0x${'11'.repeat(32)}` },
+    deps: {
+      preflight: fakePreflight(),
+      createLiveExchange: () => adapter,
+      interactive: false,
+      files,
+      output() {},
+    },
+  });
+  fs.writeFileSync(files.ownership, '{}', { mode: 0o600 });
+  adapter.reconcileStatus = 'RECONCILING';
+  await assert.rejects(started.session.executeCommand('stop'), /RECONCILING|终态/);
+  assert.equal(fs.existsSync(files.state), true);
+  assert.equal(fs.existsSync(files.ownership), true);
 });
 
 test('probe lock rejects a live PID and replaces a stale PID only after preflight', async (t) => {
