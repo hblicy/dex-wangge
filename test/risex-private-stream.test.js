@@ -248,6 +248,49 @@ test('disconnect emits state and schedules exponential reconnect unless stopped'
   assert.equal(harness.scheduled.length, before);
 });
 
+test('runtime signer-check fetch failure reconnects without fatal and later authenticates', async () => {
+  let failSignerCheck = false;
+  const logs = [];
+  const harness = makeHarness({
+    isSignerRegistered: async () => {
+      if (!failSignerCheck) return true;
+      const socketError = Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' });
+      throw new TypeError('fetch failed', { cause: socketError });
+    },
+    logger: { log() {}, error(message) { logs.push(message); } },
+  });
+  let fatals = 0;
+  harness.stream.on('fatal', () => { fatals += 1; });
+
+  const firstSocket = await openAndAuthenticate(harness);
+  firstSocket.emit('close', { code: 1006, reason: 'network' });
+  failSignerCheck = true;
+
+  const failedRetry = harness.scheduled.at(-1).fn();
+  const failedConnect = harness.stream._connectPromise;
+  const failedSocket = FakeSocket.instances.at(-1);
+  failedSocket.emit('open');
+  await assert.rejects(failedConnect, /fetch failed/);
+  await failedRetry;
+  await waitFor(() => harness.scheduled.length >= 2);
+
+  assert.equal(fatals, 0);
+  assert.equal(harness.stream.authenticated, false);
+  assert.match(logs.join('\n'), /临时认证错误/);
+  assert.match(logs.join('\n'), /UND_ERR_SOCKET/);
+
+  failSignerCheck = false;
+  const recoveredRetry = harness.scheduled.at(-1).fn();
+  const recoveredSocket = FakeSocket.instances.at(-1);
+  recoveredSocket.emit('open');
+  await waitFor(() => recoveredSocket.sent.length === 1);
+  recoveredSocket.message({ method: 'auth_v2', status: 'success' });
+  await recoveredRetry;
+
+  assert.equal(harness.stream.authenticated, true);
+  assert.equal(fatals, 0);
+});
+
 test('private stream connect timeout rejects and closes the socket', async () => {
   const deadlines = [];
   const harness = makeHarness({
