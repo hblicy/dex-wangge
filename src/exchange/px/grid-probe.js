@@ -532,6 +532,19 @@ async function createSession({ args, preflight, plan, env, deps, files, fsImpl }
       output(`PopDEX grid-probe 收到 ${signal}，未发送撤单或平仓；必须使用 --resume。`);
     },
   };
+  let activeCommand = null;
+  const executeCommandUnlocked = session.executeCommand.bind(session);
+  session.executeCommand = async (command) => {
+    if (activeCommand !== null) {
+      throw new Error(`PopDEX 控制命令 ${activeCommand} 正在执行，请等待完成。`);
+    }
+    activeCommand = command;
+    try {
+      return await executeCommandUnlocked(command);
+    } finally {
+      activeCommand = null;
+    }
+  };
   return session;
 }
 

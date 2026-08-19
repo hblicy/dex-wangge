@@ -186,13 +186,6 @@ git commit -m "改进：显示PopDEX停止阶段"
 test('a running stop rejects concurrent control commands without another cancel', async (t) => {
   const files = temporaryFiles(t);
   const adapter = new FakeStrictAdapter();
-  let releaseCancel;
-  const cancelGate = new Promise((resolve) => { releaseCancel = resolve; });
-  const originalCancelAll = adapter.cancelAll.bind(adapter);
-  adapter.cancelAll = async () => {
-    await cancelGate;
-    return originalCancelAll();
-  };
   const started = await runGridProbe({
     argv: ['--confirm-mainnet-grid'],
     env: { POPDEX_AGENT_PRIVATE_KEY: `0x${'11'.repeat(32)}` },
@@ -204,15 +197,21 @@ test('a running stop rejects concurrent control commands without another cancel'
       output() {},
     },
   });
+  const cancelCallsBeforeStop = adapter.cancelCalls;
+  let releaseCancel;
+  const cancelGate = new Promise((resolve) => { releaseCancel = resolve; });
+  const originalCancelAll = adapter.cancelAll.bind(adapter);
+  adapter.cancelAll = async () => {
+    await cancelGate;
+    return originalCancelAll();
+  };
 
   const stopping = started.session.executeCommand('stop');
-  await assert.rejects(
-    started.session.executeCommand('status'),
-    /控制命令 stop 正在执行/,
-  );
+  const concurrent = started.session.executeCommand('status');
   releaseCancel();
+  await assert.rejects(concurrent, /控制命令 stop 正在执行/);
   await stopping;
-  assert.equal(adapter.cancelCalls, 1);
+  assert.equal(adapter.cancelCalls, cancelCallsBeforeStop + 1);
 });
 ```
 
