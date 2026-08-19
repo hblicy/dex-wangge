@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { parseUnits } from 'ethers';
 import { GridBot } from '../../bot.js';
 import { loadEnv, ROOT } from '../../config.js';
 import { strictAddress, strictIntegerString } from './normalize.js';
@@ -313,15 +314,15 @@ function removeCompletedFiles(files, fsImpl) {
   for (const file of [files.state, files.ownership, files.operation]) unlinkExisting(file, fsImpl);
 }
 
-function archiveManualCancelFiles(files, fsImpl, now) {
+function archiveRecoveryFiles(files, fsImpl, now, { suffix, label }) {
   const milliseconds = now();
   if (!Number.isSafeInteger(milliseconds) || milliseconds < 0) {
     throw new Error('PopDEX grid-probe now() 必须返回非负安全整数。');
   }
-  const suffix = new Date(milliseconds).toISOString().replace(/[:.]/g, '-');
+  const timestampSuffix = new Date(milliseconds).toISOString().replace(/[:.]/g, '-');
   const entries = [files.state, files.ownership, files.operation]
     .filter((file) => fsImpl.existsSync(file))
-    .map((file) => ({ file, archived: `${file}.manual-cancel-${suffix}.bak` }));
+    .map((file) => ({ file, archived: `${file}.${suffix}-${timestampSuffix}.bak` }));
   for (const { archived } of entries) {
     if (fsImpl.existsSync(archived)) {
       throw new Error(`PopDEX grid-probe 恢复备份已存在：${archived}。`);
@@ -337,7 +338,7 @@ function archiveManualCancelFiles(files, fsImpl, now) {
     for (const entry of moved.reverse()) {
       fsImpl.renameSync(entry.archived, entry.file);
     }
-    throw new Error(`PopDEX grid-probe 归档人工撤单事实失败：${cause?.message || cause}`, { cause });
+    throw new Error(`PopDEX grid-probe 归档${label}事实失败：${cause?.message || cause}`, { cause });
   }
   return entries.map((entry) => entry.archived);
 }
@@ -400,10 +401,109 @@ function recoverManualCancel({ args, preflight, deps, files, fsImpl }) {
       preflight,
       orderId: args.manualCancelOrderId,
     });
-    const archivedFiles = archiveManualCancelFiles(files, fsImpl, now);
+    const archivedFiles = archiveRecoveryFiles(files, fsImpl, now, {
+      suffix: 'manual-cancel',
+      label: '人工撤单',
+    });
     return {
       mode: 'manual-cancel-recovered',
       orderId: args.manualCancelOrderId,
+      archivedFiles,
+      writes: 0,
+    };
+  } finally {
+    releaseLock();
+  }
+}
+
+function validateManualFlatState({ files, fsImpl, preflight, orderId }) {
+  const record = readJson(files.state, fsImpl);
+  if (record?.version !== 1
+      || record.mainAccount?.toLowerCase() !== preflight.mainAccount.toLowerCase()) {
+    throw new Error('PopDEX grid-probe 人工平仓恢复的状态文件版本或账户不匹配。');
+  }
+  if (record.snapshot?.running !== true
+      || !Array.isArray(record.snapshot?.active)
+      || record.snapshot.active.length !== 0
+      || !Array.isArray(record.snapshot?.processedFillEventIds)
+      || record.snapshot.processedFillEventIds.length !== 0) {
+    throw new Error('PopDEX grid-probe 人工平仓恢复只允许 running、0 active、0 已处理成交事件的快照。');
+  }
+  if (readJson(files.operation, fsImpl) !== null) {
+    throw new Error('PopDEX grid-probe 仍有未完成写操作，拒绝人工平仓恢复。');
+  }
+
+  const ownershipStore = new PopdexOwnershipStore({
+    file: files.ownership,
+    mainAccount: preflight.mainAccount,
+    fsImpl,
+  });
+  const orders = ownershipStore.listOrders();
+  if (orders.length !== 1 || orders[0].orderId !== orderId) {
+    throw new Error('PopDEX grid-probe 人工确认的订单号与本地事实不一致。');
+  }
+  const owned = orders[0];
+  if (owned.side !== 'buy' || owned.opening !== true || owned.reduceOnly !== false
+      || owned.parentFillEventId !== null || owned.state !== 'FILLED'
+      || BigInt(owned.filledQtyWad) <= 0n || owned.filledQtyWad !== owned.qtyWad) {
+    throw new Error('PopDEX grid-probe 本地订单不是唯一完整开仓成交。');
+  }
+  const event = owned.terminalEvent;
+  if (event?.stage !== 'EVENT_PENDING' || event.terminalState !== 'FILLED'
+      || event.suppressRequote !== false || event.replacementOrderId !== null) {
+    throw new Error('PopDEX grid-probe 本地订单不是未补单的待补单成交事件。');
+  }
+  if (preflight.openOrders.length !== 0 || preflight.chainActiveOrders.length !== 0) {
+    throw new Error('PopDEX BTCUSDT 仍有活动挂单，拒绝人工平仓恢复。');
+  }
+  if (preflight.positions.length !== 0) {
+    throw new Error('PopDEX BTCUSDT 仍有持仓，拒绝人工平仓恢复。');
+  }
+
+  const official = preflight.fills.filter((fill) => String(fill?.orderId) === orderId);
+  if (official.length === 0) {
+    throw new Error(`PopDEX orderId=${orderId} 官方成交事实不匹配。`);
+  }
+  const officialFillIds = official
+    .map((fill) => strictIntegerString(fill?.fillId, 'grid-probe 人工平仓 fill ID'))
+    .sort();
+  const ownedFillIds = [...owned.fillIds].sort();
+  if (officialFillIds.join(',') !== ownedFillIds.join(',')) {
+    throw new Error(`PopDEX orderId=${orderId} 官方 fill ID 与本地事实不匹配。`);
+  }
+  const officialQtyWad = official.reduce(
+    (total, fill) => total + parseUnits(String(fill?.execQty), 18),
+    0n,
+  ).toString();
+  if (officialQtyWad !== owned.filledQtyWad) {
+    throw new Error(`PopDEX orderId=${orderId} 官方成交数量与本地事实不匹配。`);
+  }
+  return owned;
+}
+
+function recoverManualFlat({ args, preflight, deps, files, fsImpl }) {
+  const now = deps.now ?? (() => Date.now());
+  const releaseLock = acquireLock({
+    file: files.lock,
+    mainAccount: preflight.mainAccount,
+    fsImpl,
+    now,
+    processKill: deps.processKill ?? process.kill.bind(process),
+  });
+  try {
+    validateManualFlatState({
+      files,
+      fsImpl,
+      preflight,
+      orderId: args.manualFlatOrderId,
+    });
+    const archivedFiles = archiveRecoveryFiles(files, fsImpl, now, {
+      suffix: 'manual-flat',
+      label: '人工平仓',
+    });
+    return {
+      mode: 'manual-flat-recovered',
+      orderId: args.manualFlatOrderId,
       archivedFiles,
       writes: 0,
     };
@@ -596,6 +696,9 @@ export async function runGridProbe({
   const fsImpl = deps.fsImpl ?? fs;
   if (args.manualCancelOrderId !== null) {
     return recoverManualCancel({ args, preflight, deps, files, fsImpl });
+  }
+  if (args.manualFlatOrderId !== null) {
+    return recoverManualFlat({ args, preflight, deps, files, fsImpl });
   }
   const facts = (deps.inspectProbeFacts ?? defaultInspectProbeFacts)(files, fsImpl);
   if (!args.resume && (args.confirmMainnetGrid || facts.state || facts.ownership || facts.operation)) {
