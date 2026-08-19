@@ -213,6 +213,9 @@ export class PopdexReconciler {
           && (restCompleted !== null || chainCompleted !== null)) {
         throw fault('POPDEX_IDENTITY_CONFLICT', `orderId=${order.orderId} 同时存在活动和终态事实。`);
       }
+      if (order.cancelProof !== null && (restActive !== null || activeOnChain !== null)) {
+        throw fault('POPDEX_IDENTITY_CONFLICT', `orderId=${order.orderId} 同时存在撤单证明和活动订单事实。`);
+      }
 
       const active = restActive ?? activeOnChain;
       const terminal = restCompleted ?? chainCompleted;
@@ -220,8 +223,19 @@ export class PopdexReconciler {
         active,
         completed: terminal,
         fills,
+        cancelProof: terminal === null ? order.cancelProof : null,
         suppressRequote,
       });
+      if (terminal !== null && order.cancelProof !== null) {
+        const proofResult = reconcileOwnedOrder(order, {
+          fills,
+          cancelProof: order.cancelProof,
+          suppressRequote,
+        });
+        if (!sameResult(primary, proofResult)) {
+          throw fault('POPDEX_IDENTITY_CONFLICT', `orderId=${order.orderId} 撤单证明与官方终态冲突。`);
+        }
+      }
       if (restCompleted !== null && chainCompleted !== null) {
         const cross = reconcileOwnedOrder(order, {
           completed: chainCompleted,

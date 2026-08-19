@@ -5,8 +5,10 @@ const ROOT_KEYS = new Set(['version', 'mainAccount', 'symbol', 'symbolId', 'orde
 const ORDER_KEYS = new Set([
   'orderId', 'clientOrderId', 'marketId', 'levelIndex', 'side', 'priceWad', 'qtyWad',
   'opening', 'reduceOnly', 'parentFillEventId', 'state', 'filledQtyWad', 'fillIds',
-  'terminalEvent',
+  'terminalEvent', 'cancelProof',
 ]);
+const REQUIRED_ORDER_KEYS = new Set([...ORDER_KEYS].filter((key) => key !== 'cancelProof'));
+const CANCEL_PROOF_KEYS = new Set(['orderId', 'clientOrderId', 'filledQtyWad']);
 const EVENT_KEYS = new Set([
   'fillEventId', 'stage', 'terminalState', 'filledQtyWad', 'priceWad', 'fillIds',
   'suppressRequote', 'replacementOrderId',
@@ -84,6 +86,22 @@ function fillIds(value, field) {
   return normalized;
 }
 
+function validateCancelProof(value, order) {
+  rejectUnknown(value, CANCEL_PROOF_KEYS, 'cancelProof');
+  requireKeys(value, CANCEL_PROOF_KEYS, 'cancelProof');
+  const proof = value;
+  proof.orderId = positiveInteger(proof.orderId, 'cancelProof.orderId');
+  proof.clientOrderId = bytes32(proof.clientOrderId, 'cancelProof.clientOrderId');
+  proof.filledQtyWad = wad(proof.filledQtyWad, 'cancelProof.filledQtyWad');
+  if (proof.orderId !== order.orderId || proof.clientOrderId !== order.clientOrderId) {
+    throw new Error('PopDEX ownership 撤单证明身份不匹配。');
+  }
+  if (proof.filledQtyWad !== order.filledQtyWad) {
+    throw new Error('PopDEX ownership 撤单证明成交量与持久化订单不匹配。');
+  }
+  return proof;
+}
+
 function validateEvent(value, order) {
   rejectUnknown(value, EVENT_KEYS, 'terminalEvent');
   requireKeys(value, EVENT_KEYS, 'terminalEvent');
@@ -124,7 +142,7 @@ function validateEvent(value, order) {
 
 function validateOrder(value) {
   rejectUnknown(value, ORDER_KEYS, 'order');
-  requireKeys(value, ORDER_KEYS, 'order');
+  requireKeys(value, REQUIRED_ORDER_KEYS, 'order');
   const order = value;
   order.orderId = positiveInteger(order.orderId, 'order.orderId');
   order.clientOrderId = bytes32(order.clientOrderId, 'order.clientOrderId');
@@ -154,6 +172,8 @@ function validateOrder(value) {
   if (order.terminalEvent !== null && !TERMINAL_STATES.has(order.state)) {
     throw new Error('PopDEX ownership 非终态订单不能包含 terminalEvent。');
   }
+  if (!Object.hasOwn(order, 'cancelProof')) order.cancelProof = null;
+  if (order.cancelProof !== null) order.cancelProof = validateCancelProof(order.cancelProof, order);
   return order;
 }
 
@@ -342,6 +362,20 @@ export class PopdexOwnershipStore {
         }
         if (order.terminalEvent === null) order.terminalEvent = nextEvent;
       }
+    });
+  }
+
+  recordCancelProof(orderIdValue, proofValue) {
+    const orderId = positiveInteger(orderIdValue, 'cancelProof.orderId');
+    return this.#change((root) => {
+      const order = root.orders.find((item) => item.orderId === orderId);
+      if (!order) throw new Error(`PopDEX ownership orderId ${orderId} 不存在。`);
+      const proof = validateCancelProof(structuredClone(proofValue), order);
+      if (order.cancelProof !== null
+          && JSON.stringify(order.cancelProof) !== JSON.stringify(proof)) {
+        throw new Error(`PopDEX ownership orderId ${orderId} 撤单证明事实冲突。`);
+      }
+      if (order.cancelProof === null) order.cancelProof = proof;
     });
   }
 

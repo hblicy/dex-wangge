@@ -599,6 +599,45 @@ export class PopdexExchange extends EventEmitter {
     return this.snapshot.orders.get(marketId)?.get(String(orderId)) ?? null;
   }
 
+  #settleZeroFillCancellation(proof) {
+    if (!proof || typeof proof !== 'object' || Array.isArray(proof)) {
+      throw new Error('PopDEX 撤单持久化证明必须是对象。');
+    }
+    const orderId = strictIntegerString(proof.orderId, 'cancel proof.orderId');
+    const clientOrderId = proof.clientOrderId;
+    if (typeof clientOrderId !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(clientOrderId)) {
+      throw new Error('PopDEX 撤单持久化 clientOrderId 必须是 bytes32。');
+    }
+    if (strictIntegerString(proof.filledQtyWad, 'cancel proof.filledQtyWad') !== '0') {
+      throw new Error(`PopDEX 订单 ${orderId} 撤单存在成交，拒绝按零成交终态持久化。`);
+    }
+    if (proof.remainingQtyWad !== undefined
+        && strictIntegerString(proof.remainingQtyWad, 'cancel proof.remainingQtyWad') !== '0') {
+      throw new Error(`PopDEX 订单 ${orderId} 撤单后仍有剩余数量。`);
+    }
+    const durable = this.ownershipStore.listOrders()
+      .find((order) => order.orderId === orderId);
+    if (durable === undefined) return false;
+    if (durable.clientOrderId !== clientOrderId.toLowerCase()) {
+      throw new Error(`PopDEX 订单 ${orderId} 撤单证明与所有权 clientOrderId 冲突。`);
+    }
+    if (durable.filledQtyWad !== '0' || durable.fillIds.length !== 0
+        || durable.terminalEvent !== null) {
+      throw new Error(`PopDEX 订单 ${orderId} 已有成交或终态事实，拒绝覆盖。`);
+    }
+    if (proof.cancelledQtyWad !== undefined
+        && strictIntegerString(proof.cancelledQtyWad, 'cancel proof.cancelledQtyWad')
+          !== durable.qtyWad) {
+      throw new Error(`PopDEX 订单 ${orderId} 撤单数量与所有权不匹配。`);
+    }
+    this.ownershipStore.recordCancelProof(orderId, {
+      orderId,
+      clientOrderId: clientOrderId.toLowerCase(),
+      filledQtyWad: '0',
+    });
+    return true;
+  }
+
   async #cancelOwnedOrder(owned) {
     const official = this.#officialOrder(MARKET_IDS.BTCUSDT, owned.orderId);
     if (official === null) {
@@ -611,11 +650,12 @@ export class PopdexExchange extends EventEmitter {
       orderId: official.orderId,
       clientOrderId: official.clientOrderId,
     }));
-    await this.tradingClient.cancelAdapterOrder({
+    const cancelled = await this.tradingClient.cancelAdapterOrder({
       ...official,
       side: official.side === 'buy' ? '0' : '1',
       isReduceOnly: official.reduceOnly,
     }, this.journal);
+    this.#settleZeroFillCancellation(cancelled);
     try {
       await this.refresh();
     } catch (error) {
@@ -769,7 +809,8 @@ export class PopdexExchange extends EventEmitter {
     this.journal.advance('BROADCAST', 'CONFIRMED', { orderId: order.orderId });
   }
 
-  async #recoverCancel(record, receipt) {
+  async #recoverCancel(record, receipt, { advance = true } = {}) {
+    if (typeof advance !== 'boolean') throw new Error('PopDEX cancel recovery advance 必须是布尔值。');
     parseOrderCancelReceipt(receipt, {
       account: record.mainAccount,
       orderId: record.orderId,
@@ -808,7 +849,13 @@ export class PopdexExchange extends EventEmitter {
         throw new Error('PopDEX BROADCAST cancel 后 BTCUSDT 仍有仓位。');
       }
     }
-    this.journal.advance('BROADCAST', 'CONFIRMED');
+    this.#settleZeroFillCancellation({
+      orderId: record.orderId,
+      clientOrderId: record.clientOrderId,
+      filledQtyWad: '0',
+      remainingQtyWad: '0',
+    });
+    if (advance) this.journal.advance('BROADCAST', 'CONFIRMED');
   }
 
   async #recoverClose(record, receipt) {
@@ -843,7 +890,11 @@ export class PopdexExchange extends EventEmitter {
 
   async #recoverOperation(record, authorization) {
     this.#validateRecoveryIdentity(record, authorization);
-    if (record.stage === 'CONFIRMED') return;
+    if (record.stage === 'CONFIRMED') {
+      if (record.kind !== 'cancel') return;
+      const receipt = await this.#exactRecoveryReceipt(record);
+      return this.#recoverCancel(record, receipt, { advance: false });
+    }
     if (record.stage === 'PREPARED') {
       if (record.txHash !== null) {
         throw new Error('PopDEX PREPARED 恢复记录不能包含 txHash。');

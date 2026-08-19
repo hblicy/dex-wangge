@@ -170,7 +170,9 @@ function exactRestCancelledOrder(order, openOrder) {
   ]) {
     if (actual !== expected) mismatch('CANCEL_CONFIRMED REST', field, expected, actual);
   }
-  if (order.reduceOnly !== false) mismatch('CANCEL_CONFIRMED REST', 'reduceOnly', false, order.reduceOnly);
+  if (order.reduceOnly !== openOrder.isReduceOnly) {
+    mismatch('CANCEL_CONFIRMED REST', 'reduceOnly', openOrder.isReduceOnly, order.reduceOnly);
+  }
   return {
     ...openOrder,
     filledQtyWad,
@@ -564,8 +566,8 @@ export class PopdexTradingClient {
     if (openOrder.side !== '0' && openOrder.side !== '1') {
       throw new Error('PopDEX openOrder.side 必须是 0 或 1。');
     }
-    if (openOrder.isReduceOnly !== false) {
-      throw new Error('PopDEX openOrder.isReduceOnly 必须是 false。');
+    if (typeof openOrder.isReduceOnly !== 'boolean') {
+      throw new Error('PopDEX openOrder.isReduceOnly 必须是布尔值。');
     }
     symbolForId(openOrder.symbolId);
     await this.preflight();

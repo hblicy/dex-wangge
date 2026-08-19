@@ -246,3 +246,47 @@ test('read failures preserve the original network cause', async () => {
     (error) => error.message === 'fetch failed' && error.cause === cause,
   );
 });
+
+test('durable exact cancellation proof closes an order absent from official snapshots', async () => {
+  const one = ownedOrder('1');
+  const target = fixture({ owned: [one] });
+  target.store.recordCancelProof(one.orderId, {
+    orderId: one.orderId,
+    clientOrderId: one.clientOrderId,
+    filledQtyWad: '0',
+  });
+
+  const result = await target.reconciler.reconcile({ reason: 'cancel:1', suppressRequote: true });
+  assert.equal(result.status, 'READY');
+  assert.deepEqual(result.activeOrders, []);
+  assert.equal(target.store.listOrders()[0].state, 'CANCELLED');
+});
+
+test('cancellation proof conflicts fail closed on a delayed fill or active order', async () => {
+  const one = ownedOrder('1');
+  const delayedFill = fixture({ owned: [one], fills: [fill(one)], positions: [position()] });
+  delayedFill.store.recordCancelProof(one.orderId, {
+    orderId: one.orderId,
+    clientOrderId: one.clientOrderId,
+    filledQtyWad: '0',
+  });
+  await assert.rejects(
+    delayedFill.reconciler.reconcile({ reason: 'refresh' }),
+    /撤单证明成交量不匹配/,
+  );
+
+  const activeConflict = fixture({
+    owned: [one],
+    restOpen: [restOrder(one)],
+    active: [chainOrder(one)],
+  });
+  activeConflict.store.recordCancelProof(one.orderId, {
+    orderId: one.orderId,
+    clientOrderId: one.clientOrderId,
+    filledQtyWad: '0',
+  });
+  await assert.rejects(
+    activeConflict.reconciler.reconcile({ reason: 'refresh' }),
+    (error) => error.code === 'POPDEX_IDENTITY_CONFLICT',
+  );
+});

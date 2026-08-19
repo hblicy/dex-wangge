@@ -410,6 +410,28 @@ test('cancelAdapterOrder uses generic stages and exact terminal confirmation', a
   assert.deepEqual(journal.advances.map((entry) => entry.next), ['BROADCAST', 'CONFIRMED']);
 });
 
+test('cancelAdapterOrder cancels an exact reduce-only replacement order', async () => {
+  const orderPlan = adapterPlan();
+  const deps = dependencies({
+    findRestOrder: async () => restOrder(orderPlan, {
+      side: 'Sell',
+      reduceOnly: true,
+      status: 'Cancelled',
+      remainingQty: '0',
+      cancelledQty: orderPlan.qty,
+    }),
+  });
+  const journal = genericJournal();
+  const result = await createClient(deps).cancelAdapterOrder(openOrder(orderPlan, {
+    side: '1',
+    isReduceOnly: true,
+  }), journal);
+
+  assert.equal(result.isReduceOnly, true);
+  assert.equal(result.cancelledQtyWad, orderPlan.qtyWad);
+  assert.equal(journal.stage, 'CONFIRMED');
+});
+
 test('closeAdapterBtcLong confirms positive execution receipt fill and flat official position', async () => {
   const closeClientOrderId = createBtcCloseClientOrderId(
     Uint8Array.from({ length: 16 }, (_, index) => index + 1),
