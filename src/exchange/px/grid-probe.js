@@ -634,7 +634,26 @@ async function createSession({ args, preflight, plan, env, deps, files, fsImpl }
           return { status: 'stopped-flat' };
         } catch (error) {
           output(`[PopDEX stop] 失败：阶段=${stopStage}，耗时=${elapsed()}ms。`);
-          throw error;
+          const cleanupErrors = [];
+          try {
+            exchange.stop();
+          } catch (cleanupError) {
+            cleanupErrors.push(cleanupError);
+          }
+          try {
+            releaseLock();
+          } catch (cleanupError) {
+            cleanupErrors.push(cleanupError);
+          }
+          closed = true;
+          if (cleanupErrors.length === 0) {
+            output('[PopDEX stop] 失败后已关闭交易所刷新并释放进程锁。');
+            throw error;
+          }
+          throw new AggregateError(
+            [error, ...cleanupErrors],
+            `PopDEX stop ${stopStage}失败，且会话资源清理失败。`,
+          );
         }
       }
       throw new Error(`PopDEX grid-probe 不支持控制命令 ${String(command)}。`);

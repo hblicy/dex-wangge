@@ -48,6 +48,7 @@ class FakeStrictAdapter extends EventEmitter {
     this.placeCalls = 0;
     this.cancelCalls = 0;
     this.closeCalls = 0;
+    this.stopCalls = 0;
     this.reconcileFailure = null;
     this.reconcileStatus = 'READY';
     this.position = null;
@@ -56,7 +57,7 @@ class FakeStrictAdapter extends EventEmitter {
 
   async init() { return this; }
   start() {}
-  stop() {}
+  stop() { this.stopCalls++; }
   async getMarkets() { return [(await fakePreflight()()).market]; }
   async getPrice() { return 63000.5; }
   async setLeverage(_marketId, leverage) { assert.equal(leverage, 1); return true; }
@@ -653,6 +654,10 @@ test('stop retains recovery facts when final reconciliation is not READY', async
   assert.equal(output.some((line) => line.includes('已安全停止')), false);
   assert.equal(fs.existsSync(files.state), true);
   assert.equal(fs.existsSync(files.ownership), true);
+  assert.equal(adapter.stopCalls, 1);
+  assert.equal(fs.existsSync(files.lock), false);
+  await assert.rejects(started.session.executeCommand('status'), /会话已结束/);
+  assert.ok(output.includes('[PopDEX stop] 失败后已关闭交易所刷新并释放进程锁。'));
 });
 
 test('a running stop rejects concurrent control commands without another cancel', async (t) => {
