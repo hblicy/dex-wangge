@@ -96,7 +96,7 @@ function btcPositions(values) {
   return values.filter((position) => String(position?.symbolId) === '20000');
 }
 
-function verifyPositions(owned, results, positions) {
+function verifyPositions(owned, results, positions, settledExposureEvents) {
   const btc = btcPositions(positions);
   let longQty = 0n;
   for (const position of btc) {
@@ -112,6 +112,29 @@ function verifyPositions(owned, results, positions) {
     owned.filter((order) => order.reduceOnly && order.parentFillEventId !== null)
       .map((order) => order.parentFillEventId),
   );
+  if (!Array.isArray(settledExposureEvents)) {
+    throw new Error('PopDEX settledExposureEvents 必须是数组。');
+  }
+  const settledIds = new Set();
+  for (const proof of settledExposureEvents) {
+    const eventId = proof?.fillEventId;
+    if (typeof eventId !== 'string' || settledIds.has(eventId)) {
+      throw fault('POPDEX_IDENTITY_CONFLICT', 'PopDEX 已结算敞口事件身份无效或重复。');
+    }
+    const order = owned.find((candidate) => candidate.orderId === proof.orderId);
+    const event = order?.terminalEvent;
+    if (!order || !order.opening || order.reduceOnly || event?.fillEventId !== eventId
+        || event.stage !== 'EVENT_COMPLETED' || !event.suppressRequote
+        || event.replacementOrderId !== null
+        || proof.filledQtyWad !== order.filledQtyWad
+        || proof.filledQtyWad !== event.filledQtyWad) {
+      throw fault(
+        'POPDEX_IDENTITY_CONFLICT',
+        `PopDEX 已结算敞口 ${String(eventId)} 与开仓成交事实冲突。`,
+      );
+    }
+    settledIds.add(eventId);
+  }
   let requiredLongQty = 0n;
   for (const order of owned) {
     const result = results.get(order.orderId);
@@ -124,7 +147,9 @@ function verifyPositions(owned, results, positions) {
     }
     if (!order.opening || filled === 0n) continue;
     const eventId = result?.event?.fillEventId ?? order.terminalEvent?.fillEventId ?? null;
-    if (eventId === null || !coveredEvents.has(eventId)) requiredLongQty += filled;
+    if (eventId === null || (!coveredEvents.has(eventId) && !settledIds.has(eventId))) {
+      requiredLongQty += filled;
+    }
   }
   if (longQty < requiredLongQty) {
     throw fault(
@@ -132,6 +157,11 @@ function verifyPositions(owned, results, positions) {
       `BTCUSDT Long 持仓不足：required=${requiredLongQty} actual=${longQty}。`,
     );
   }
+  return {
+    actualLongQtyWad: longQty.toString(),
+    requiredLongQtyWad: requiredLongQty.toString(),
+    settledExposureEvents: settledIds.size,
+  };
 }
 
 export class PopdexReconciler {
@@ -184,6 +214,7 @@ export class PopdexReconciler {
     }
     const startedAt = exactNow(this.now);
     const owned = this.ownershipStore.listOrders();
+    const settledExposureEvents = this.ownershipStore.listSettledExposureEvents();
     const [restOpen, history, fills, chainActive, completed, positions] = await Promise.all([
       this.accountClient.getAllOpenOrders(this.mainAccount, 'BTCUSDT'),
       this.accountClient.getAllOrderHistory(this.mainAccount, 'BTCUSDT'),
@@ -271,7 +302,12 @@ export class PopdexReconciler {
       }
     }
 
-    verifyPositions(owned, results, positions);
+    const positionDiagnostics = verifyPositions(
+      owned,
+      results,
+      positions,
+      settledExposureEvents,
+    );
     for (const order of owned) {
       this.ownershipStore.applyResult(order.orderId, results.get(order.orderId));
     }
@@ -293,6 +329,7 @@ export class PopdexReconciler {
         completed: completed.length,
         fills: fills.length,
         pending: pendingEvents.length,
+        ...positionDiagnostics,
       },
     };
   }

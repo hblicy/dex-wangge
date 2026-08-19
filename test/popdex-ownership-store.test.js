@@ -7,6 +7,8 @@ const FILE = 'ownership.json';
 const ACCOUNT = '0x1111111111111111111111111111111111111111';
 const CLIENT_ID = encodeBytes32String('dw-bb-111111111111111111111111').toLowerCase();
 const EVENT_ID = `px-fill-${'12'.repeat(32)}`;
+const CLOSE_CLIENT_ID = encodeBytes32String('dw-bc-111111111111111111111111').toLowerCase();
+const CLOSE_TX_HASH = `0x${'34'.repeat(32)}`;
 
 function memoryFs(initial = null, mode = 0o600, failures = {}) {
   const files = new Map(initial === null ? [] : [[FILE, typeof initial === 'string' ? initial : JSON.stringify(initial)]]);
@@ -93,6 +95,18 @@ function terminalResult(overrides = {}) {
   };
 }
 
+function closeFacts(overrides = {}) {
+  return {
+    closeOrderId: '456',
+    closeClientOrderId: CLOSE_CLIENT_ID,
+    closeTxHash: CLOSE_TX_HASH,
+    positionId: '88',
+    closeQtyWad: parseUnits('0.0002', 18).toString(),
+    reason: 'stop-close',
+    ...overrides,
+  };
+}
+
 test('ownership store persists exact order and pending event atomically', () => {
   const fsImpl = memoryFs();
   const store = createStore(fsImpl);
@@ -139,6 +153,80 @@ test('suppressed events complete without replacement and normal events cannot us
   normal.applyResult('123', terminalResult());
   assert.throws(() => normal.completeSuppressedEvent(EVENT_ID), /不是 suppression/);
   assert.throws(() => normal.completeEvent(EVENT_ID), /尚未确认补单/);
+});
+
+test('completed suppressed opening exposure is settled atomically by an exact confirmed close', () => {
+  const store = createStore();
+  store.upsertOrder(ownedOrder());
+  store.applyResult('123', terminalResult({
+    event: { ...terminalResult().event, suppressRequote: true },
+  }));
+  store.completeSuppressedEvent(EVENT_ID);
+
+  const qtyWad = parseUnits('0.0002', 18).toString();
+  const plan = store.planFlatExposureSettlement(qtyWad);
+  assert.deepEqual(plan, [{
+    fillEventId: EVENT_ID,
+    orderId: '123',
+    filledQtyWad: qtyWad,
+  }]);
+
+  store.recordFlatExposureSettlement(plan, closeFacts());
+  const [proof] = store.listSettledExposureEvents();
+  assert.deepEqual(proof, {
+    fillEventId: EVENT_ID,
+    orderId: '123',
+    filledQtyWad: qtyWad,
+    closeOrderId: '456',
+    closeClientOrderId: CLOSE_CLIENT_ID,
+    closeTxHash: CLOSE_TX_HASH,
+    positionId: '88',
+    closeQtyWad: qtyWad,
+    reason: 'stop-close',
+    confirmedAt: '2026-08-17T06:00:00.000Z',
+  });
+
+  store.recordFlatExposureSettlement(plan, closeFacts());
+  assert.equal(store.listSettledExposureEvents().length, 1);
+  assert.throws(
+    () => store.recordFlatExposureSettlement(plan, closeFacts({ closeOrderId: '457' })),
+    /冲突/,
+  );
+});
+
+test('flat exposure settlement rejects suppression without completed exact exposure', () => {
+  const qtyWad = parseUnits('0.0002', 18).toString();
+
+  const pending = createStore();
+  pending.upsertOrder(ownedOrder());
+  pending.applyResult('123', terminalResult({
+    event: { ...terminalResult().event, suppressRequote: true },
+  }));
+  assert.throws(() => pending.planFlatExposureSettlement(qtyWad), /已完成|敞口/);
+
+  const unsuppressed = createStore();
+  unsuppressed.upsertOrder(ownedOrder());
+  unsuppressed.applyResult('123', terminalResult());
+  assert.throws(() => unsuppressed.planFlatExposureSettlement(qtyWad), /suppression|敞口/);
+
+  const completed = createStore();
+  completed.upsertOrder(ownedOrder());
+  completed.applyResult('123', terminalResult({
+    event: { ...terminalResult().event, suppressRequote: true },
+  }));
+  completed.completeSuppressedEvent(EVENT_ID);
+  assert.throws(
+    () => completed.planFlatExposureSettlement(parseUnits('0.0001', 18).toString()),
+    /数量|敞口/,
+  );
+});
+
+test('legacy ownership files load with an empty settled exposure collection', () => {
+  const legacy = createStore().load();
+  delete legacy.settledExposureEvents;
+  const loaded = createStore(memoryFs(legacy)).load();
+  assert.deepEqual(loaded.settledExposureEvents, []);
+  assert.deepEqual(createStore(memoryFs(legacy)).listSettledExposureEvents(), []);
 });
 
 test('stop explicitly suppresses a pending event without changing its exchange facts', () => {

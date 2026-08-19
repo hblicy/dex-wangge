@@ -1,7 +1,10 @@
 import fs from 'node:fs';
 import { strictAddress, strictIntegerString } from './normalize.js';
 
-const ROOT_KEYS = new Set(['version', 'mainAccount', 'symbol', 'symbolId', 'orders', 'updatedAt']);
+const ROOT_KEYS = new Set([
+  'version', 'mainAccount', 'symbol', 'symbolId', 'orders', 'settledExposureEvents', 'updatedAt',
+]);
+const REQUIRED_ROOT_KEYS = new Set([...ROOT_KEYS].filter((key) => key !== 'settledExposureEvents'));
 const ORDER_KEYS = new Set([
   'orderId', 'clientOrderId', 'marketId', 'levelIndex', 'side', 'priceWad', 'qtyWad',
   'opening', 'reduceOnly', 'parentFillEventId', 'state', 'filledQtyWad', 'fillIds',
@@ -9,6 +12,11 @@ const ORDER_KEYS = new Set([
 ]);
 const REQUIRED_ORDER_KEYS = new Set([...ORDER_KEYS].filter((key) => key !== 'cancelProof'));
 const CANCEL_PROOF_KEYS = new Set(['orderId', 'clientOrderId', 'filledQtyWad']);
+const SETTLED_EXPOSURE_KEYS = new Set([
+  'fillEventId', 'orderId', 'filledQtyWad', 'closeOrderId', 'closeClientOrderId',
+  'closeTxHash', 'positionId', 'closeQtyWad', 'reason', 'confirmedAt',
+]);
+const SETTLEMENT_PLAN_KEYS = new Set(['fillEventId', 'orderId', 'filledQtyWad']);
 const EVENT_KEYS = new Set([
   'fillEventId', 'stage', 'terminalState', 'filledQtyWad', 'priceWad', 'fillIds',
   'suppressRequote', 'replacementOrderId',
@@ -68,6 +76,44 @@ function timestamp(value) {
     throw new Error('PopDEX ownership updatedAt 必须是规范 ISO 时间字符串。');
   }
   return value;
+}
+
+function settledExposure(value, order) {
+  rejectUnknown(value, SETTLED_EXPOSURE_KEYS, 'settledExposureEvent');
+  requireKeys(value, SETTLED_EXPOSURE_KEYS, 'settledExposureEvent');
+  const proof = value;
+  proof.fillEventId = fillEventId(proof.fillEventId, 'settledExposureEvent.fillEventId');
+  proof.orderId = positiveInteger(proof.orderId, 'settledExposureEvent.orderId');
+  proof.filledQtyWad = wad(proof.filledQtyWad, 'settledExposureEvent.filledQtyWad', { positive: true });
+  proof.closeOrderId = positiveInteger(proof.closeOrderId, 'settledExposureEvent.closeOrderId');
+  proof.closeClientOrderId = bytes32(
+    proof.closeClientOrderId,
+    'settledExposureEvent.closeClientOrderId',
+  );
+  proof.closeTxHash = bytes32(proof.closeTxHash, 'settledExposureEvent.closeTxHash');
+  proof.positionId = positiveInteger(proof.positionId, 'settledExposureEvent.positionId');
+  proof.closeQtyWad = wad(proof.closeQtyWad, 'settledExposureEvent.closeQtyWad', { positive: true });
+  if (proof.reason !== 'stop-close') {
+    throw new Error('PopDEX ownership settledExposureEvent reason 必须是 stop-close。');
+  }
+  proof.confirmedAt = timestamp(proof.confirmedAt);
+  if (!order || !order.opening || order.reduceOnly || order.state !== 'FILLED') {
+    throw new Error('PopDEX ownership 已结算敞口必须引用完整开仓成交。');
+  }
+  const event = order.terminalEvent;
+  if (!event || event.fillEventId !== proof.fillEventId
+      || event.stage !== 'EVENT_COMPLETED' || !event.suppressRequote
+      || event.replacementOrderId !== null) {
+    throw new Error('PopDEX ownership 已结算敞口必须引用已完成 suppression 事件。');
+  }
+  if (order.filledQtyWad !== proof.filledQtyWad
+      || event.filledQtyWad !== proof.filledQtyWad) {
+    throw new Error('PopDEX ownership 已结算敞口数量与开仓成交不匹配。');
+  }
+  if (BigInt(proof.filledQtyWad) > BigInt(proof.closeQtyWad)) {
+    throw new Error('PopDEX ownership 已结算敞口数量超过平仓数量。');
+  }
+  return proof;
 }
 
 function fillEventId(value, field = 'fillEventId') {
@@ -179,7 +225,7 @@ function validateOrder(value) {
 
 function validateRoot(value, expectedAccount) {
   rejectUnknown(value, ROOT_KEYS, 'root');
-  requireKeys(value, ROOT_KEYS, 'root');
+  requireKeys(value, REQUIRED_ROOT_KEYS, 'root');
   if (value.version !== 1) throw new Error('PopDEX ownership version 必须是 1。');
   value.mainAccount = strictAddress(value.mainAccount, 'ownership mainAccount');
   if (value.mainAccount.toLowerCase() !== expectedAccount.toLowerCase()) {
@@ -190,6 +236,10 @@ function validateRoot(value, expectedAccount) {
   }
   if (!Array.isArray(value.orders)) throw new Error('PopDEX ownership orders 必须是数组。');
   value.orders = value.orders.map(validateOrder);
+  if (!Object.hasOwn(value, 'settledExposureEvents')) value.settledExposureEvents = [];
+  if (!Array.isArray(value.settledExposureEvents)) {
+    throw new Error('PopDEX ownership settledExposureEvents 必须是数组。');
+  }
   timestamp(value.updatedAt);
   const orderIds = new Set();
   const clientOrderIds = new Set();
@@ -206,7 +256,63 @@ function validateRoot(value, expectedAccount) {
       eventIds.add(order.terminalEvent.fillEventId);
     }
   }
+  const settledIds = new Set();
+  value.settledExposureEvents = value.settledExposureEvents.map((proof) => {
+    const order = value.orders.find((candidate) => candidate.orderId === String(proof?.orderId));
+    const normalized = settledExposure(proof, order);
+    if (settledIds.has(normalized.fillEventId)) {
+      throw new Error(`PopDEX ownership 已结算 fillEventId ${normalized.fillEventId} 重复。`);
+    }
+    settledIds.add(normalized.fillEventId);
+    return normalized;
+  });
   return value;
+}
+
+function settlementPlan(root, closeQtyWadValue) {
+  const closeQtyWad = wad(closeQtyWadValue, 'settlement.closeQtyWad', { positive: true });
+  const coveredEvents = new Set(
+    root.orders.filter((order) => order.reduceOnly && order.parentFillEventId !== null)
+      .map((order) => order.parentFillEventId),
+  );
+  const plan = root.orders.filter((order) => {
+    const event = order.terminalEvent;
+    return order.opening && !order.reduceOnly && order.state === 'FILLED'
+      && event !== null && event.stage === 'EVENT_COMPLETED' && event.suppressRequote
+      && event.replacementOrderId === null && !coveredEvents.has(event.fillEventId);
+  }).map((order) => ({
+    fillEventId: order.terminalEvent.fillEventId,
+    orderId: order.orderId,
+    filledQtyWad: order.filledQtyWad,
+  }));
+  const total = plan.reduce((sum, item) => sum + BigInt(item.filledQtyWad), 0n);
+  if (plan.length === 0 || total !== BigInt(closeQtyWad)) {
+    throw new Error(
+      `PopDEX ownership 可结算开仓敞口数量不匹配：expected=${closeQtyWad} actual=${total.toString()}。`,
+    );
+  }
+  return plan;
+}
+
+function exactSettlementPlan(value) {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error('PopDEX ownership settlement plan 必须是非空数组。');
+  }
+  const ids = new Set();
+  return value.map((entry) => {
+    rejectUnknown(entry, SETTLEMENT_PLAN_KEYS, 'settlement plan item');
+    requireKeys(entry, SETTLEMENT_PLAN_KEYS, 'settlement plan item');
+    const item = {
+      fillEventId: fillEventId(entry.fillEventId, 'settlement plan.fillEventId'),
+      orderId: positiveInteger(entry.orderId, 'settlement plan.orderId'),
+      filledQtyWad: wad(entry.filledQtyWad, 'settlement plan.filledQtyWad', { positive: true }),
+    };
+    if (ids.has(item.fillEventId)) {
+      throw new Error(`PopDEX ownership settlement plan fillEventId ${item.fillEventId} 重复。`);
+    }
+    ids.add(item.fillEventId);
+    return item;
+  });
 }
 
 function eventFromResult(event, order) {
@@ -261,6 +367,7 @@ export class PopdexOwnershipStore {
       symbol: 'BTCUSDT',
       symbolId: '20000',
       orders: [],
+      settledExposureEvents: [],
       updatedAt: this.#timestamp(),
     };
   }
@@ -318,6 +425,64 @@ export class PopdexOwnershipStore {
 
   listOrders() {
     return this.load().orders;
+  }
+
+  listSettledExposureEvents() {
+    return this.load().settledExposureEvents;
+  }
+
+  planFlatExposureSettlement(closeQtyWad) {
+    return settlementPlan(this.load(), closeQtyWad);
+  }
+
+  recordFlatExposureSettlement(planValue, closeFactsValue) {
+    const plan = exactSettlementPlan(structuredClone(planValue));
+    if (!closeFactsValue || typeof closeFactsValue !== 'object' || Array.isArray(closeFactsValue)) {
+      throw new Error('PopDEX ownership close facts 必须是对象。');
+    }
+    const allowed = new Set([
+      'closeOrderId', 'closeClientOrderId', 'closeTxHash', 'positionId', 'closeQtyWad', 'reason',
+    ]);
+    rejectUnknown(closeFactsValue, allowed, 'close facts');
+    requireKeys(closeFactsValue, allowed, 'close facts');
+    const facts = {
+      closeOrderId: positiveInteger(closeFactsValue.closeOrderId, 'closeFacts.closeOrderId'),
+      closeClientOrderId: bytes32(closeFactsValue.closeClientOrderId, 'closeFacts.closeClientOrderId'),
+      closeTxHash: bytes32(closeFactsValue.closeTxHash, 'closeFacts.closeTxHash'),
+      positionId: positiveInteger(closeFactsValue.positionId, 'closeFacts.positionId'),
+      closeQtyWad: wad(closeFactsValue.closeQtyWad, 'closeFacts.closeQtyWad', { positive: true }),
+      reason: closeFactsValue.reason,
+    };
+    if (facts.reason !== 'stop-close') {
+      throw new Error('PopDEX ownership close facts reason 必须是 stop-close。');
+    }
+    return this.#change((root) => {
+      const expected = settlementPlan(root, facts.closeQtyWad);
+      if (JSON.stringify(expected) !== JSON.stringify(plan)) {
+        throw new Error('PopDEX ownership settlement plan 与当前敞口事实冲突。');
+      }
+      const confirmedAt = this.#timestamp();
+      for (const item of expected) {
+        const candidate = {
+          ...item,
+          ...facts,
+          confirmedAt,
+        };
+        const order = root.orders.find((entry) => entry.orderId === item.orderId);
+        settledExposure(candidate, order);
+        const existing = root.settledExposureEvents
+          .find((proof) => proof.fillEventId === item.fillEventId);
+        if (existing) {
+          const { confirmedAt: _existingAt, ...existingFacts } = existing;
+          const { confirmedAt: _candidateAt, ...candidateFacts } = candidate;
+          if (JSON.stringify(existingFacts) !== JSON.stringify(candidateFacts)) {
+            throw new Error(`PopDEX ownership 已结算事件 ${item.fillEventId} 事实冲突。`);
+          }
+          continue;
+        }
+        root.settledExposureEvents.push(candidate);
+      }
+    });
   }
 
   upsertOrder(value) {

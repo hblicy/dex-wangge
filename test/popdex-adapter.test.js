@@ -70,6 +70,36 @@ function longPosition(overrides = {}) {
   };
 }
 
+function completedSuppressedOpening(overrides = {}) {
+  const fillEventId = `px-fill-${'ab'.repeat(32)}`;
+  return {
+    orderId: '90071992547409931234',
+    clientOrderId: encodeBytes32String('dw-bb-0102030405060708090a0b0c').toLowerCase(),
+    marketId: 20000,
+    levelIndex: 0,
+    side: 'buy',
+    priceWad: parseUnits('60000', 18).toString(),
+    qtyWad: '200000000000000',
+    opening: true,
+    reduceOnly: false,
+    parentFillEventId: null,
+    state: 'FILLED',
+    filledQtyWad: '200000000000000',
+    fillIds: ['77'],
+    terminalEvent: {
+      fillEventId,
+      stage: 'EVENT_COMPLETED',
+      terminalState: 'FILLED',
+      filledQtyWad: '200000000000000',
+      priceWad: parseUnits('60000', 18).toString(),
+      fillIds: ['77'],
+      suppressRequote: true,
+      replacementOrderId: null,
+    },
+    ...overrides,
+  };
+}
+
 function memoryJournal(initial = null) {
   let record = initial === null ? null : structuredClone(initial);
   const calls = [];
@@ -79,7 +109,9 @@ function memoryJournal(initial = null) {
     create(facts) {
       calls.push(`create:${facts.kind}`);
       if (record !== null) throw new Error('已有未完成操作');
-      record = { ...structuredClone(facts), stage: 'PREPARED', txHash: null };
+      record = {
+        ...structuredClone(facts), stage: 'PREPARED', txHash: null, outcome: null,
+      };
       return structuredClone(record);
     },
     advance(expected, next, fields = {}) {
@@ -109,10 +141,32 @@ function memoryJournal(initial = null) {
 function memoryOwnership(initialOrders = [], initialEvents = []) {
   let orders = structuredClone(initialOrders);
   let events = structuredClone(initialEvents);
+  let settledExposureEvents = [];
   const calls = [];
   return {
     calls,
     listOrders() { calls.push('list'); return structuredClone(orders); },
+    listSettledExposureEvents() {
+      calls.push('list-settled');
+      return structuredClone(settledExposureEvents);
+    },
+    planFlatExposureSettlement(closeQtyWad) {
+      calls.push(`flat-plan:${closeQtyWad}`);
+      const plan = orders.filter((order) => order.opening && !order.reduceOnly
+        && order.terminalEvent?.stage === 'EVENT_COMPLETED'
+        && order.terminalEvent?.suppressRequote === true)
+        .map((order) => ({
+          fillEventId: order.terminalEvent.fillEventId,
+          orderId: order.orderId,
+          filledQtyWad: order.filledQtyWad,
+        }));
+      assert.equal(plan.reduce((sum, item) => sum + BigInt(item.filledQtyWad), 0n), BigInt(closeQtyWad));
+      return structuredClone(plan);
+    },
+    recordFlatExposureSettlement(plan, facts) {
+      calls.push(`flat-record:${facts.closeOrderId}`);
+      settledExposureEvents = plan.map((item) => ({ ...structuredClone(item), ...structuredClone(facts) }));
+    },
     upsertOrder(order) {
       calls.push(`upsert:${order.orderId}`);
       const existing = orders.find((candidate) => candidate.orderId === order.orderId);
@@ -902,17 +956,103 @@ test('adoptOrder rejects incomplete or conflicting ownership metadata', async ()
 });
 
 test('closePosition accepts only one confirmed BTC long and reaches official flat', async () => {
-  const deps = dependencies({ positions: [longPosition()] });
+  const opening = completedSuppressedOpening();
+  const ownershipStore = memoryOwnership([opening]);
+  const deps = dependencies({ positions: [longPosition()], ownershipStore });
   const ex = createLiveAdapter(deps);
   await ex.init();
   assert.equal(await ex.closePosition(20000), true);
   assert.equal(ex.getPosition(20000), null);
+  assert.deepEqual(ownershipStore.calls.filter((call) => call.startsWith('flat-')), [
+    'flat-plan:200000000000000',
+    'flat-record:99',
+  ]);
+  assert.deepEqual(ownershipStore.listSettledExposureEvents().map((proof) => ({
+    fillEventId: proof.fillEventId,
+    orderId: proof.orderId,
+    closeOrderId: proof.closeOrderId,
+    closeTxHash: proof.closeTxHash,
+    positionId: proof.positionId,
+    closeQtyWad: proof.closeQtyWad,
+    reason: proof.reason,
+  })), [{
+    fillEventId: opening.terminalEvent.fillEventId,
+    orderId: opening.orderId,
+    closeOrderId: '99',
+    closeTxHash: `0x${'44'.repeat(32)}`,
+    positionId: longPosition().positionId,
+    closeQtyWad: longPosition().holdSizeWad,
+    reason: 'stop-close',
+  }]);
+  assert.equal(deps.journal.load(), null);
 
   const shortDeps = dependencies({ positions: [longPosition({ side: '2' })] });
   const short = createLiveAdapter(shortDeps);
   await short.init();
   await assert.rejects(short.closePosition(20000), /只允许.*多仓/);
   await assert.rejects(short.closePosition(20001), /ETHUSDT.*实盘写操作/);
+});
+
+test('closePosition retains CONFIRMED journal and no exposure proof until official flat', async () => {
+  const opening = completedSuppressedOpening();
+  const ownershipStore = memoryOwnership([opening]);
+  const deps = dependencies({ positions: [longPosition()], ownershipStore });
+  deps.tradingClient.closeAdapterBtcLong = async (position, operationJournal) => {
+    operationJournal.advance('PREPARED', 'BROADCAST', { txHash: `0x${'44'.repeat(32)}` });
+    operationJournal.advance('BROADCAST', 'CONFIRMED', { closeOrderId: '99' });
+    return { closeOrderId: '99', positionQtyWad: position.qtyWad };
+  };
+  const ex = createLiveAdapter(deps);
+  await ex.init();
+
+  await assert.rejects(ex.closePosition(20000), /官方快照仍有 BTCUSDT 仓位/);
+  assert.equal(deps.journal.load().stage, 'CONFIRMED');
+  assert.deepEqual(ownershipStore.listSettledExposureEvents(), []);
+});
+
+function confirmedCloseRecord(overrides = {}) {
+  return {
+    kind: 'close',
+    stage: 'CONFIRMED',
+    mainAccount: ACCOUNT,
+    agentAddress: AGENT,
+    symbol: 'BTCUSDT',
+    symbolId: '20000',
+    side: null,
+    price: null,
+    qty: '0.0002',
+    clientOrderId: null,
+    intentId: null,
+    levelIndex: null,
+    opening: null,
+    reduceOnly: null,
+    parentFillEventId: null,
+    closeClientOrderId: encodeBytes32String('dw-bc-0102030405060708090a0b0c').toLowerCase(),
+    orderId: null,
+    closeOrderId: '99',
+    positionId: longPosition().positionId,
+    leverage: null,
+    txHash: `0x${'44'.repeat(32)}`,
+    outcome: null,
+    ...overrides,
+  };
+}
+
+test('CONFIRMED close recovery persists exact flat exposure before clearing without rebroadcast', async () => {
+  const opening = completedSuppressedOpening();
+  const ownershipStore = memoryOwnership([opening]);
+  const journal = memoryJournal(confirmedCloseRecord());
+  const deps = dependencies({ journal, ownershipStore, positions: [] });
+  const ex = createLiveAdapter(deps);
+
+  await ex.reconnect();
+  assert.equal(deps.broadcastCalls, 0);
+  assert.equal(journal.load(), null);
+  assert.deepEqual(ownershipStore.calls.filter((call) => call.startsWith('flat-')), [
+    'flat-plan:200000000000000',
+    'flat-record:99',
+  ]);
+  assert.equal(ownershipStore.listSettledExposureEvents().length, 1);
 });
 
 function broadcastPlaceRecord(overrides = {}) {

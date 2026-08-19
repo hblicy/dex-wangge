@@ -48,6 +48,7 @@ class FakeStrictAdapter extends EventEmitter {
     this.placeCalls = 0;
     this.cancelCalls = 0;
     this.closeCalls = 0;
+    this.stopCalls = 0;
     this.reconcileFailure = null;
     this.reconcileStatus = 'READY';
     this.position = null;
@@ -56,7 +57,7 @@ class FakeStrictAdapter extends EventEmitter {
 
   async init() { return this; }
   start() {}
-  stop() {}
+  stop() { this.stopCalls++; }
   async getMarkets() { return [(await fakePreflight()()).market]; }
   async getPrice() { return 63000.5; }
   async setLeverage(_marketId, leverage) { assert.equal(leverage, 1); return true; }
@@ -229,6 +230,19 @@ function writeManualFlatIncident(files, orderId = '245591159265558528') {
     }],
     updatedAt: '2026-08-19T08:00:00.000Z',
   }), { mode: 0o600 });
+}
+
+function writeStoppedCompletedFlatIncident(files, orderId = '246022657449918464') {
+  writeManualFlatIncident(files, orderId);
+  const state = JSON.parse(fs.readFileSync(files.state, 'utf8'));
+  const ownership = JSON.parse(fs.readFileSync(files.ownership, 'utf8'));
+  const event = ownership.orders[0].terminalEvent;
+  state.snapshot.running = false;
+  state.snapshot.processedFillEventIds = [event.fillEventId];
+  event.stage = 'EVENT_COMPLETED';
+  event.suppressRequote = true;
+  fs.writeFileSync(files.state, JSON.stringify(state), { mode: 0o600 });
+  fs.writeFileSync(files.ownership, JSON.stringify(ownership), { mode: 0o600 });
 }
 
 function manualFlatFill(overrides = {}) {
@@ -425,6 +439,7 @@ test('manual flat recovery archives the exact filled incident without writes', a
     { mode: result.mode, orderId: result.orderId, writes: result.writes },
     { mode: 'manual-flat-recovered', orderId, writes: 0 },
   );
+  assert.equal(result.recoveryShape, 'pending-manual-flat');
   assert.equal(fs.existsSync(files.state), false);
   assert.equal(fs.existsSync(files.ownership), false);
   assert.equal(result.archivedFiles.length, 2);
@@ -434,19 +449,69 @@ test('manual flat recovery archives the exact filled incident without writes', a
   }
 });
 
+test('manual flat recovery archives the stopped completed suppression incident without writes', async (t) => {
+  const files = temporaryFiles(t);
+  const orderId = '246022657449918464';
+  writeStoppedCompletedFlatIncident(files, orderId);
+  const result = await runGridProbe({
+    argv: ['--confirm-manual-flat-order', orderId],
+    deps: {
+      preflight: fakePreflight({ fills: [manualFlatFill({ orderId })] }),
+      files,
+      now: () => Date.parse('2026-08-19T09:00:00.000Z'),
+      processKill() { const error = new Error('missing'); error.code = 'ESRCH'; throw error; },
+    },
+  });
+  assert.deepEqual({
+    mode: result.mode,
+    orderId: result.orderId,
+    writes: result.writes,
+    recoveryShape: result.recoveryShape,
+  }, {
+    mode: 'manual-flat-recovered',
+    orderId,
+    writes: 0,
+    recoveryShape: 'stopped-completed-flat',
+  });
+  assert.equal(fs.existsSync(files.state), false);
+  assert.equal(fs.existsSync(files.ownership), false);
+  assert.equal(result.archivedFiles.length, 2);
+});
+
 test('manual flat recovery CLI output identifies zero writes and every archive', () => {
   const output = [];
   printManualFlatRecoveryResult({
     mode: 'manual-flat-recovered',
     orderId: '245591159265558528',
     writes: 0,
+    recoveryShape: 'pending-manual-flat',
     archivedFiles: ['/tmp/state.manual-flat.bak', '/tmp/ownership.manual-flat.bak'],
   }, (message) => output.push(String(message)));
   assert.deepEqual(output, [
     'PopDEX 人工平仓恢复完成：orderId=245591159265558528，链上写入=0。',
+    '恢复形态：pending-manual-flat。',
     '已归档：/tmp/state.manual-flat.bak',
     '已归档：/tmp/ownership.manual-flat.bak',
   ]);
+});
+
+test('stopped completed flat recovery rejects a processed fill identity mismatch', async (t) => {
+  const files = temporaryFiles(t);
+  const orderId = '246022657449918464';
+  writeStoppedCompletedFlatIncident(files, orderId);
+  const state = JSON.parse(fs.readFileSync(files.state, 'utf8'));
+  state.snapshot.processedFillEventIds = [`px-fill-${'99'.repeat(32)}`];
+  fs.writeFileSync(files.state, JSON.stringify(state), { mode: 0o600 });
+
+  await assert.rejects(runGridProbe({
+    argv: ['--confirm-manual-flat-order', orderId],
+    deps: {
+      preflight: fakePreflight({ fills: [manualFlatFill({ orderId })] }),
+      files,
+    },
+  }), /已处理成交事件.*不匹配/);
+  assert.equal(fs.existsSync(files.state), true);
+  assert.equal(fs.existsSync(files.ownership), true);
 });
 
 test('manual flat recovery rejects official exposure or mismatched fills and preserves facts', async (t) => {
@@ -653,6 +718,10 @@ test('stop retains recovery facts when final reconciliation is not READY', async
   assert.equal(output.some((line) => line.includes('已安全停止')), false);
   assert.equal(fs.existsSync(files.state), true);
   assert.equal(fs.existsSync(files.ownership), true);
+  assert.equal(adapter.stopCalls, 1);
+  assert.equal(fs.existsSync(files.lock), false);
+  await assert.rejects(started.session.executeCommand('status'), /会话已结束/);
+  assert.ok(output.includes('[PopDEX stop] 失败后已关闭交易所刷新并释放进程锁。'));
 });
 
 test('a running stop rejects concurrent control commands without another cancel', async (t) => {
