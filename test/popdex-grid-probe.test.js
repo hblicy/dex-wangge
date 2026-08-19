@@ -49,6 +49,7 @@ class FakeStrictAdapter extends EventEmitter {
     this.cancelCalls = 0;
     this.closeCalls = 0;
     this.stopCalls = 0;
+    this.reconnectFailure = null;
     this.reconcileFailure = null;
     this.reconcileStatus = 'READY';
     this.position = null;
@@ -116,7 +117,11 @@ class FakeStrictAdapter extends EventEmitter {
     this.pending.delete(fillEventId);
   }
   haltFromBot(error) { this.state = 'HALTED'; this.haltReason = error.message; }
-  async reconnect() { this.reconcileFailure = null; return this.reconcileOwnedOrders(); }
+  async reconnect() {
+    if (this.reconnectFailure !== null) throw this.reconnectFailure;
+    this.reconcileFailure = null;
+    return this.reconcileOwnedOrders();
+  }
   getHealth() { return { state: this.state, status: this.state === 'READY' ? 'ok' : 'error' }; }
   terminalFill(orderId, { offline = false } = {}) {
     const order = this.orders.get(String(orderId));
@@ -722,7 +727,85 @@ test('stop retains recovery facts when final reconciliation is not READY', async
   assert.equal(adapter.stopCalls, 1);
   assert.equal(fs.existsSync(files.lock), false);
   await assert.rejects(started.session.executeCommand('status'), /会话已结束/);
-  assert.ok(output.includes('[PopDEX stop] 失败后已关闭交易所刷新并释放进程锁。'));
+  assert.ok(output.includes(
+    '[PopDEX stop] 失败后已关闭交易所刷新并释放进程锁；恢复事实已保留。',
+  ));
+});
+
+test('reconnect failure closes refresh releases lock and preserves recovery facts', async (t) => {
+  const files = temporaryFiles(t);
+  const adapter = new FakeStrictAdapter();
+  const output = [];
+  const started = await runGridProbe({
+    argv: ['--confirm-mainnet-grid'],
+    env: { POPDEX_AGENT_PRIVATE_KEY: `0x${'11'.repeat(32)}` },
+    deps: {
+      preflight: fakePreflight(),
+      createLiveExchange: () => adapter,
+      interactive: false,
+      files,
+      output(message) { output.push(String(message)); },
+    },
+  });
+  fs.writeFileSync(files.ownership, '{}', { mode: 0o600 });
+  adapter.reconnectFailure = new Error(
+    'PopDEX POPDEX_UNKNOWN_TERMINAL：orderId=246940766838980608 对账超过 30000ms 仍无法闭合。',
+  );
+
+  await assert.rejects(
+    started.session.executeCommand('reconnect'),
+    /POPDEX_UNKNOWN_TERMINAL/,
+  );
+  assert.equal(adapter.stopCalls, 1);
+  assert.equal(fs.existsSync(files.lock), false);
+  assert.equal(fs.existsSync(files.state), true);
+  assert.equal(fs.existsSync(files.ownership), true);
+  await assert.rejects(started.session.executeCommand('status'), /会话已结束/);
+  assert.ok(output.includes(
+    '[PopDEX reconnect] 失败后已关闭交易所刷新并释放进程锁；恢复事实已保留。',
+  ));
+});
+
+test('reconnect failure preserves original and cleanup errors', async (t) => {
+  const files = temporaryFiles(t);
+  const adapter = new FakeStrictAdapter();
+  adapter.stop = () => {
+    adapter.stopCalls++;
+    throw new Error('adapter cleanup failed');
+  };
+  const fsImpl = {
+    readFileSync: fs.readFileSync.bind(fs),
+    writeFileSync: fs.writeFileSync.bind(fs),
+    chmodSync: fs.chmodSync.bind(fs),
+    existsSync: fs.existsSync.bind(fs),
+    statSync: fs.statSync.bind(fs),
+    renameSync: fs.renameSync.bind(fs),
+    unlinkSync(file) {
+      if (file === files.lock) throw new Error('lock cleanup failed');
+      fs.unlinkSync(file);
+    },
+  };
+  const started = await runGridProbe({
+    argv: ['--confirm-mainnet-grid'],
+    env: { POPDEX_AGENT_PRIVATE_KEY: `0x${'11'.repeat(32)}` },
+    deps: {
+      preflight: fakePreflight(),
+      createLiveExchange: () => adapter,
+      interactive: false,
+      files,
+      fsImpl,
+      output() {},
+    },
+  });
+  adapter.reconnectFailure = new Error('POPDEX_UNKNOWN_TERMINAL');
+
+  await assert.rejects(
+    started.session.executeCommand('reconnect'),
+    (error) => error instanceof AggregateError
+      && error.errors.some((item) => /POPDEX_UNKNOWN_TERMINAL/.test(item.message))
+      && error.errors.some((item) => /adapter cleanup failed/.test(item.message))
+      && error.errors.some((item) => /lock cleanup failed/.test(item.message)),
+  );
 });
 
 test('a running stop rejects concurrent control commands without another cancel', async (t) => {
