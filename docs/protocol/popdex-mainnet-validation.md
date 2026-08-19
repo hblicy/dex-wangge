@@ -159,7 +159,7 @@ The command accepts only `status`, `reconnect`, and `stop` while running. `SIGIN
 npm run popdex:grid-probe -- --resume
 ```
 
-The `stop` command must confirm zero owned open orders, zero pending terminal events and a flat BTCUSDT position before clearing the isolated probe files. Any identity conflict, unresolved terminal fact, replacement failure or persistence failure stops acceptance and retains recovery facts.
+The `stop` command must confirm zero owned open orders, zero pending terminal events and a flat BTCUSDT position before clearing the isolated probe files. For an automatic cancellation, the adapter persists the exact zero-fill cancellation proof from the successful `OrderCancel` receipt and official confirmation before clearing the operation journal; reconciliation keeps that proof attached to the owned order and checks every later fill snapshot against it. A delayed fill, an active order reappearing after cancellation, or a conflicting official terminal row fails closed. The same path cancels both opening orders and `ReduceOnly` replacement orders. Any identity conflict, unresolved terminal fact, replacement failure or persistence failure stops acceptance and retains recovery facts.
 
 If an operator cancels the sole probe order in the PopDEX web page, the exchange may expose neither an active row nor an exact terminal row. In that case the probe deliberately retains an `UNKNOWN_TERMINAL` ownership record and does not guess that disappearance means cancellation. After `popdex:verify` independently reports zero BTCUSDT open orders and zero positions, the operator may attest the exact order identity with the following read-only recovery command:
 

@@ -121,6 +121,31 @@ function memoryOwnership(initialOrders = [], initialEvents = []) {
       }
       if (!existing) orders.push(structuredClone(order));
     },
+    applyResult(orderId, result) {
+      calls.push(`apply:${orderId}:${result.state}:${result.filledQtyWad}`);
+      const order = orders.find((candidate) => candidate.orderId === String(orderId));
+      if (!order) throw new Error('ownership order missing');
+      order.state = result.state;
+      order.filledQtyWad = result.filledQtyWad;
+      order.fillIds = [...(result.fillIds ?? [])];
+    },
+    recordCancelProof(orderId, proof) {
+      calls.push(`proof:${orderId}:${proof.filledQtyWad}`);
+      const order = orders.find((candidate) => candidate.orderId === String(orderId));
+      if (!order) throw new Error('ownership order missing');
+      if (order.cancelProof && JSON.stringify(order.cancelProof) !== JSON.stringify(proof)) {
+        throw new Error('ownership cancel proof conflict');
+      }
+      order.cancelProof = structuredClone(proof);
+    },
+    removeSettled(orderId) {
+      calls.push(`remove:${orderId}`);
+      const order = orders.find((candidate) => candidate.orderId === String(orderId));
+      if (!order || !['CANCELLED', 'FILLED', 'REJECTED', 'EXPIRED'].includes(order.state)) {
+        throw new Error('ownership order not settled');
+      }
+      orders = orders.filter((candidate) => candidate.orderId !== String(orderId));
+    },
     pendingEvents() { calls.push('pending'); return structuredClone(events); },
     markReplacementConfirmed(eventId, replacementOrderId) {
       calls.push(`mark:${eventId}:${replacementOrderId}`);
@@ -181,6 +206,10 @@ function dependencies(overrides = {}) {
       return structuredClone(symbol === 'BTCUSDT' ? btcOrders : ethOrders);
     },
     async getOverview() { calls.push('account:overview'); return structuredClone(overview); },
+    async getAllFills() {
+      calls.push('account:fills');
+      return structuredClone(overrides.fills ?? []);
+    },
     async findUniqueOrderByClientId(_account, symbol, clientOrderId) {
       calls.push(`account:find:${symbol}`);
       const expected = decodeBytes32String(clientOrderId);
@@ -662,6 +691,39 @@ test('cancelAll cancels only adopted PopDEX orders and preserves manual orders',
   await assert.rejects(ex.cancelOrder(20000, manual.orderId), /不属于适配器/);
 });
 
+test('cancelAll durably settles its exact zero-fill cancellation before final reconciliation', async () => {
+  const robot = openOrder();
+  const clientOrderId = encodeBytes32String(robot.clientOid).toLowerCase();
+  const durable = {
+    orderId: robot.orderId,
+    clientOrderId,
+    marketId: 20000,
+    levelIndex: 0,
+    side: 'buy',
+    priceWad: parseUnits(robot.price, 18).toString(),
+    qtyWad: parseUnits(robot.qty, 18).toString(),
+    opening: true,
+    reduceOnly: false,
+    parentFillEventId: null,
+    state: 'OPEN',
+    filledQtyWad: '0',
+    fillIds: [],
+    terminalEvent: null,
+  };
+  const deps = dependencies({ btcOrders: [robot], ownershipOrders: [durable] });
+  const ex = createLiveAdapter(deps);
+  await ex.init();
+  await ex.recoverOwnedOrders({ marketId: 20000, reason: 'startup' });
+
+  assert.equal(await ex.cancelAll(20000), true);
+  assert.ok(deps.ownershipStore.calls.includes(`proof:${robot.orderId}:0`));
+  assert.deepEqual(deps.ownershipStore.listOrders()[0].cancelProof, {
+    orderId: robot.orderId,
+    clientOrderId,
+    filledQtyWad: '0',
+  });
+});
+
 test('cancelAll does not clear recovery facts while a target remains active after reconciliation', async () => {
   const robot = openOrder();
   const durable = {
@@ -780,6 +842,91 @@ function placeReceipt(record) {
     }],
   };
 }
+
+function confirmedCancelRecord(order, overrides = {}) {
+  return {
+    kind: 'cancel',
+    stage: 'CONFIRMED',
+    mainAccount: ACCOUNT,
+    agentAddress: AGENT,
+    symbol: 'BTCUSDT',
+    symbolId: '20000',
+    side: null,
+    price: null,
+    qty: null,
+    clientOrderId: order.clientOrderId,
+    intentId: null,
+    levelIndex: null,
+    opening: null,
+    reduceOnly: null,
+    parentFillEventId: null,
+    orderId: order.orderId,
+    closeOrderId: null,
+    positionId: null,
+    leverage: null,
+    closeClientOrderId: null,
+    txHash: `0x${'66'.repeat(32)}`,
+    outcome: null,
+    ...overrides,
+  };
+}
+
+function cancelReceipt(record) {
+  const event = POPDEX_ORDER_EVENT_INTERFACE.encodeEventLog(
+    POPDEX_ORDER_EVENT_INTERFACE.getEvent('OrderCancel'),
+    [ACCOUNT, record.orderId, record.clientOrderId, true, 0],
+  );
+  return {
+    transactionHash: record.txHash,
+    status: '0x1',
+    logs: [{
+      address: '0x0000000000000000000000000000000000001000',
+      data: event.data,
+      topics: event.topics,
+    }],
+  };
+}
+
+test('CONFIRMED cancel recovery settles durable ownership before clearing its journal', async () => {
+  const robot = openOrder();
+  const durable = {
+    orderId: robot.orderId,
+    clientOrderId: encodeBytes32String(robot.clientOid).toLowerCase(),
+    marketId: 20000,
+    levelIndex: 0,
+    side: 'buy',
+    priceWad: parseUnits(robot.price, 18).toString(),
+    qtyWad: parseUnits(robot.qty, 18).toString(),
+    opening: true,
+    reduceOnly: false,
+    parentFillEventId: null,
+    state: 'OPEN',
+    filledQtyWad: '0',
+    fillIds: [],
+    terminalEvent: null,
+  };
+  const record = confirmedCancelRecord(durable);
+  const journal = memoryJournal(record);
+  const deps = dependencies({
+    journal,
+    ownershipOrders: [durable],
+    receipt: cancelReceipt(record),
+    btcOrders: [],
+    fills: [],
+    positions: [],
+  });
+  const ex = createLiveAdapter(deps);
+
+  await ex.reconnect();
+  assert.deepEqual(deps.ownershipStore.listOrders()[0].cancelProof, {
+    orderId: durable.orderId,
+    clientOrderId: durable.clientOrderId,
+    filledQtyWad: '0',
+  });
+  assert.equal(journal.load(), null);
+  assert.ok(deps.calls.includes('rpc:receipt'));
+  assert.equal(deps.broadcastCalls, 0);
+});
 
 test('BROADCAST place recovery confirms official facts and never broadcasts again', async () => {
   const record = broadcastPlaceRecord();

@@ -212,3 +212,31 @@ test('partial reconciliation persists exact fill IDs for restart deduplication',
   assert.equal(store.listOrders()[0].filledQtyWad, '80');
   assert.deepEqual(store.listOrders()[0].fillIds, ['7']);
 });
+
+test('exact cancellation proof is durable idempotent and cannot be overwritten', () => {
+  const store = createStore();
+  store.upsertOrder(ownedOrder());
+  const proof = {
+    orderId: '123',
+    clientOrderId: CLIENT_ID,
+    filledQtyWad: '0',
+  };
+
+  store.recordCancelProof('123', proof);
+  store.recordCancelProof('123', proof);
+  assert.deepEqual(store.listOrders()[0].cancelProof, proof);
+  assert.throws(() => store.recordCancelProof('123', {
+    ...proof,
+    filledQtyWad: '1',
+  }), /撤单证明.*(?:冲突|不匹配)/);
+});
+
+test('legacy ownership orders load with a null cancellation proof', () => {
+  const seed = createStore();
+  seed.upsertOrder(ownedOrder());
+  const legacy = seed.load();
+  delete legacy.orders[0].cancelProof;
+
+  const loaded = createStore(memoryFs(legacy)).load();
+  assert.equal(loaded.orders[0].cancelProof, null);
+});
