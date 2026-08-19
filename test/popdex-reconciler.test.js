@@ -234,6 +234,41 @@ test('opening fills require a confirmed long position of sufficient size', async
   );
 });
 
+test('only an exact settled exposure proof permits a completed suppressed opening to be flat', async () => {
+  const one = ownedOrder('1');
+  const completed = chainOrder(one, {
+    filledQtyWad: QTY, remainingQtyWad: '0', cancelledQtyWad: '0',
+  });
+  const target = fixture({
+    owned: [one], completed: [completed], fills: [fill(one)], positions: [position()],
+  });
+
+  await target.reconciler.reconcile({ reason: 'stop', suppressRequote: true });
+  const [pending] = target.store.pendingEvents();
+  target.store.completeSuppressedEvent(pending.fillEventId);
+  target.readRpc.getAllOpenPositions = async () => [];
+
+  await assert.rejects(
+    target.reconciler.reconcile({ reason: 'probe-stop-final', suppressRequote: true }),
+    (error) => error.code === 'POPDEX_POSITION_MISMATCH',
+  );
+
+  const plan = target.store.planFlatExposureSettlement(QTY);
+  target.store.recordFlatExposureSettlement(plan, {
+    closeOrderId: '456',
+    closeClientOrderId: clientId('c'),
+    closeTxHash: `0x${'34'.repeat(32)}`,
+    positionId: '88',
+    closeQtyWad: QTY,
+    reason: 'stop-close',
+  });
+  const result = await target.reconciler.reconcile({ reason: 'probe-stop-final' });
+  assert.equal(result.status, 'READY');
+  assert.equal(result.diagnostics.settledExposureEvents, 1);
+  assert.equal(result.diagnostics.requiredLongQtyWad, '0');
+  assert.equal(result.diagnostics.actualLongQtyWad, '0');
+});
+
 test('concurrent reconciliation calls share one complete read round', async () => {
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
