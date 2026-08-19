@@ -1,12 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { RisexPrivateStream } from '../src/exchange/rs/private-stream.js';
+import { isTransientNetworkError } from '../src/exchange/rs/error-details.js';
 
 const ACCOUNT = '0x0000000000000000000000000000000000000001';
 const SIGNER = '0x0000000000000000000000000000000000000002';
 const SIGNER_KEY = `0x${'11'.repeat(32)}`;
 const API = 'https://api.rise.trade';
 const WS = 'wss://api.rise.trade/ws/';
+
+test('RISEx transient network classification follows nested causes but rejects HTTP failures', () => {
+  const socketError = Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' });
+  const fetchError = new TypeError('fetch failed', { cause: socketError });
+
+  assert.equal(isTransientNetworkError(fetchError), true);
+  assert.equal(isTransientNetworkError(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' })), true);
+  assert.equal(isTransientNetworkError(Object.assign(new Error('aborted'), { name: 'AbortError' })), true);
+  assert.equal(isTransientNetworkError(new Error('RISEx GET /v1/auth/nonce 失败：HTTP 403。')), false);
+  assert.equal(isTransientNetworkError(new Error('RISEx auth_v2 EIP-712 domain 名称或版本不匹配。')), false);
+});
 
 class FakeSocket {
   static instances = [];
@@ -236,6 +248,49 @@ test('disconnect emits state and schedules exponential reconnect unless stopped'
   assert.equal(harness.scheduled.length, before);
 });
 
+test('runtime signer-check fetch failure reconnects without fatal and later authenticates', async () => {
+  let failSignerCheck = false;
+  const logs = [];
+  const harness = makeHarness({
+    isSignerRegistered: async () => {
+      if (!failSignerCheck) return true;
+      const socketError = Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' });
+      throw new TypeError('fetch failed', { cause: socketError });
+    },
+    logger: { log() {}, error(message) { logs.push(message); } },
+  });
+  let fatals = 0;
+  harness.stream.on('fatal', () => { fatals += 1; });
+
+  const firstSocket = await openAndAuthenticate(harness);
+  firstSocket.emit('close', { code: 1006, reason: 'network' });
+  failSignerCheck = true;
+
+  const failedRetry = harness.scheduled.at(-1).fn();
+  const failedConnect = harness.stream._connectPromise;
+  const failedSocket = FakeSocket.instances.at(-1);
+  failedSocket.emit('open');
+  await assert.rejects(failedConnect, /fetch failed/);
+  await failedRetry;
+  await waitFor(() => harness.scheduled.length >= 2);
+
+  assert.equal(fatals, 0);
+  assert.equal(harness.stream.authenticated, false);
+  assert.match(logs.join('\n'), /临时认证错误/);
+  assert.match(logs.join('\n'), /UND_ERR_SOCKET/);
+
+  failSignerCheck = false;
+  const recoveredRetry = harness.scheduled.at(-1).fn();
+  const recoveredSocket = FakeSocket.instances.at(-1);
+  recoveredSocket.emit('open');
+  await waitFor(() => recoveredSocket.sent.length === 1);
+  recoveredSocket.message({ method: 'auth_v2', status: 'success' });
+  await recoveredRetry;
+
+  assert.equal(harness.stream.authenticated, true);
+  assert.equal(fatals, 0);
+});
+
 test('private stream connect timeout rejects and closes the socket', async () => {
   const deadlines = [];
   const harness = makeHarness({
@@ -243,13 +298,40 @@ test('private stream connect timeout rejects and closes the socket', async () =>
     setDeadline: (fn, ms) => { deadlines.push({ fn, ms }); return deadlines.length; },
     clearDeadline() {},
   });
+  let initialFatal = null;
+  harness.stream.once('fatal', (error) => { initialFatal = error; });
   const connecting = harness.stream.connect();
   const deadline = deadlines.find((entry) => entry.ms === 20);
   assert.ok(deadline, 'connect deadline was not scheduled');
   deadline.fn();
 
   await assert.rejects(connecting, /认证 20ms 超时/);
+  assert.match(initialFatal?.message || '', /认证 20ms 超时/);
   assert.equal(FakeSocket.instances[0].readyState, 3);
+});
+
+test('runtime authentication timeout reconnects while initial timeout remains fatal', async () => {
+  const deadlines = [];
+  const harness = makeHarness({
+    connectTimeoutMs: 20,
+    setDeadline: (fn, ms) => { deadlines.push({ fn, ms }); return deadlines.length; },
+    clearDeadline() {},
+  });
+  let fatals = 0;
+  harness.stream.on('fatal', () => { fatals += 1; });
+  const firstSocket = await openAndAuthenticate(harness);
+  firstSocket.emit('close', { code: 1006, reason: 'network' });
+
+  const reconnecting = harness.scheduled.at(-1).fn();
+  const runtimeConnect = harness.stream._connectPromise;
+  const runtimeDeadline = deadlines.at(-1);
+  runtimeDeadline.fn();
+  await assert.rejects(runtimeConnect, /认证 20ms 超时/);
+  await reconnecting;
+  await waitFor(() => harness.scheduled.length >= 2);
+
+  assert.equal(fatals, 0);
+  assert.equal(harness.stream.authenticated, false);
 });
 
 test('private stream order snapshot timeout removes its waiter', async () => {

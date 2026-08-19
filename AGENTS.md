@@ -25,6 +25,7 @@
 - PopDEX 普通网格未来仍固定使用 `LIMIT + GTC`；本次 `MARKET + Sell + ReduceOnly + Net + 3%` 编码只允许第 5 阶段验收、用户明确执行的停止清仓或另行批准的紧急清仓，禁止用于初始网格和成交后的反向补单。
 - PopDEX `/overview` 只用于账户概览，持仓事实必须从订单预编译合约 `0x0000000000000000000000000000000000001000` 的只读方法 `getOpenPositionsByAccount` 获取，禁止猜测 overview 内含 `positions`。
 - RISEx 私有 Orders/Fills WebSocket 与 REST 对账共同构成订单、成交和持仓的事实来源。
+- RISEx 已成功认证后的私有流自动重连若遇到可证明的临时网络错误，必须保持 `RECONCILING`、禁止新增风险写入并按 1–30 秒指数退避持续重试；只有完成新的 REST/WS 所有权对账才可恢复 `READY`。初次启动、私有验证、人工重建客户端及 signer/签名/domain/nonce/schema/身份冲突仍须 fail-fast 或进入 `HALTED`，不得把 HTTP 拒绝或确定性错误伪装成网络抖动。
 - RISEx Orders WebSocket、订单历史和单笔订单接口的价量字段按当前主网人类可读十进制字符串解析；开放订单仍按 ticks/steps，仓位仍按已验证的 WAD 结构，禁止按字符串长度猜单位。
 - RISEx Orders/Fills WebSocket 游标优先使用 `block_timestamp`，其次使用服务端 `timestamp`；顶层时间缺失或为空时才使用订单 `created_at` / 成交 `time`，所有候选缺失或非法必须进入 `HALTED`，禁止填 `0` 或本地时间。
 - RISEx 持仓缓存、杠杆回读和平仓确认统一使用 `/v1/positions` 全持仓接口；禁止把 `/v1/account/position` 的单市场返回交给全持仓 WAD 解析器。

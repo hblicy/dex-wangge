@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { Wallet, isAddress } from 'ethers';
-import { describeError } from './error-details.js';
+import { describeError, isTransientNetworkError } from './error-details.js';
 import { WebSocket as UndiciWebSocket } from 'undici';
 import { compareRisexCursor, parseFillEnvelope, parseOrderEnvelope } from './normalize.js';
 
@@ -88,6 +88,7 @@ export class RisexPrivateStream extends EventEmitter {
     this._orderSnapshotSeen = false;
     this._snapshotWaiters = [];
     this.authenticated = false;
+    this._everAuthenticated = false;
   }
 
   async connect() {
@@ -143,6 +144,7 @@ export class RisexPrivateStream extends EventEmitter {
   stop() {
     this._stopped = true;
     this.authenticated = false;
+    this._everAuthenticated = false;
     if (this._reconnectTimer != null) {
       this._clearTimer(this._reconnectTimer);
       this._reconnectTimer = null;
@@ -158,7 +160,7 @@ export class RisexPrivateStream extends EventEmitter {
   _bindSocket(socket) {
     socket.addEventListener('open', () => {
       this._logger.log?.('[RISEx WS] 已连接，开始 auth_v2。');
-      this._authenticate().catch((error) => this._fatal(error));
+      this._authenticate().catch((error) => this._handleConnectionFailure(error));
     });
     socket.addEventListener('message', (event) => this._handleMessage(event));
     socket.addEventListener('error', (event) => {
@@ -320,6 +322,7 @@ export class RisexPrivateStream extends EventEmitter {
   _authSucceeded() {
     if (this.authenticated) return;
     this.authenticated = true;
+    this._everAuthenticated = true;
     this._reconnectDelay = 1000;
     this._send({ method: 'subscribe', params: { channel: 'orders', market_ids: this.marketIds, makers: [this.account] } });
     this._send({ method: 'subscribe', params: { channel: 'fills', market_ids: this.marketIds } });
@@ -377,6 +380,22 @@ export class RisexPrivateStream extends EventEmitter {
     }, delay);
   }
 
+  _handleConnectionFailure(error) {
+    const normalized = error instanceof Error ? error : new Error(String(error));
+    if (!this._everAuthenticated || !isTransientNetworkError(normalized)) {
+      this._fatal(normalized);
+      return;
+    }
+    this._logger.error?.(`[RISEx WS] 临时认证错误：${describeError(normalized)}`);
+    this.authenticated = false;
+    this._rejectSnapshotWaiters(normalized);
+    this._rejectConnect(normalized);
+    const socket = this._socket;
+    this._socket = null;
+    socket?.close?.();
+    this._scheduleReconnect();
+  }
+
   _fatal(error) {
     const normalized = error instanceof Error ? error : new Error(String(error));
     this._logger.error?.(`[RISEx WS] 严重错误：${normalized.message}`);
@@ -428,7 +447,9 @@ export class RisexPrivateStream extends EventEmitter {
     this._clearConnectDeadline();
     this._connectDeadline = this._setDeadline(() => {
       this._connectDeadline = null;
-      this._fatal(new Error(`RISEx 私有 WebSocket 认证 ${this._connectTimeoutMs}ms 超时。`));
+      this._handleConnectionFailure(
+        new Error(`RISEx 私有 WebSocket 认证 ${this._connectTimeoutMs}ms 超时。`),
+      );
     }, this._connectTimeoutMs);
   }
 
