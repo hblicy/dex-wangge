@@ -602,6 +602,7 @@ test('manual flat archive failure rolls back every recovery fact', async (t) => 
     writeFileSync: fs.writeFileSync.bind(fs),
     chmodSync: fs.chmodSync.bind(fs),
     existsSync: fs.existsSync.bind(fs),
+    statSync: fs.statSync.bind(fs),
     unlinkSync: fs.unlinkSync.bind(fs),
     renameSync(source, destination) {
       if (String(destination).includes('.manual-flat-') && ++archiveMoves === 2) {
