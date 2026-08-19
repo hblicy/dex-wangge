@@ -8,6 +8,7 @@ import test from 'node:test';
 import {
   buildBtcLongThreeGridPlan,
   parseGridProbeArgs,
+  printManualFlatRecoveryResult,
   runGridProbe,
 } from '../src/exchange/px/grid-probe.js';
 
@@ -183,6 +184,65 @@ function writeManualCancelIncident(files, orderId = '244656875029659648') {
   }), { mode: 0o600 });
 }
 
+function writeManualFlatIncident(files, orderId = '245591159265558528') {
+  const mainAccount = '0x1111111111111111111111111111111111111111';
+  const fillId = '245614705081581571';
+  fs.writeFileSync(files.state, JSON.stringify({
+    version: 1,
+    mainAccount,
+    snapshot: {
+      running: true,
+      active: [],
+      processedFillEventIds: [],
+    },
+    updatedAt: '2026-08-19T08:00:00.000Z',
+  }), { mode: 0o600 });
+  fs.writeFileSync(files.ownership, JSON.stringify({
+    version: 1,
+    mainAccount,
+    symbol: 'BTCUSDT',
+    symbolId: '20000',
+    orders: [{
+      orderId,
+      clientOrderId: `0x${'22'.repeat(32)}`,
+      marketId: 20000,
+      levelIndex: 0,
+      side: 'buy',
+      priceWad: '64302000000000000000000',
+      qtyWad: '200000000000000',
+      opening: true,
+      reduceOnly: false,
+      parentFillEventId: null,
+      state: 'FILLED',
+      filledQtyWad: '200000000000000',
+      fillIds: [fillId],
+      terminalEvent: {
+        fillEventId: `px-fill-${'15'.repeat(32)}`,
+        stage: 'EVENT_PENDING',
+        terminalState: 'FILLED',
+        filledQtyWad: '200000000000000',
+        priceWad: '64302000000000000000000',
+        fillIds: [fillId],
+        suppressRequote: false,
+        replacementOrderId: null,
+      },
+    }],
+    updatedAt: '2026-08-19T08:00:00.000Z',
+  }), { mode: 0o600 });
+}
+
+function manualFlatFill(overrides = {}) {
+  return {
+    fillId: '245614705081581571',
+    orderId: '245591159265558528',
+    symbol: 'BTCUSDT',
+    side: 'Buy',
+    execQty: '0.0002',
+    execPrice: '64302',
+    ...overrides,
+  };
+}
+
 test('grid probe defaults to read-only preflight', async () => {
   const result = await runGridProbe({
     argv: [],
@@ -273,6 +333,7 @@ test('argument parser keeps resume exclusive from a new mainnet start', () => {
     confirmMainnetGrid: false,
     resume: false,
     manualCancelOrderId: null,
+    manualFlatOrderId: null,
   });
   assert.throws(
     () => parseGridProbeArgs(['--resume', '--confirm-mainnet-grid']),
@@ -287,6 +348,19 @@ test('argument parser keeps resume exclusive from a new mainnet start', () => {
   assert.throws(
     () => parseGridProbeArgs(['--resume', '--confirm-manual-cancel-order', '244656875029659648']),
     /互斥/,
+  );
+  const flatOrderId = '245591159265558528';
+  assert.equal(
+    parseGridProbeArgs(['--confirm-manual-flat-order', flatOrderId]).manualFlatOrderId,
+    flatOrderId,
+  );
+  assert.throws(
+    () => parseGridProbeArgs(['--resume', '--confirm-manual-flat-order', flatOrderId]),
+    /confirm-manual-flat-order.*互斥/,
+  );
+  assert.throws(
+    () => parseGridProbeArgs(['--confirm-manual-flat-order', '0']),
+    /必须大于 0/,
   );
 });
 
@@ -332,6 +406,159 @@ test('manual cancel recovery rejects mismatched identity or any fill/open exposu
       assert.equal(fs.existsSync(files.ownership), true);
     });
   }
+});
+
+test('manual flat recovery archives the exact filled incident without writes', async (t) => {
+  const files = temporaryFiles(t);
+  const orderId = '245591159265558528';
+  writeManualFlatIncident(files, orderId);
+  const result = await runGridProbe({
+    argv: ['--confirm-manual-flat-order', orderId],
+    deps: {
+      preflight: fakePreflight({ fills: [manualFlatFill()] }),
+      files,
+      now: () => Date.parse('2026-08-19T08:00:00.000Z'),
+      processKill() { const error = new Error('missing'); error.code = 'ESRCH'; throw error; },
+    },
+  });
+  assert.deepEqual(
+    { mode: result.mode, orderId: result.orderId, writes: result.writes },
+    { mode: 'manual-flat-recovered', orderId, writes: 0 },
+  );
+  assert.equal(fs.existsSync(files.state), false);
+  assert.equal(fs.existsSync(files.ownership), false);
+  assert.equal(result.archivedFiles.length, 2);
+  for (const file of result.archivedFiles) {
+    assert.match(file, /\.manual-flat-/);
+    assert.equal(fs.existsSync(file), true);
+  }
+});
+
+test('manual flat recovery CLI output identifies zero writes and every archive', () => {
+  const output = [];
+  printManualFlatRecoveryResult({
+    mode: 'manual-flat-recovered',
+    orderId: '245591159265558528',
+    writes: 0,
+    archivedFiles: ['/tmp/state.manual-flat.bak', '/tmp/ownership.manual-flat.bak'],
+  }, (message) => output.push(String(message)));
+  assert.deepEqual(output, [
+    'PopDEX 人工平仓恢复完成：orderId=245591159265558528，链上写入=0。',
+    '已归档：/tmp/state.manual-flat.bak',
+    '已归档：/tmp/ownership.manual-flat.bak',
+  ]);
+});
+
+test('manual flat recovery rejects official exposure or mismatched fills and preserves facts', async (t) => {
+  const orderId = '245591159265558528';
+  for (const [label, requestedId, overrides, message] of [
+    ['wrong identity', '245591159265558529', { fills: [manualFlatFill()] }, /订单号与本地事实不一致/],
+    ['open order', orderId, { fills: [manualFlatFill()], openOrders: [{ orderId: '9' }] }, /仍有活动挂单/],
+    ['chain active', orderId, { fills: [manualFlatFill()], chainActiveOrders: [{ orderId: '9' }] }, /仍有活动挂单/],
+    ['position', orderId, { fills: [manualFlatFill()], positions: [{ symbolId: '20000' }] }, /仍有持仓/],
+    ['missing fill', orderId, { fills: [] }, /官方成交.*不匹配/],
+    ['fill id conflict', orderId, { fills: [manualFlatFill({ fillId: '245614705081581572' })] }, /fill ID.*不匹配/],
+    ['fill quantity conflict', orderId, { fills: [manualFlatFill({ execQty: '0.0001' })] }, /成交数量.*不匹配/],
+  ]) {
+    await t.test(label, async (t2) => {
+      const files = temporaryFiles(t2);
+      writeManualFlatIncident(files, orderId);
+      await assert.rejects(runGridProbe({
+        argv: ['--confirm-manual-flat-order', requestedId],
+        deps: { preflight: fakePreflight(overrides), files },
+      }), message);
+      assert.equal(fs.existsSync(files.state), true);
+      assert.equal(fs.existsSync(files.ownership), true);
+    });
+  }
+});
+
+test('manual flat recovery rejects unsafe local facts and preserves files', async (t) => {
+  const orderId = '245591159265558528';
+  for (const [label, mutate, message] of [
+    ['stopped snapshot', (files) => {
+      const record = JSON.parse(fs.readFileSync(files.state, 'utf8'));
+      record.snapshot.running = false;
+      fs.writeFileSync(files.state, JSON.stringify(record), { mode: 0o600 });
+    }, /running.*0 active.*0 已处理成交事件/],
+    ['active snapshot', (files) => {
+      const record = JSON.parse(fs.readFileSync(files.state, 'utf8'));
+      record.snapshot.active = [{ orderId }];
+      fs.writeFileSync(files.state, JSON.stringify(record), { mode: 0o600 });
+    }, /running.*0 active.*0 已处理成交事件/],
+    ['processed fill snapshot', (files) => {
+      const record = JSON.parse(fs.readFileSync(files.state, 'utf8'));
+      record.snapshot.processedFillEventIds = [`px-fill-${'15'.repeat(32)}`];
+      fs.writeFileSync(files.state, JSON.stringify(record), { mode: 0o600 });
+    }, /running.*0 active.*0 已处理成交事件/],
+    ['operation journal', (files) => {
+      fs.writeFileSync(files.operation, JSON.stringify({ stage: 'BROADCAST' }), { mode: 0o600 });
+    }, /未完成写操作/],
+    ['partial fill', (files) => {
+      const record = JSON.parse(fs.readFileSync(files.ownership, 'utf8'));
+      record.orders[0].state = 'PARTIAL';
+      record.orders[0].filledQtyWad = '100000000000000';
+      record.orders[0].terminalEvent = null;
+      fs.writeFileSync(files.ownership, JSON.stringify(record), { mode: 0o600 });
+    }, /完整开仓成交/],
+    ['suppressed event', (files) => {
+      const record = JSON.parse(fs.readFileSync(files.ownership, 'utf8'));
+      record.orders[0].terminalEvent.suppressRequote = true;
+      fs.writeFileSync(files.ownership, JSON.stringify(record), { mode: 0o600 });
+    }, /待补单成交事件/],
+    ['replacement recorded', (files) => {
+      const record = JSON.parse(fs.readFileSync(files.ownership, 'utf8'));
+      record.orders[0].terminalEvent.stage = 'REPLACEMENT_CONFIRMED';
+      record.orders[0].terminalEvent.replacementOrderId = '245591159265558529';
+      fs.writeFileSync(files.ownership, JSON.stringify(record), { mode: 0o600 });
+    }, /待补单成交事件/],
+  ]) {
+    await t.test(label, async (t2) => {
+      const files = temporaryFiles(t2);
+      writeManualFlatIncident(files, orderId);
+      mutate(files);
+      await assert.rejects(runGridProbe({
+        argv: ['--confirm-manual-flat-order', orderId],
+        deps: { preflight: fakePreflight({ fills: [manualFlatFill()] }), files },
+      }), message);
+      assert.equal(fs.existsSync(files.state), true);
+      assert.equal(fs.existsSync(files.ownership), true);
+    });
+  }
+});
+
+test('manual flat archive failure rolls back every recovery fact', async (t) => {
+  const files = temporaryFiles(t);
+  const orderId = '245591159265558528';
+  writeManualFlatIncident(files, orderId);
+  let archiveMoves = 0;
+  const fsImpl = {
+    readFileSync: fs.readFileSync.bind(fs),
+    writeFileSync: fs.writeFileSync.bind(fs),
+    chmodSync: fs.chmodSync.bind(fs),
+    existsSync: fs.existsSync.bind(fs),
+    unlinkSync: fs.unlinkSync.bind(fs),
+    renameSync(source, destination) {
+      if (String(destination).includes('.manual-flat-') && ++archiveMoves === 2) {
+        const error = new Error('archive failed');
+        error.code = 'EIO';
+        throw error;
+      }
+      fs.renameSync(source, destination);
+    },
+  };
+  await assert.rejects(runGridProbe({
+    argv: ['--confirm-manual-flat-order', orderId],
+    deps: {
+      preflight: fakePreflight({ fills: [manualFlatFill()] }),
+      files,
+      fsImpl,
+      now: () => Date.parse('2026-08-19T08:00:00.000Z'),
+    },
+  }), /归档人工平仓事实失败/);
+  assert.equal(fs.existsSync(files.state), true);
+  assert.equal(fs.existsSync(files.ownership), true);
+  assert.equal(fs.readdirSync(path.dirname(files.state)).some((name) => name.includes('.manual-flat-')), false);
 });
 
 test('mainnet probe handles one fill, offline resume, reconnect and verified stop', async (t) => {
