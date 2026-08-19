@@ -204,6 +204,7 @@ export class PopdexReconciler {
     const results = new Map();
     const transient = new Set();
     for (const order of owned) {
+      const effectiveSuppressRequote = order.terminalEvent?.suppressRequote ?? suppressRequote;
       const restActive = exactOfficial(restOpen, order, 'REST open');
       const activeOnChain = exactOfficial(chainActive, order, 'chain active');
       const restCompleted = exactOfficial(terminalHistory, order, 'REST history terminal');
@@ -224,13 +225,13 @@ export class PopdexReconciler {
         completed: terminal,
         fills,
         cancelProof: terminal === null ? order.cancelProof : null,
-        suppressRequote,
+        suppressRequote: effectiveSuppressRequote,
       });
       if (terminal !== null && order.cancelProof !== null) {
         const proofResult = reconcileOwnedOrder(order, {
           fills,
           cancelProof: order.cancelProof,
-          suppressRequote,
+          suppressRequote: effectiveSuppressRequote,
         });
         if (!sameResult(primary, proofResult)) {
           throw fault('POPDEX_IDENTITY_CONFLICT', `orderId=${order.orderId} 撤单证明与官方终态冲突。`);
@@ -240,7 +241,7 @@ export class PopdexReconciler {
         const cross = reconcileOwnedOrder(order, {
           completed: chainCompleted,
           fills,
-          suppressRequote,
+          suppressRequote: effectiveSuppressRequote,
         });
         if (!sameResult(primary, cross)) transient.add(order.orderId);
       }
