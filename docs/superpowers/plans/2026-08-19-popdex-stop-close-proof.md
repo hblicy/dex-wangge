@@ -406,4 +406,3 @@ Confirm there are no `.env`, state, ownership, journal, private key, unrelated f
 git add docs/superpowers/specs/2026-08-19-popdex-stop-close-proof-design.md docs/superpowers/plans/2026-08-19-popdex-stop-close-proof.md
 git commit -m "文档：完善PopDEX停止平仓修复计划"
 ```
-
