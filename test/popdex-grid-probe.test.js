@@ -273,6 +273,7 @@ test('argument parser keeps resume exclusive from a new mainnet start', () => {
     confirmMainnetGrid: false,
     resume: false,
     manualCancelOrderId: null,
+    manualFlatOrderId: null,
   });
   assert.throws(
     () => parseGridProbeArgs(['--resume', '--confirm-mainnet-grid']),
@@ -287,6 +288,19 @@ test('argument parser keeps resume exclusive from a new mainnet start', () => {
   assert.throws(
     () => parseGridProbeArgs(['--resume', '--confirm-manual-cancel-order', '244656875029659648']),
     /互斥/,
+  );
+  const flatOrderId = '245591159265558528';
+  assert.equal(
+    parseGridProbeArgs(['--confirm-manual-flat-order', flatOrderId]).manualFlatOrderId,
+    flatOrderId,
+  );
+  assert.throws(
+    () => parseGridProbeArgs(['--resume', '--confirm-manual-flat-order', flatOrderId]),
+    /confirm-manual-flat-order.*互斥/,
+  );
+  assert.throws(
+    () => parseGridProbeArgs(['--confirm-manual-flat-order', '0']),
+    /必须大于 0/,
   );
 });
 

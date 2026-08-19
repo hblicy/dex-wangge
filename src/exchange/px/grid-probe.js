@@ -21,6 +21,7 @@ const VALUE_FLAGS = Object.freeze([
   '--lower', '--upper', '--size-base', '--mode', '--grids', '--leverage',
 ]);
 const MANUAL_CANCEL_FLAG = '--confirm-manual-cancel-order';
+const MANUAL_FLAT_FLAG = '--confirm-manual-flat-order';
 
 function exactNumber(value, field, { integer = false } = {}) {
   const number = Number(value);
@@ -37,6 +38,7 @@ export function parseGridProbeArgs(argv) {
   let confirmMainnetGrid = false;
   let resume = false;
   let manualCancelOrderId = null;
+  let manualFlatOrderId = null;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (VALUE_FLAGS.includes(arg)) {
@@ -64,6 +66,20 @@ export function parseGridProbeArgs(argv) {
       index += 1;
       continue;
     }
+    if (arg === MANUAL_FLAT_FLAG) {
+      if (seen.has(arg)) throw new Error(`PopDEX grid-probe 重复参数 ${arg}。`);
+      const value = argv[index + 1];
+      if (typeof value !== 'string' || value.length === 0 || value.startsWith('--')) {
+        throw new Error(`PopDEX grid-probe 参数 ${arg} 缺少订单号。`);
+      }
+      manualFlatOrderId = strictIntegerString(value, 'grid-probe 人工平仓 orderId');
+      if (BigInt(manualFlatOrderId) <= 0n) {
+        throw new Error('PopDEX grid-probe 人工平仓 orderId 必须大于 0。');
+      }
+      seen.add(arg);
+      index += 1;
+      continue;
+    }
     if (arg === '--confirm-mainnet-grid' || arg === '--resume') {
       if (seen.has(arg)) throw new Error(`PopDEX grid-probe 重复参数 ${arg}。`);
       seen.add(arg);
@@ -77,8 +93,14 @@ export function parseGridProbeArgs(argv) {
     throw new Error('PopDEX grid-probe --resume 与新网格参数及 --confirm-mainnet-grid 互斥。');
   }
   if (manualCancelOrderId !== null
-      && (resume || confirmMainnetGrid || VALUE_FLAGS.some((flag) => values.get(flag) !== null))) {
+      && (manualFlatOrderId !== null || resume || confirmMainnetGrid
+        || VALUE_FLAGS.some((flag) => values.get(flag) !== null))) {
     throw new Error(`PopDEX grid-probe ${MANUAL_CANCEL_FLAG} 与其它运行参数互斥。`);
+  }
+  if (manualFlatOrderId !== null
+      && (manualCancelOrderId !== null || resume || confirmMainnetGrid
+        || VALUE_FLAGS.some((flag) => values.get(flag) !== null))) {
+    throw new Error(`PopDEX grid-probe ${MANUAL_FLAT_FLAG} 与其它运行参数互斥。`);
   }
   return {
     lower: values.get('--lower') === null ? null : exactNumber(values.get('--lower'), '--lower'),
@@ -93,6 +115,7 @@ export function parseGridProbeArgs(argv) {
     confirmMainnetGrid,
     resume,
     manualCancelOrderId,
+    manualFlatOrderId,
   };
 }
 
