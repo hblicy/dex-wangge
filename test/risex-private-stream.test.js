@@ -1,12 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { RisexPrivateStream } from '../src/exchange/rs/private-stream.js';
+import { isTransientNetworkError } from '../src/exchange/rs/error-details.js';
 
 const ACCOUNT = '0x0000000000000000000000000000000000000001';
 const SIGNER = '0x0000000000000000000000000000000000000002';
 const SIGNER_KEY = `0x${'11'.repeat(32)}`;
 const API = 'https://api.rise.trade';
 const WS = 'wss://api.rise.trade/ws/';
+
+test('RISEx transient network classification follows nested causes but rejects HTTP failures', () => {
+  const socketError = Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' });
+  const fetchError = new TypeError('fetch failed', { cause: socketError });
+
+  assert.equal(isTransientNetworkError(fetchError), true);
+  assert.equal(isTransientNetworkError(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' })), true);
+  assert.equal(isTransientNetworkError(Object.assign(new Error('aborted'), { name: 'AbortError' })), true);
+  assert.equal(isTransientNetworkError(new Error('RISEx GET /v1/auth/nonce 失败：HTTP 403。')), false);
+  assert.equal(isTransientNetworkError(new Error('RISEx auth_v2 EIP-712 domain 名称或版本不匹配。')), false);
+});
 
 class FakeSocket {
   static instances = [];
