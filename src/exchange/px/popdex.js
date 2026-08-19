@@ -487,6 +487,7 @@ export class PopdexExchange extends EventEmitter {
     this.refreshPromise = null;
     this.timer = null;
     this.ownedOrders = new Map();
+    this.ownedReconcileTail = Promise.resolve();
     this.writeTail = Promise.resolve();
     this.lastQueueError = null;
   }
@@ -1259,7 +1260,13 @@ export class PopdexExchange extends EventEmitter {
     });
   }
 
-  async #reconcileOwned(options) {
+  #reconcileOwned(options) {
+    const operation = this.ownedReconcileTail.then(() => this.#runOwnedReconcile(options));
+    this.ownedReconcileTail = operation.catch(() => {});
+    return operation;
+  }
+
+  async #runOwnedReconcile(options) {
     const marketId = this.#assertLiveWriteMarket(options?.marketId, '订单对账');
     const reason = options?.reason;
     const suppressRequote = options?.suppressRequote ?? false;
@@ -1267,7 +1274,16 @@ export class PopdexExchange extends EventEmitter {
       throw new Error('PopDEX owned reconcile reason 必须是非空字符串。');
     }
     try {
+      if (suppressRequote) {
+        const changedEvents = this.ownershipStore.suppressPendingEvents();
+        for (const fillEventId of changedEvents) this.releasedFillEvents.delete(fillEventId);
+      }
       const result = await this.reconciler.reconcile({ reason, suppressRequote });
+      const positions = exactPositions(result.positions, this.mainAccount, this.snapshot.tickers);
+      this.snapshot = { ...this.snapshot, positions };
+      this.realizedPnl = [...positions.values()]
+        .reduce((total, position) => total + position.realizedPnl, 0);
+      this.lastAccountOkAt = exactNow(this.now);
       for (const order of result.activeOrders) {
         const metadata = durableOrderMetadata(order);
         this.ownedOrders.set(metadata.orderId, metadata);

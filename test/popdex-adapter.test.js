@@ -167,6 +167,16 @@ function memoryOwnership(initialOrders = [], initialEvents = []) {
       if (!event?.suppressRequote) throw new Error('事件不是 suppression');
       events = events.filter((candidate) => candidate.fillEventId !== eventId);
     },
+    suppressPendingEvents() {
+      calls.push('suppress-pending');
+      const changed = [];
+      for (const event of events) {
+        if (event.stage !== 'EVENT_PENDING' || event.suppressRequote) continue;
+        event.suppressRequote = true;
+        changed.push(event.fillEventId);
+      }
+      return changed;
+    },
   };
 }
 
@@ -359,6 +369,123 @@ test('live init publishes one complete verified BTC and ETH snapshot', async () 
   assert.equal(ex.equity, 799.23);
   assert.equal(ex.balance, 799.23);
   assert.equal(await ex.getPrice(20000), 62900.5);
+});
+
+test('owned reconciliation publishes its verified position before a reduce-only replacement', async () => {
+  const deps = dependencies();
+  const ex = createLiveAdapter(deps);
+  await ex.init();
+  assert.equal(ex.getPosition(20000), null);
+
+  deps.setPositions([longPosition()]);
+  await ex.reconcileOwnedOrders({ marketId: 20000, reason: 'terminal-fill' });
+
+  assert.equal(ex.getPosition(20000)?.sizeBase, 0.0002);
+  const replacement = await ex.placeLimitOrder({
+    marketId: 20000,
+    side: 'sell',
+    price: 63000,
+    sizeBase: 0.0002,
+    reduceOnly: true,
+    levelIndex: 1,
+    opening: false,
+    intentId: 'replacement:verified-position',
+    parentFillEventId: `px-fill-${'ab'.repeat(32)}`,
+  });
+  assert.equal(replacement.reduceOnly, true);
+});
+
+test('stop suppression re-releases an already delivered pending fill exactly once', async () => {
+  const eventId = `px-fill-${'cd'.repeat(32)}`;
+  const pendingEvent = {
+    fillEventId: eventId,
+    stage: 'EVENT_PENDING',
+    terminalState: 'FILLED',
+    filledQtyWad: '200000000000000',
+    priceWad: '60000000000000000000000',
+    fillIds: ['9'],
+    suppressRequote: false,
+    replacementOrderId: null,
+    orderId: '123',
+    clientOrderId: encodeBytes32String('dw-bb-111111111111111111111111').toLowerCase(),
+    marketId: 20000,
+    levelIndex: 0,
+    side: 'buy',
+    opening: true,
+    reduceOnly: false,
+    parentFillEventId: null,
+  };
+  const deps = dependencies({ pendingEvents: [pendingEvent] });
+  const ex = createLiveAdapter(deps);
+  await ex.init();
+  const delivered = [];
+  ex.on('fill', (event) => delivered.push(event));
+
+  ex.releaseRecoveredEvents();
+  ex.releaseRecoveredEvents();
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].suppressRequote, false);
+
+  await ex.reconcileOwnedOrders({
+    marketId: 20000,
+    reason: 'cancel:stop',
+    suppressRequote: true,
+  });
+  ex.releaseRecoveredEvents();
+  ex.releaseRecoveredEvents();
+
+  assert.equal(delivered.length, 2);
+  assert.equal(delivered[1].fillEventId, eventId);
+  assert.equal(delivered[1].suppressRequote, true);
+});
+
+test('stop suppression waits for an in-flight periodic owned reconciliation', async () => {
+  const eventId = `px-fill-${'ef'.repeat(32)}`;
+  const pendingEvent = {
+    fillEventId: eventId,
+    stage: 'EVENT_PENDING',
+    terminalState: 'FILLED',
+    filledQtyWad: '200000000000000',
+    priceWad: '60000000000000000000000',
+    fillIds: ['9'],
+    suppressRequote: false,
+    replacementOrderId: null,
+    orderId: '123',
+    clientOrderId: encodeBytes32String('dw-bb-222222222222222222222222').toLowerCase(),
+    marketId: 20000,
+    levelIndex: 0,
+    side: 'buy',
+    opening: true,
+    reduceOnly: false,
+    parentFillEventId: null,
+  };
+  const deps = dependencies({ pendingEvents: [pendingEvent] });
+  const reconcileCalls = [];
+  let releasePeriodic;
+  const periodicGate = new Promise((resolve) => { releasePeriodic = resolve; });
+  deps.reconciler.reconcile = async (options) => {
+    reconcileCalls.push(options.reason);
+    if (options.reason === 'periodic') await periodicGate;
+    return {
+      status: 'READY', activeOrders: [], pendingEvents: deps.ownershipStore.pendingEvents(),
+      positions: [], diagnostics: { reason: options.reason },
+    };
+  };
+  const ex = createLiveAdapter(deps);
+  await ex.init();
+
+  const periodic = ex.reconcileOwnedOrders({ marketId: 20000, reason: 'periodic' });
+  await new Promise((resolve) => setImmediate(resolve));
+  const stopping = ex.reconcileOwnedOrders({
+    marketId: 20000, reason: 'cancel:stop', suppressRequote: true,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(reconcileCalls, ['periodic']);
+  releasePeriodic();
+  await Promise.all([periodic, stopping]);
+  assert.deepEqual(reconcileCalls, ['periodic', 'cancel:stop']);
+  assert.equal(deps.ownershipStore.pendingEvents()[0].suppressRequote, true);
 });
 
 test('failed refresh retains the previous snapshot and enters RECONCILING', async () => {

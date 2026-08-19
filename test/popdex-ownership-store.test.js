@@ -141,6 +141,25 @@ test('suppressed events complete without replacement and normal events cannot us
   assert.throws(() => normal.completeEvent(EVENT_ID), /尚未确认补单/);
 });
 
+test('stop explicitly suppresses a pending event without changing its exchange facts', () => {
+  const store = createStore();
+  store.upsertOrder(ownedOrder());
+  store.applyResult('123', terminalResult());
+
+  assert.deepEqual(store.suppressPendingEvents(), [EVENT_ID]);
+  const [event] = store.pendingEvents();
+  assert.equal(event.suppressRequote, true);
+  assert.equal(event.stage, 'EVENT_PENDING');
+  assert.equal(event.filledQtyWad, terminalResult().event.filledQtyWad);
+  assert.equal(event.priceWad, terminalResult().event.priceWad);
+  assert.deepEqual(event.fillIds, terminalResult().event.fillIds);
+
+  store.applyResult('123', terminalResult({
+    event: { ...terminalResult().event, suppressRequote: true },
+  }));
+  assert.equal(store.pendingEvents()[0].suppressRequote, true);
+});
+
 test('ownership store rejects schema drift duplicate identities and account mismatch', () => {
   const store = createStore();
   assert.throws(() => store.upsertOrder({ ...ownedOrder(), secret: 'x' }), /未知字段 secret/);

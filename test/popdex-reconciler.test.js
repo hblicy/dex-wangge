@@ -163,6 +163,23 @@ test('reconciler adopts exact active orders and queues one offline fill', async 
   assert.deepEqual(target.calls.sort(), ['active', 'completed', 'fills', 'history', 'positions', 'restOpen']);
 });
 
+test('reconciler preserves the durable stop suppression policy on later refreshes', async () => {
+  const one = ownedOrder('1');
+  const terminal = chainOrder(one, {
+    filledQtyWad: QTY, remainingQtyWad: '0', cancelledQtyWad: '0',
+  });
+  const target = fixture({
+    owned: [one], completed: [terminal], fills: [fill(one)], positions: [position()],
+  });
+
+  await target.reconciler.reconcile({ reason: 'stop', suppressRequote: true });
+  assert.equal(target.store.pendingEvents()[0].suppressRequote, true);
+
+  const refreshed = await target.reconciler.reconcile({ reason: 'refresh' });
+  assert.equal(refreshed.status, 'READY');
+  assert.equal(target.store.pendingEvents()[0].suppressRequote, true);
+});
+
 test('reconciler rejects external and duplicate official order identities', async () => {
   const external = ownedOrder('9');
   await assert.rejects(

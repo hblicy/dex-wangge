@@ -395,6 +395,19 @@ export class PopdexOwnershipStore {
       }));
   }
 
+  suppressPendingEvents() {
+    const changed = [];
+    this.#change((root) => {
+      for (const order of root.orders) {
+        const event = order.terminalEvent;
+        if (!event || event.stage !== 'EVENT_PENDING' || event.suppressRequote) continue;
+        event.suppressRequote = true;
+        changed.push(event.fillEventId);
+      }
+    });
+    return changed;
+  }
+
   #findEvent(root, eventId) {
     const id = fillEventId(eventId);
     const order = root.orders.find((item) => item.terminalEvent?.fillEventId === id);
