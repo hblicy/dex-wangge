@@ -3,11 +3,12 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { GridBot } from '../../bot.js';
 import { loadEnv, ROOT } from '../../config.js';
-import { strictAddress } from './normalize.js';
+import { strictAddress, strictIntegerString } from './normalize.js';
 import { POPDEX_EXPECTED_MARKETS } from './constants.js';
 import { PopdexPublicClient } from './public-client.js';
 import { PopdexAccountClient } from './account-client.js';
 import { PopdexRpcClient } from './rpc-client.js';
+import { PopdexOwnershipStore } from './ownership-store.js';
 import { createLiveExchange } from './index.js';
 
 const FILES = Object.freeze({
@@ -19,6 +20,7 @@ const FILES = Object.freeze({
 const VALUE_FLAGS = Object.freeze([
   '--lower', '--upper', '--size-base', '--mode', '--grids', '--leverage',
 ]);
+const MANUAL_CANCEL_FLAG = '--confirm-manual-cancel-order';
 
 function exactNumber(value, field, { integer = false } = {}) {
   const number = Number(value);
@@ -34,6 +36,7 @@ export function parseGridProbeArgs(argv) {
   const seen = new Set();
   let confirmMainnetGrid = false;
   let resume = false;
+  let manualCancelOrderId = null;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (VALUE_FLAGS.includes(arg)) {
@@ -44,6 +47,20 @@ export function parseGridProbeArgs(argv) {
       }
       seen.add(arg);
       values.set(arg, value);
+      index += 1;
+      continue;
+    }
+    if (arg === MANUAL_CANCEL_FLAG) {
+      if (seen.has(arg)) throw new Error(`PopDEX grid-probe 重复参数 ${arg}。`);
+      const value = argv[index + 1];
+      if (typeof value !== 'string' || value.length === 0 || value.startsWith('--')) {
+        throw new Error(`PopDEX grid-probe 参数 ${arg} 缺少订单号。`);
+      }
+      manualCancelOrderId = strictIntegerString(value, 'grid-probe 人工撤单 orderId');
+      if (BigInt(manualCancelOrderId) <= 0n) {
+        throw new Error('PopDEX grid-probe 人工撤单 orderId 必须大于 0。');
+      }
+      seen.add(arg);
       index += 1;
       continue;
     }
@@ -59,6 +76,10 @@ export function parseGridProbeArgs(argv) {
   if (resume && (confirmMainnetGrid || VALUE_FLAGS.some((flag) => values.get(flag) !== null))) {
     throw new Error('PopDEX grid-probe --resume 与新网格参数及 --confirm-mainnet-grid 互斥。');
   }
+  if (manualCancelOrderId !== null
+      && (resume || confirmMainnetGrid || VALUE_FLAGS.some((flag) => values.get(flag) !== null))) {
+    throw new Error(`PopDEX grid-probe ${MANUAL_CANCEL_FLAG} 与其它运行参数互斥。`);
+  }
   return {
     lower: values.get('--lower') === null ? null : exactNumber(values.get('--lower'), '--lower'),
     upper: values.get('--upper') === null ? null : exactNumber(values.get('--upper'), '--upper'),
@@ -71,6 +92,7 @@ export function parseGridProbeArgs(argv) {
       ? 1 : exactNumber(values.get('--leverage'), '--leverage', { integer: true }),
     confirmMainnetGrid,
     resume,
+    manualCancelOrderId,
   };
 }
 
@@ -149,25 +171,33 @@ async function defaultPreflight(env, deps) {
   const readRpc = deps.readRpc ?? new PopdexRpcClient();
   const markets = await publicClient.getMarkets();
   const market = exactMarket(markets);
-  const [ticker, openOrders, positions, overview] = await Promise.all([
+  const [ticker, openOrders, fills, chainActiveOrders, positions, overview] = await Promise.all([
     publicClient.getTicker('BTCUSDT'),
     accountClient.getAllOpenOrders(mainAccount, 'BTCUSDT'),
+    accountClient.getAllFills(mainAccount, 'BTCUSDT'),
+    readRpc.getAllActiveOrders(mainAccount),
     readRpc.getAllOpenPositions(mainAccount),
     accountClient.getOverview(mainAccount),
   ]);
   const mark = Number(ticker?.mark);
   exactNumber(mark, 'mark');
-  if (!Array.isArray(openOrders) || !Array.isArray(positions)) {
-    throw new Error('PopDEX grid-probe 官方订单或持仓快照不是数组。');
+  if (!Array.isArray(openOrders) || !Array.isArray(fills)
+      || !Array.isArray(chainActiveOrders) || !Array.isArray(positions)) {
+    throw new Error('PopDEX grid-probe 官方订单、成交或持仓快照不是数组。');
   }
   const btcPositions = positions.filter((position) => (
     String(position?.symbolId ?? position?.marketId) === '20000'
+  ));
+  const btcChainActiveOrders = chainActiveOrders.filter((order) => (
+    String(order?.symbolId ?? order?.marketId) === '20000'
   ));
   return {
     mainAccount,
     mark,
     market,
     openOrders,
+    fills,
+    chainActiveOrders: btcChainActiveOrders,
     positions: btcPositions,
     availableMargin: exactNumber(overview?.availableMargin, 'availableMargin'),
   };
@@ -260,6 +290,105 @@ function removeCompletedFiles(files, fsImpl) {
   for (const file of [files.state, files.ownership, files.operation]) unlinkExisting(file, fsImpl);
 }
 
+function archiveManualCancelFiles(files, fsImpl, now) {
+  const milliseconds = now();
+  if (!Number.isSafeInteger(milliseconds) || milliseconds < 0) {
+    throw new Error('PopDEX grid-probe now() 必须返回非负安全整数。');
+  }
+  const suffix = new Date(milliseconds).toISOString().replace(/[:.]/g, '-');
+  const entries = [files.state, files.ownership, files.operation]
+    .filter((file) => fsImpl.existsSync(file))
+    .map((file) => ({ file, archived: `${file}.manual-cancel-${suffix}.bak` }));
+  for (const { archived } of entries) {
+    if (fsImpl.existsSync(archived)) {
+      throw new Error(`PopDEX grid-probe 恢复备份已存在：${archived}。`);
+    }
+  }
+  const moved = [];
+  try {
+    for (const entry of entries) {
+      fsImpl.renameSync(entry.file, entry.archived);
+      moved.push(entry);
+    }
+  } catch (cause) {
+    for (const entry of moved.reverse()) {
+      fsImpl.renameSync(entry.archived, entry.file);
+    }
+    throw new Error(`PopDEX grid-probe 归档人工撤单事实失败：${cause?.message || cause}`, { cause });
+  }
+  return entries.map((entry) => entry.archived);
+}
+
+function validateManualCancelState({ files, fsImpl, preflight, orderId }) {
+  const record = readJson(files.state, fsImpl);
+  if (record?.version !== 1
+      || record.mainAccount?.toLowerCase() !== preflight.mainAccount.toLowerCase()) {
+    throw new Error('PopDEX grid-probe 人工撤单恢复的状态文件版本或账户不匹配。');
+  }
+  if (record.snapshot?.running !== false
+      || !Array.isArray(record.snapshot?.active)
+      || record.snapshot.active.length !== 0
+      || !Array.isArray(record.snapshot?.processedFillEventIds)
+      || record.snapshot.processedFillEventIds.length !== 0) {
+    throw new Error('PopDEX grid-probe 人工撤单恢复只允许 stopped、0 active、0 已处理成交事件的快照。');
+  }
+  if (readJson(files.operation, fsImpl) !== null) {
+    throw new Error('PopDEX grid-probe 仍有未完成写操作，拒绝人工撤单恢复。');
+  }
+  const ownershipStore = new PopdexOwnershipStore({
+    file: files.ownership,
+    mainAccount: preflight.mainAccount,
+    fsImpl,
+  });
+  const orders = ownershipStore.listOrders();
+  if (orders.length !== 1 || orders[0].orderId !== orderId) {
+    throw new Error('PopDEX grid-probe 人工确认的订单号与本地事实不一致。');
+  }
+  const owned = orders[0];
+  if (owned.state !== 'UNKNOWN_TERMINAL' || owned.filledQtyWad !== '0'
+      || owned.fillIds.length !== 0 || owned.terminalEvent !== null) {
+    throw new Error('PopDEX grid-probe 本地订单不是可人工确认的 UNKNOWN_TERMINAL 零成交状态。');
+  }
+  if (preflight.openOrders.length !== 0 || preflight.chainActiveOrders.length !== 0) {
+    throw new Error('PopDEX BTCUSDT 仍有活动挂单，拒绝人工撤单恢复。');
+  }
+  if (preflight.positions.length !== 0) {
+    throw new Error('PopDEX BTCUSDT 仍有持仓，拒绝人工撤单恢复。');
+  }
+  if (preflight.fills.some((fill) => String(fill?.orderId) === orderId)) {
+    throw new Error(`PopDEX orderId=${orderId} 存在成交事实，拒绝人工撤单恢复。`);
+  }
+  return owned;
+}
+
+function recoverManualCancel({ args, preflight, deps, files, fsImpl }) {
+  const now = deps.now ?? (() => Date.now());
+  const releaseLock = acquireLock({
+    file: files.lock,
+    mainAccount: preflight.mainAccount,
+    fsImpl,
+    now,
+    processKill: deps.processKill ?? process.kill.bind(process),
+  });
+  try {
+    validateManualCancelState({
+      files,
+      fsImpl,
+      preflight,
+      orderId: args.manualCancelOrderId,
+    });
+    const archivedFiles = archiveManualCancelFiles(files, fsImpl, now);
+    return {
+      mode: 'manual-cancel-recovered',
+      orderId: args.manualCancelOrderId,
+      archivedFiles,
+      writes: 0,
+    };
+  } finally {
+    releaseLock();
+  }
+}
+
 async function createSession({ args, preflight, plan, env, deps, files, fsImpl }) {
   const now = deps.now ?? (() => Date.now());
   const releaseLock = acquireLock({
@@ -340,12 +469,15 @@ async function createSession({ args, preflight, plan, env, deps, files, fsImpl }
         return { state: exchange.getHealth().state };
       }
       if (command === 'stop') {
-        await bot.stop({ closePosition: true });
+        await bot.stop({ closePosition: exchange.getPosition(20000) !== null });
         const reconciled = await exchange.reconcileOwnedOrders({
           marketId: 20000,
           reason: 'probe-stop-final',
           suppressRequote: true,
         });
+        if (reconciled.status !== 'READY') {
+          throw new Error(`PopDEX grid-probe stop 后订单终态仍为 ${String(reconciled.status)}。`);
+        }
         if (reconciled.activeOrders.length !== 0 || exchange.pendingFillEvents().length !== 0
             || exchange.getPosition(20000) !== null) {
           throw new Error('PopDEX grid-probe stop 后未确认 0 挂单、0 pending event、0 持仓。');
@@ -400,6 +532,9 @@ export async function runGridProbe({
   }
   const files = deps.files ?? FILES;
   const fsImpl = deps.fsImpl ?? fs;
+  if (args.manualCancelOrderId !== null) {
+    return recoverManualCancel({ args, preflight, deps, files, fsImpl });
+  }
   const facts = (deps.inspectProbeFacts ?? defaultInspectProbeFacts)(files, fsImpl);
   if (!args.resume && (args.confirmMainnetGrid || facts.state || facts.ownership || facts.operation)) {
     if (facts.state || facts.ownership || facts.operation) {
@@ -407,7 +542,9 @@ export async function runGridProbe({
     }
   }
   if (!args.resume && args.confirmMainnetGrid) {
-    if (preflight.openOrders.length > 0) throw new Error('PopDEX BTCUSDT 存在外部挂单，拒绝启动。');
+    if (preflight.openOrders.length > 0 || preflight.chainActiveOrders.length > 0) {
+      throw new Error('PopDEX BTCUSDT 存在外部挂单，拒绝启动。');
+    }
     if (preflight.positions.length > 0) throw new Error('PopDEX BTCUSDT 存在外部持仓，拒绝启动。');
   }
   if (!args.confirmMainnetGrid && !args.resume) {
@@ -452,6 +589,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       console.log(`BTCUSDT mark=${result.preflight.mark} lower=${result.plan.lower} upper=${result.plan.upper}`);
       console.log(`grids=3 leverage=1x size=${result.plan.sizeBase} seed=${result.plan.seed.price}`);
       console.log('writes=0；加入 --confirm-mainnet-grid 才会启动主网三格验收。');
+    } else if (result?.mode === 'manual-cancel-recovered') {
+      console.log(`PopDEX 人工撤单恢复完成：orderId=${result.orderId}，链上写入=0。`);
+      for (const file of result.archivedFiles) console.log(`已归档：${file}`);
     }
   }).catch((error) => {
     console.error(`PopDEX grid-probe 失败：${error?.message || error}`);

@@ -9,7 +9,7 @@
 - PopDEX Stage 7 已完成 live 成交补单、重启订单接管、离线成交恢复、断线对账、同形 Paper 模式和独立 BTC 小网格验收命令；正式服务器、配置、API 和前端仍未注册 PopDEX，网页不得启动，正式迁移属于 Stage 8。
 - PopDEX Stage 7 主网验收仅允许 `BTCUSDT` 做多、1x、3 格、每单 10–15 USDT；中性、做空、ETHUSDT live 仍禁止。自动化测试通过不等于主网验收通过。
 - PopDEX 做多成交后的卖出补单必须是 `Limit + GTC + ReduceOnly + OneWay/Net`，禁止降级为普通卖单或市价补单。
-- PopDEX 订单恢复只允许使用本地所有权中的 `orderId + clientOrderId` 与官方事实精确核对，禁止根据价格、方向、数量或订单消失猜测归属与成交。
+- PopDEX 订单恢复只允许使用本地所有权中的 `orderId + clientOrderId` 与官方事实精确核对，禁止根据价格、方向、数量或订单消失猜测归属与成交。若用户在网页人工撤销唯一探针订单且交易所未提供终态，只有显式传入精确 `orderId` 的 `--confirm-manual-cancel-order` 可在 stopped、零 active、零成交事件、唯一 `UNKNOWN_TERMINAL` 零成交所有权、无写操作、REST/链上零活动订单、该订单零成交及 BTCUSDT 空仓全部成立时归档恢复文件；禁止直接删除事实文件。
 - PopDEX 主钱包私钥禁止进入前端、后端、配置或日志。临时 Agent 私钥只能由浏览器内存生成，链上授权回验成功且用户明确确认后才能写入 `.env`；撤销必须先确认链上 Agent 已失效，再清除本地私钥。
 - PopDEX Agent API 必须独立于 exchange registry、GridBot、`.state.json`、AI、Decibel 和 RISEx；本阶段禁止新增 PopDEX start/stop/order/cancel/leverage/close 路由。
 - PopDEX 真实订单只允许由独立 CLI 触发：已验收的 CLI 单笔下单撤单探针使用 `npm run popdex:write-probe` 与 `--confirm-mainnet-write`；第 5 阶段成交平仓探针使用独立的 `npm run popdex:fill-close-probe`、`--confirm-mainnet-fill-close` 和恢复写入参数；Stage 7 小网格使用 `npm run popdex:grid-probe`，默认只读，只有 `--confirm-mainnet-grid` 可首次启动，未正常退出后只能 `--resume`。正式服务器、网页和 Agent API 禁止触发 PopDEX 交易。任何新的主网写入仍需用户逐次明确批准。
