@@ -613,3 +613,361 @@ test('reconcile does not resend an accepted Decibel duplicate cancellation', asy
   assert.deepEqual(forgotten, ['duplicate']);
   assert.equal(bot._pendingCancelOrders.size, 0);
 });
+
+function strictExchange(overrides = {}) {
+  const exchange = new FakeExchange({
+    strictOrderRecovery: true,
+    requiresDurableFillAck: true,
+  });
+  exchange.calls = [];
+  exchange.haltReason = null;
+  exchange.adoptCalls = 0;
+  exchange.placeLimitOrder = async (order) => {
+    exchange.calls.push('placeLimitOrder');
+    const orderId = String(++exchange.nextId);
+    const result = {
+      orderId,
+      clientOrderId: `0x${orderId.padStart(64, '0')}`,
+      marketId: order.marketId,
+      side: order.side,
+      price: order.price,
+      sizeBase: order.sizeBase,
+      reduceOnly: order.reduceOnly,
+      levelIndex: order.levelIndex,
+      opening: order.opening,
+      parentFillEventId: order.parentFillEventId ?? null,
+    };
+    exchange.orders.set(orderId, result);
+    return result;
+  };
+  exchange.recoverOwnedOrders = async () => {
+    exchange.calls.push('recoverOwnedOrders');
+    return { activeOrders: [], pendingEvents: [] };
+  };
+  exchange.reconcileOwnedOrders = async () => {
+    exchange.calls.push('reconcileOwnedOrders');
+    return { activeOrders: [...exchange.orders.values()], pendingEvents: [] };
+  };
+  exchange.releaseRecoveredEvents = () => { exchange.calls.push('releaseRecoveredEvents'); };
+  exchange.pendingFillEvents = () => [];
+  exchange.acknowledgeFillEvent = (eventId, orderId) => {
+    exchange.calls.push(`acknowledgeFillEvent:${eventId}:${String(orderId)}`);
+  };
+  exchange.adoptOrder = () => { exchange.adoptCalls++; };
+  exchange.haltFromBot = (error) => { exchange.haltReason ??= error?.message ?? String(error); };
+  exchange.start = () => { exchange.calls.push('start'); };
+  return Object.assign(exchange, overrides);
+}
+
+const strictConfig = {
+  ...config,
+  mode: 'long',
+  leverage: 1,
+};
+
+test('strict bot persists gridRunId before placement and stores complete adapter order identity', async () => {
+  const callOrder = [];
+  const exchange = strictExchange();
+  const originalPlace = exchange.placeLimitOrder;
+  exchange.placeLimitOrder = async (order) => {
+    callOrder.push('placeLimitOrder');
+    return originalPlace(order);
+  };
+  const bot = new GridBot(exchange, {
+    onChange: () => callOrder.push('persistSnapshot'),
+  });
+
+  await bot.start(strictConfig);
+  const snapshot = bot.snapshot();
+  assert.match(snapshot.config.gridRunId, /^[0-9a-f-]{36}$/);
+  assert.equal(callOrder[0], 'persistSnapshot');
+  const [, active] = snapshot.active[0];
+  assert.match(active.clientOrderId, /^0x[0-9a-f]{64}$/);
+  assert.equal(active.reduceOnly, false);
+  assert.equal(active.opening, true);
+  assert.equal(active.parentFillEventId, null);
+  bot._stopReconcileTimer();
+});
+
+test('strict resume replaces stale active orders without adoption or price guessing', async () => {
+  const exchange = strictExchange();
+  const recoveredOrder = {
+    orderId: '123',
+    clientOrderId: `0x${'12'.repeat(32)}`,
+    marketId: 1,
+    side: 'buy',
+    price: 95,
+    sizeBase: 1,
+    reduceOnly: false,
+    levelIndex: 1,
+    opening: true,
+    parentFillEventId: null,
+  };
+  exchange.recoverOwnedOrders = async () => {
+    exchange.calls.push('recoverOwnedOrders');
+    return { activeOrders: [recoveredOrder], pendingEvents: [] };
+  };
+  exchange.reconcileOwnedOrders = async () => {
+    exchange.calls.push('reconcileOwnedOrders');
+    return { activeOrders: [recoveredOrder], pendingEvents: [] };
+  };
+  exchange.releaseRecoveredEvents = () => {
+    assert.equal(exchange.listenerCount('fill'), 1);
+    exchange.calls.push('releaseRecoveredEvents');
+  };
+  const bot = new GridBot(exchange);
+  await bot.resume({
+    running: true,
+    config: { ...strictConfig, displayName: 'TEST-USD', gridRunId: 'run-1' },
+    active: [['stale', { levelIndex: 3, side: 'sell', price: 105 }]],
+  });
+
+  assert.deepEqual([...bot.active.keys()], ['123']);
+  assert.equal(bot.active.get('123').clientOrderId, recoveredOrder.clientOrderId);
+  assert.equal(exchange.adoptCalls, 0);
+  assert.deepEqual(exchange.calls, [
+    'recoverOwnedOrders', 'start', 'reconcileOwnedOrders', 'releaseRecoveredEvents',
+  ]);
+  bot._stopReconcileTimer();
+});
+
+test('strict terminal fill persists replacement before durable event acknowledgement', async () => {
+  const callOrder = [];
+  const exchange = strictExchange();
+  const originalPlace = exchange.placeLimitOrder;
+  exchange.placeLimitOrder = async (order) => {
+    callOrder.push('placeLimitOrder');
+    return originalPlace(order);
+  };
+  exchange.acknowledgeFillEvent = (eventId, orderId) => {
+    callOrder.push(`acknowledgeFillEvent:${eventId}:${orderId}`);
+  };
+  const bot = new GridBot(exchange, {
+    onChange: () => callOrder.push('persistSnapshot'),
+    logger: { log() {} },
+  });
+  bot.config = { ...strictConfig, displayName: 'TEST-USD', gridRunId: 'run-1' };
+  bot.grid = { levels: [90, 95, 100, 105, 110], spacing: 5, count: 4 };
+  bot.running = true;
+  bot.active.set('old', {
+    levelIndex: 1, side: 'buy', price: 95, sizeBase: 1, opening: true,
+    clientOrderId: `0x${'11'.repeat(32)}`, reduceOnly: false, parentFillEventId: null,
+  });
+  exchange.on('fill', bot._onFill);
+  const eventId = `px-fill-${'a'.repeat(64)}`;
+  exchange.emit('fill', {
+    fillEventId: eventId,
+    orderId: 'old', marketId: 1, side: 'buy', price: 95, sizeBase: 1, levelIndex: 1,
+    suppressRequote: false,
+  });
+  await bot._fillQueue;
+
+  assert.deepEqual(callOrder.map((entry) => entry.split(':')[0]), [
+    'placeLimitOrder', 'persistSnapshot', 'acknowledgeFillEvent',
+  ]);
+  assert.equal(bot.stats.buys, 1);
+  assert.equal(bot.fills.length, 1);
+  exchange.off('fill', bot._onFill);
+});
+
+test('strict replacement failure halts without stats mutation or generic retry', async () => {
+  const exchange = strictExchange();
+  exchange.placeLimitOrder = async () => { throw new Error('write failed'); };
+  const bot = new GridBot(exchange, { logger: { log() {} } });
+  bot.config = { ...strictConfig, displayName: 'TEST-USD', gridRunId: 'run-1' };
+  bot.grid = { levels: [90, 95, 100, 105, 110], spacing: 5, count: 4 };
+  bot.running = true;
+  bot.active.set('old', {
+    levelIndex: 1, side: 'buy', price: 95, sizeBase: 1, opening: true,
+    clientOrderId: `0x${'11'.repeat(32)}`, reduceOnly: false, parentFillEventId: null,
+  });
+  exchange.on('fill', bot._onFill);
+  exchange.emit('fill', {
+    fillEventId: `px-fill-${'b'.repeat(64)}`,
+    orderId: 'old', marketId: 1, side: 'buy', price: 95, sizeBase: 1, levelIndex: 1,
+    suppressRequote: false,
+  });
+  await bot._fillQueue;
+
+  assert.equal(bot._retryQueue.length, 0);
+  assert.equal(bot.stats.buys, 0);
+  assert.equal(bot.fills.length, 0);
+  assert.match(exchange.haltReason, /write failed/);
+  exchange.off('fill', bot._onFill);
+});
+
+test('strict equivalent level is covered only by the same parent fill intent', async () => {
+  const exchange = strictExchange();
+  const bot = new GridBot(exchange);
+  bot.config = { ...strictConfig, gridRunId: 'run-1' };
+  bot.running = true;
+  bot.active.set('other', {
+    levelIndex: 2, side: 'sell', price: 100, sizeBase: 1, opening: false,
+    parentFillEventId: `px-fill-${'c'.repeat(64)}`,
+  });
+  const result = await bot._place({
+    levelIndex: 2, side: 'sell', price: 100, sizeBase: 1, opening: false,
+    parentFillEventId: `px-fill-${'d'.repeat(64)}`,
+  });
+  assert.equal(result.status, 'blocked');
+  assert.match(result.reason, /补单意图冲突/);
+});
+
+test('strict suppressed fill persists statistics before acknowledging without replacement', async () => {
+  const callOrder = [];
+  const exchange = strictExchange();
+  exchange.acknowledgeFillEvent = (eventId, orderId) => {
+    callOrder.push(`acknowledgeFillEvent:${eventId}:${String(orderId)}`);
+  };
+  const bot = new GridBot(exchange, {
+    onChange: () => callOrder.push('persistSnapshot'),
+  });
+  bot.config = { ...strictConfig, displayName: 'TEST-USD', gridRunId: 'run-1' };
+  bot.grid = { levels: [90, 95, 100, 105, 110], spacing: 5, count: 4 };
+  bot.running = true;
+  const eventId = `px-fill-${'e'.repeat(64)}`;
+
+  await bot._handleStrictFill({
+    fillEventId: eventId,
+    orderId: 'old', marketId: 1, side: 'sell', price: 100, sizeBase: 1,
+    levelIndex: 2, suppressRequote: true,
+  }, {
+    levelIndex: 2, side: 'sell', price: 100, sizeBase: 1, opening: false,
+    recovery: false,
+  });
+
+  assert.deepEqual(callOrder, [
+    'persistSnapshot',
+    `acknowledgeFillEvent:${eventId}:null`,
+  ]);
+  assert.equal(bot.stats.sells, 1);
+  assert.equal(bot.stats.completedRungs, 1);
+  assert.equal(exchange.orders.size, 0);
+});
+
+test('strict processed fill replay only acknowledges its existing replacement', async () => {
+  const exchange = strictExchange();
+  const eventId = `px-fill-${'f'.repeat(64)}`;
+  const replacementId = 'replacement-order';
+  const bot = new GridBot(exchange);
+  bot.config = { ...strictConfig, displayName: 'TEST-USD', gridRunId: 'run-1' };
+  bot.grid = { levels: [90, 95, 100, 105, 110], spacing: 5, count: 4 };
+  bot.running = true;
+  bot.stats.buys = 1;
+  bot._processedFillEventIds.add(eventId);
+  bot.active.set(replacementId, {
+    levelIndex: 2, side: 'sell', price: 100, sizeBase: 1, opening: false,
+    parentFillEventId: eventId,
+  });
+
+  await bot._handleStrictFill({
+    fillEventId: eventId,
+    orderId: 'old', marketId: 1, side: 'buy', price: 95, sizeBase: 1,
+    levelIndex: 1, suppressRequote: false,
+  }, null);
+
+  assert.equal(bot.stats.buys, 1);
+  assert.equal(bot.fills.length, 0);
+  assert.equal(exchange.orders.size, 0);
+  assert.deepEqual(exchange.calls, [
+    `acknowledgeFillEvent:${eventId}:${replacementId}`,
+  ]);
+});
+
+test('strict placement rejects incomplete adapter identity and halts without retry', async () => {
+  const exchange = strictExchange({
+    placeLimitOrder: async () => ({ orderId: 'incomplete' }),
+  });
+  const bot = new GridBot(exchange, { logger: { log() {} } });
+  bot.config = { ...strictConfig, gridRunId: 'run-1' };
+  bot.running = true;
+
+  await assert.rejects(
+    bot._place({ levelIndex: 1, side: 'buy', price: 95, sizeBase: 1, opening: true }),
+    /严格下单响应缺少完整订单元数据/,
+  );
+  assert.match(exchange.haltReason, /严格下单响应缺少完整订单元数据/);
+  assert.equal(bot._retryQueue.length, 0);
+  assert.equal(bot.active.size, 0);
+});
+
+test('strict invalid fill event halts before any accounting or acknowledgement', async () => {
+  const exchange = strictExchange();
+  const bot = new GridBot(exchange);
+  bot.config = { ...strictConfig, gridRunId: 'run-1' };
+  bot.running = true;
+
+  await assert.rejects(
+    bot._handleStrictFill({
+      fillEventId: 'invalid', marketId: 1, side: 'buy', price: 95,
+      sizeBase: 1, levelIndex: 1, suppressRequote: false,
+    }, null),
+    /缺少有效 fillEventId/,
+  );
+  assert.match(exchange.haltReason, /缺少有效 fillEventId/);
+  assert.equal(bot.stats.buys, 0);
+  assert.equal(exchange.calls.length, 0);
+});
+
+test('strict snapshot failure after replacement preserves recoverable order and pending event', async () => {
+  const exchange = strictExchange();
+  const bot = new GridBot(exchange, {
+    onChange: () => { throw new Error('snapshot write failed'); },
+    logger: { log() {} },
+  });
+  bot.config = { ...strictConfig, displayName: 'TEST-USD', gridRunId: 'run-1' };
+  bot.grid = { levels: [90, 95, 100, 105, 110], spacing: 5, count: 4 };
+  bot.running = true;
+  const eventId = `px-fill-${'1'.repeat(64)}`;
+
+  await assert.rejects(bot._handleStrictFill({
+    fillEventId: eventId,
+    orderId: 'old', marketId: 1, side: 'buy', price: 95, sizeBase: 1,
+    levelIndex: 1, suppressRequote: false,
+  }, {
+    levelIndex: 1, side: 'buy', price: 95, sizeBase: 1, opening: true,
+    recovery: false,
+  }), /snapshot write failed/);
+
+  assert.equal(exchange.orders.size, 1);
+  assert.equal([...exchange.orders.values()][0].parentFillEventId, eventId);
+  assert.equal(bot.stats.buys, 0);
+  assert.equal(bot.fills.length, 0);
+  assert.equal(bot._processedFillEventIds.has(eventId), false);
+  assert.equal(exchange.calls.some((call) => call.startsWith('acknowledgeFillEvent:')), false);
+  assert.match(exchange.haltReason, /snapshot write failed/);
+});
+
+test('strict stop drains suppressed cancellation fills before detaching listeners', async () => {
+  const exchange = strictExchange();
+  const eventId = `px-fill-${'2'.repeat(64)}`;
+  exchange.cancelAll = async () => { exchange.orders.clear(); return true; };
+  let released = false;
+  exchange.releaseRecoveredEvents = () => {
+    if (released) return;
+    released = true;
+    exchange.emit('fill', {
+      fillEventId: eventId,
+      orderId: 'old', marketId: 1, side: 'buy', price: 95, sizeBase: 1,
+      levelIndex: 1, suppressRequote: true,
+    });
+  };
+  const bot = new GridBot(exchange);
+  bot.config = { ...strictConfig, displayName: 'TEST-USD', gridRunId: 'run-1' };
+  bot.grid = { levels: [90, 95, 100, 105, 110], spacing: 5, count: 4 };
+  bot.running = true;
+  bot.active.set('old', {
+    levelIndex: 1, side: 'buy', price: 95, sizeBase: 1, opening: true,
+    clientOrderId: `0x${'11'.repeat(32)}`, reduceOnly: false,
+    parentFillEventId: null,
+  });
+  exchange.on('fill', bot._onFill);
+  exchange.on('price', bot._onPrice);
+
+  await bot.stop({ closePosition: false });
+
+  assert.equal(bot.running, false);
+  assert.equal(bot.stats.buys, 1);
+  assert.ok(exchange.calls.includes(`acknowledgeFillEvent:${eventId}:null`));
+  assert.equal(exchange.listenerCount('fill'), 0);
+});

@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   decodeBytes32String,
   Interface,
+  keccak256,
   ZeroAddress,
 } from 'ethers';
 import {
@@ -12,6 +13,8 @@ import {
 import {
   POPDEX_REDUCE_ONLY_MARKET_PARAMS,
   POPDEX_USER_CONFIG_INTERFACE,
+  createBtcCloseClientOrderId,
+  encodeBtcLeverageOne,
   encodeReduceOnlyMarketClose,
   parseLeverageUpdatedReceipt,
   prepareFillClosePlan,
@@ -47,6 +50,21 @@ function plan() {
     randomBytesImpl: deterministicBytes,
   });
 }
+
+test('production BTC leverage and close identity helpers preserve validated vectors', () => {
+  assert.equal(
+    keccak256(encodeBtcLeverageOne(MAINNET_ACCOUNT)),
+    '0x75a358124ff6d9dac768951aa74a4cf82bd2862958e195aeed7e7b6c559b6e6c',
+  );
+  assert.equal(
+    createBtcCloseClientOrderId(deterministicBytes()),
+    plan().closeClientOrderId,
+  );
+  assert.equal(
+    decodeBytes32String(createBtcCloseClientOrderId(deterministicBytes())),
+    'dw-bc-0102030405060708090a0b0c',
+  );
+});
 
 test('fill-close plan is fixed to BTCUSDT 1x minimum long with 0.3 percent cap', () => {
   const prepared = plan();
@@ -84,7 +102,7 @@ test('fill-close plan is fixed to BTCUSDT 1x minimum long with 0.3 percent cap',
   assert.equal(entry.price.toString(), prepared.priceWad);
   assert.equal(entry.qty.toString(), prepared.qtyWad);
   assert.equal(entry.clientOrderId, prepared.clientOrderId);
-  assert.equal(entry.orderParams, encodeOrderParams('buy'));
+  assert.equal(entry.orderParams, encodeOrderParams({ side: 'buy' }));
   assert.equal(entry.slippage, 0n);
   assert.equal(entry.builder, ZeroAddress);
   assert.equal(entry.builderFeeRate, 0n);

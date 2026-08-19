@@ -3,13 +3,16 @@ import test from 'node:test';
 import {
   decodeBytes32String,
   encodeBytes32String,
+  getBytes,
   parseUnits,
   ZeroAddress,
 } from 'ethers';
 import {
+  createGridClientOrderId,
   encodeCancelOrder,
   encodeOrderParams,
   POPDEX_ORDER_INTERFACE,
+  prepareLimitOrder,
   prepareProbeOrder,
 } from '../src/exchange/px/order-codec.js';
 
@@ -30,6 +33,10 @@ function validOrder(overrides = {}) {
     ...overrides,
   };
 }
+
+test('production limit planner is byte-identical to the validated probe planner', () => {
+  assert.deepEqual(prepareLimitOrder(validOrder()), prepareProbeOrder(validOrder()));
+});
 
 test('prepareProbeOrder encodes the fixed BTC buy ABI vector without floating point', () => {
   const plan = prepareProbeOrder(validOrder());
@@ -58,14 +65,69 @@ test('prepareProbeOrder encodes the fixed BTC buy ABI vector without floating po
 
 test('orderParams supports only exact buy and sell limit GTC vectors', () => {
   assert.equal(
-    encodeOrderParams('buy'),
+    encodeOrderParams({ side: 'buy' }),
     '0x0200000100000000000000000000000000000000000000000000000000000000',
   );
   assert.equal(
-    encodeOrderParams('sell'),
+    encodeOrderParams({ side: 'sell' }),
     '0x0200010100000000000000000000000000000000000000000000000000000000',
   );
-  assert.throws(() => encodeOrderParams('BUY'), /side.*buy.*sell/i);
+  assert.throws(() => encodeOrderParams({ side: 'BUY' }), /side.*buy.*sell/i);
+});
+
+test('replacement intent creates one stable PopDEX client order ID', () => {
+  const one = createGridClientOrderId({
+    symbol: 'BTCUSDT',
+    side: 'sell',
+    intentId: 'fill:123:456',
+  });
+  const two = createGridClientOrderId({
+    symbol: 'BTCUSDT',
+    side: 'sell',
+    intentId: 'fill:123:456',
+  });
+  assert.equal(one, two);
+  assert.match(decodeBytes32String(one), /^dw-bs-[0-9a-f]{24}$/);
+});
+
+test('long replacement encodes Limit GTC ReduceOnly Net exactly', () => {
+  const encoded = encodeOrderParams({ side: 'sell', reduceOnly: true, positionSide: '0' });
+  assert.deepEqual([...getBytes(encoded).slice(0, 10)], [2, 0, 1, 1, 0, 0, 1, 0, 0, 0]);
+
+  const plan = prepareLimitOrder(validOrder({
+    side: 'sell',
+    price: '65000',
+    reduceOnly: true,
+    positionSide: '0',
+    intentId: 'replacement:px-fill-1',
+  }));
+  assert.equal(plan.reduceOnly, true);
+  assert.equal(plan.positionSide, '0');
+  assert.equal(plan.clientOrderId, createGridClientOrderId({
+    symbol: 'BTCUSDT',
+    side: 'sell',
+    intentId: 'replacement:px-fill-1',
+  }));
+});
+
+test('reduce-only live limit plan rejects buy, ETH and non-Net position side', () => {
+  assert.throws(
+    () => prepareLimitOrder(validOrder({ reduceOnly: true, intentId: 'buy' })),
+    /只允许 BTCUSDT sell/,
+  );
+  assert.throws(
+    () => prepareLimitOrder(validOrder({
+      symbol: 'ETHUSDT', side: 'sell', price: '2000.1', qty: '0.006', bid: '1878.8', ask: '1878.9',
+      reduceOnly: true, intentId: 'eth',
+    })),
+    /只允许 BTCUSDT sell/,
+  );
+  assert.throws(
+    () => prepareLimitOrder(validOrder({
+      side: 'sell', price: '65000', reduceOnly: true, positionSide: '1', intentId: 'hedge',
+    })),
+    /OneWay\/Net/,
+  );
 });
 
 test('prepareProbeOrder accepts the exact ETH whitelist identity and sell protection', () => {

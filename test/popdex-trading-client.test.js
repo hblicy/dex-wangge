@@ -3,8 +3,13 @@ import test from 'node:test';
 import { decodeBytes32String, keccak256, Transaction, Wallet } from 'ethers';
 import {
   POPDEX_ORDER_INTERFACE,
+  prepareLimitOrder,
   prepareProbeOrder,
 } from '../src/exchange/px/order-codec.js';
+import {
+  POPDEX_USER_CONFIG_INTERFACE,
+  createBtcCloseClientOrderId,
+} from '../src/exchange/px/fill-close-codec.js';
 import { PopdexTradingClient } from '../src/exchange/px/trading-client.js';
 import { POPDEX_ORDER_EVENT_INTERFACE } from '../src/exchange/px/receipt-events.js';
 
@@ -15,6 +20,20 @@ const NOW = 1786946400000;
 
 function plan() {
   return prepareProbeOrder({
+    mainAccount: MAIN_ACCOUNT,
+    symbol: 'BTCUSDT',
+    side: 'buy',
+    price: '60000',
+    qty: '0.0002',
+    bid: '62900',
+    ask: '62901',
+    randomBytesImpl: () => Uint8Array.from({ length: 16 }, (_, index) => index + 1),
+    nowMs: NOW,
+  });
+}
+
+function adapterPlan() {
+  return prepareLimitOrder({
     mainAccount: MAIN_ACCOUNT,
     symbol: 'BTCUSDT',
     side: 'buy',
@@ -174,12 +193,41 @@ function fakeJournal(initialStage = 'PREPARED') {
   };
 }
 
+function genericJournal(initialStage = 'PREPARED') {
+  return {
+    stage: initialStage,
+    advances: [],
+    errors: [],
+    advance(expected, next, fields = {}) {
+      assert.equal(this.stage, expected);
+      this.stage = next;
+      this.advances.push({ expected, next, fields });
+      return { stage: next, ...fields };
+    },
+    completePreparedWithoutBroadcast(outcome) {
+      assert.equal(this.stage, 'PREPARED');
+      assert.equal(outcome, 'safe-no-broadcast');
+      this.stage = 'CONFIRMED';
+      this.advances.push({ expected: 'PREPARED', next: 'CONFIRMED', fields: { outcome } });
+      return { stage: this.stage, outcome, txHash: null };
+    },
+    recordError(expected, error) {
+      assert.equal(this.stage, expected);
+      this.errors.push(String(error?.message ?? error));
+    },
+  };
+}
+
 function dependencies({
   agentInfo = activeAgent(),
   findOrder,
   findRestOrder,
   getFills,
   getPositions,
+  getAllPositions,
+  getAllOpenOrders,
+  getAllFills,
+  getAccountConfig,
   simulate,
   broadcast,
   waitReceipt,
@@ -201,6 +249,16 @@ function dependencies({
         if (getPositions) return getPositions(account, offset, limit);
         return { positions: [], hasMore: false };
       },
+      async getAllOpenPositions(account) {
+        calls.push('read:all-positions');
+        if (getAllPositions) return getAllPositions(account);
+        return [];
+      },
+      async getAccountConfig(account) {
+        calls.push('read:account-config');
+        if (getAccountConfig) return getAccountConfig(account);
+        return { positionMode: '0', symbolLeverages: [{ symbolId: '20000', leverage: '1' }] };
+      },
     },
     accountClient: {
       async findUniqueOrderByClientId(account, symbol, clientOrderId) {
@@ -213,13 +271,27 @@ function dependencies({
         if (getFills) return getFills(account, symbol, cursor);
         return [];
       },
+      async getAllOpenOrders(account, symbol) {
+        calls.push('rest:all-open');
+        if (getAllOpenOrders) return getAllOpenOrders(account, symbol);
+        return [];
+      },
+      async getAllFills(account, symbol) {
+        calls.push('rest:all-fills');
+        if (getAllFills) return getAllFills(account, symbol);
+        return [];
+      },
     },
     writeRpc: {
       async verifyChain() { calls.push('write:chain'); return 2184n; },
       async simulate(transaction) {
         calls.push('write:simulate');
         if (simulate) return simulate(transaction);
-        POPDEX_ORDER_INTERFACE.parseTransaction({ data: transaction.data });
+        try {
+          POPDEX_ORDER_INTERFACE.parseTransaction({ data: transaction.data });
+        } catch {
+          POPDEX_USER_CONFIG_INTERFACE.parseTransaction({ data: transaction.data });
+        }
         return '0x';
       },
       async broadcast(raw) {
@@ -235,6 +307,192 @@ function dependencies({
     },
   };
 }
+
+function leverageReceipt(hash) {
+  const event = POPDEX_USER_CONFIG_INTERFACE.encodeEventLog(
+    POPDEX_USER_CONFIG_INTERFACE.getEvent('LeverageUpdated'),
+    [MAIN_ACCOUNT, 2, 20000, '0x0000000000000000000000000000000000000000', 1, true, 0],
+  );
+  return {
+    transactionHash: hash,
+    status: '0x1',
+    logs: [{
+      address: '0x0000000000000000000000000000000000001009',
+      data: event.data,
+      topics: event.topics,
+    }],
+  };
+}
+
+function closeReceipt(hash, closeClientOrderId) {
+  const event = POPDEX_ORDER_EVENT_INTERFACE.encodeEventLog(
+    POPDEX_ORDER_EVENT_INTERFACE.getEvent('OrderCreate'),
+    [
+      MAIN_ACCOUNT,
+      '20000',
+      '90071992547409931235',
+      closeClientOrderId,
+      '62901000000000000000000',
+      '200000000000000',
+      '0',
+      2,
+      true,
+      0,
+    ],
+  );
+  return {
+    transactionHash: hash,
+    status: '0x1',
+    logs: [{
+      address: '0x0000000000000000000000000000000000001000',
+      data: event.data,
+      topics: event.topics,
+    }],
+  };
+}
+
+test('placeAdapterOrder uses generic stages and confirms exact REST identity', async () => {
+  const orderPlan = adapterPlan();
+  const deps = dependencies({ findRestOrder: async () => restOrder(orderPlan) });
+  const journal = genericJournal();
+  const result = await createClient(deps).placeAdapterOrder(orderPlan, journal);
+
+  assert.equal(result.orderId, '90071992547409931234');
+  assert.deepEqual(journal.advances.map((entry) => entry.next), ['BROADCAST', 'CONFIRMED']);
+  assert.equal(journal.advances[0].fields.txHash, keccak256(deps.serialized[0]));
+});
+
+test('setAdapterBtcLeverageOne skips an already exact setting without broadcasting', async () => {
+  const deps = dependencies();
+  const journal = genericJournal();
+  const result = await createClient(deps).setAdapterBtcLeverageOne(journal);
+
+  assert.deepEqual(result, { leverage: '1', changed: false });
+  assert.equal(journal.stage, 'CONFIRMED');
+  assert.equal(deps.serialized.length, 0);
+});
+
+test('setAdapterBtcLeverageOne broadcasts once and confirms exact receipt plus readback', async () => {
+  let reads = 0;
+  const deps = dependencies({
+    getAccountConfig: async () => {
+      reads += 1;
+      return {
+        positionMode: '0',
+        symbolLeverages: reads === 1 ? [] : [{ symbolId: '20000', leverage: '1' }],
+      };
+    },
+    waitReceipt: async (hash) => leverageReceipt(hash),
+  });
+  const journal = genericJournal();
+  const result = await createClient(deps).setAdapterBtcLeverageOne(journal);
+
+  assert.equal(result.changed, true);
+  assert.equal(journal.stage, 'CONFIRMED');
+  assert.equal(deps.serialized.length, 1);
+});
+
+test('cancelAdapterOrder uses generic stages and exact terminal confirmation', async () => {
+  const orderPlan = adapterPlan();
+  const deps = dependencies({
+    findRestOrder: async () => restOrder(orderPlan, {
+      status: 'Cancelled', remainingQty: '0', cancelledQty: orderPlan.qty,
+    }),
+  });
+  const journal = genericJournal();
+  const result = await createClient(deps).cancelAdapterOrder(openOrder(orderPlan), journal);
+
+  assert.equal(result.cancelledQtyWad, orderPlan.qtyWad);
+  assert.deepEqual(journal.advances.map((entry) => entry.next), ['BROADCAST', 'CONFIRMED']);
+});
+
+test('closeAdapterBtcLong confirms positive execution receipt fill and flat official position', async () => {
+  const closeClientOrderId = createBtcCloseClientOrderId(
+    Uint8Array.from({ length: 16 }, (_, index) => index + 1),
+  );
+  let positionReads = 0;
+  const deps = dependencies({
+    getAllPositions: async () => {
+      positionReads += 1;
+      if (positionReads === 1) {
+        return [{
+          walletId: MAIN_ACCOUNT,
+          symbol: 'BTCUSDT',
+          symbolId: '20000',
+          positionId: '7',
+          side: '1',
+          holdSizeWad: '200000000000000',
+        }];
+      }
+      return [];
+    },
+    getAllFills: async () => [{
+      fillId: '8',
+      orderId: '90071992547409931235',
+      symbol: 'BTCUSDT',
+      side: 'Sell',
+      execQty: '0.0002',
+      execPrice: '62901',
+    }],
+    waitReceipt: async (hash) => closeReceipt(hash, closeClientOrderId),
+  });
+  const journal = genericJournal();
+  const result = await createClient(deps).closeAdapterBtcLong({
+    positionId: '7',
+    qtyWad: '200000000000000',
+    closeClientOrderId,
+  }, journal);
+
+  assert.equal(result.closeOrderId, '90071992547409931235');
+  assert.equal(result.positionQtyWad, '0');
+  assert.equal(journal.stage, 'CONFIRMED');
+});
+
+test('closeAdapterBtcLong keeps BROADCAST when official fill and position facts never settle', async () => {
+  const closeClientOrderId = createBtcCloseClientOrderId(
+    Uint8Array.from({ length: 16 }, (_, index) => index + 1),
+  );
+  const livePosition = {
+    walletId: MAIN_ACCOUNT,
+    symbol: 'BTCUSDT',
+    symbolId: '20000',
+    positionId: '7',
+    side: '1',
+    holdSizeWad: '200000000000000',
+  };
+  const deps = dependencies({
+    getAllPositions: async () => [livePosition],
+    getAllFills: async () => [],
+    waitReceipt: async (hash) => closeReceipt(hash, closeClientOrderId),
+  });
+  const journal = genericJournal();
+
+  await assert.rejects(createClient(deps).closeAdapterBtcLong({
+    positionId: '7',
+    qtyWad: '200000000000000',
+    closeClientOrderId,
+  }, journal), /close CONFIRMED 超时.*remaining=200000000000000/);
+
+  assert.equal(journal.stage, 'BROADCAST');
+  assert.equal(journal.errors.length, 1);
+  assert.equal(deps.serialized.length, 1);
+});
+
+test('adapter uncertain confirmation retains BROADCAST and never broadcasts twice', async () => {
+  const orderPlan = adapterPlan();
+  let attempts = 0;
+  const deps = dependencies({
+    findRestOrder: async () => restOrder(orderPlan, { price: '1' }),
+    broadcast: async (raw) => { attempts += 1; return keccak256(raw); },
+  });
+  const journal = genericJournal();
+  const client = createClient(deps);
+  await assert.rejects(client.placeAdapterOrder(orderPlan, journal), /priceWad.*不匹配/);
+  assert.equal(journal.stage, 'BROADCAST');
+  assert.equal(attempts, 1);
+  await assert.rejects(client.placeAdapterOrder(orderPlan, journal), /PREPARED|当前阶段/);
+  assert.equal(attempts, 1);
+});
 
 function createClient(deps, overrides = {}) {
   return new PopdexTradingClient({

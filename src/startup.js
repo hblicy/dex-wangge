@@ -31,5 +31,6 @@ export async function initializeExchange(exchange, name, config, logger = consol
 }
 
 export function prepareExchangeRecovery(exchange, snapshot) {
+  if (exchange.strictOrderRecovery === true) return;
   exchange.setRecoverySnapshot?.(snapshot);
 }

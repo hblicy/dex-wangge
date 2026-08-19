@@ -5,9 +5,60 @@
 // alerts (optional auto-stop), periodic open-order reconciliation, crash-safe
 // persistence with resume-on-restart, live range adjustment, and a health probe.
 import { buildGrid, seedOrders, replacementFor, isReduceOnly } from './grid.js';
+import { randomUUID } from 'node:crypto';
 
 const RECONCILE_MS = 30000;   // periodic open-order reconciliation cadence
 const PRUNE_GRACE_MS = 20000; // don't prune a tracked order younger than this
+
+function strictActiveOrder(order) {
+  if (!order || typeof order !== 'object' || Array.isArray(order)) {
+    throw new Error('严格恢复订单必须是对象。');
+  }
+  const required = [
+    'orderId', 'clientOrderId', 'marketId', 'side', 'price', 'sizeBase',
+    'reduceOnly', 'levelIndex', 'opening', 'parentFillEventId',
+  ];
+  if (required.some((field) => order[field] === undefined)) {
+    throw new Error('严格恢复订单缺少完整订单元数据。');
+  }
+  if (typeof order.clientOrderId !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(order.clientOrderId)
+      || !Number.isSafeInteger(Number(order.marketId)) || Number(order.marketId) <= 0
+      || !Number.isSafeInteger(order.levelIndex) || order.levelIndex < 0
+      || !['buy', 'sell'].includes(order.side)
+      || !Number.isFinite(Number(order.price)) || Number(order.price) <= 0
+      || !Number.isFinite(Number(order.sizeBase)) || Number(order.sizeBase) <= 0
+      || typeof order.reduceOnly !== 'boolean' || typeof order.opening !== 'boolean'
+      || order.opening === order.reduceOnly
+      || (order.opening && order.side !== 'buy')
+      || (order.reduceOnly && order.side !== 'sell')
+      || (order.parentFillEventId !== null
+        && (typeof order.parentFillEventId !== 'string'
+          || !/^px-fill-[0-9a-f]{64}$/.test(order.parentFillEventId)))) {
+    throw new Error('严格恢复订单元数据无效。');
+  }
+  return {
+    levelIndex: order.levelIndex,
+    side: order.side,
+    price: Number(order.price),
+    sizeBase: Number(order.sizeBase),
+    clientOrderId: order.clientOrderId.toLowerCase(),
+    reduceOnly: order.reduceOnly,
+    opening: order.opening,
+    recovery: false,
+    parentFillEventId: order.parentFillEventId,
+    placedAt: Date.now(),
+  };
+}
+
+function strictProcessedEventIds(value) {
+  if (value === undefined) return new Set();
+  if (!Array.isArray(value)
+      || value.some((id) => typeof id !== 'string' || !/^px-fill-[0-9a-f]{64}$/.test(id))
+      || new Set(value).size !== value.length) {
+    throw new Error('严格恢复快照 processedFillEventIds 无效。');
+  }
+  return new Set(value);
+}
 
 export class GridBot {
   constructor(exchange, opts = {}) {
@@ -71,6 +122,7 @@ export class GridBot {
     this._pendingCancelOrders = new Map();
     this._pnlBase = null;            // realizedPnl baseline; resetStats uses an offset because some
                                      // adapters (RISEx) re-fetch realizedPnl from the exchange every poll
+    this._processedFillEventIds = new Set();
   }
 
   /**
@@ -106,6 +158,7 @@ export class GridBot {
       recovery: this.recovery, pnlBase: this._pnlBase,
       startBalance: this.startBalance, outOfRange: this.outOfRange, lastPrice: this.lastPrice,
       active: [...this.active.entries()],
+      processedFillEventIds: [...this._processedFillEventIds],
     };
   }
 
@@ -119,6 +172,9 @@ export class GridBot {
     this.stats = { buys: 0, sells: 0, completedRungs: 0, gridProfit: 0, volume: 0, ...(snap.stats || {}) };
     this.startBalance = snap.startBalance ?? null;
     this._pnlBase = snap.pnlBase ?? null;
+    if (this.ex.strictOrderRecovery === true) {
+      this._processedFillEventIds = strictProcessedEventIds(snap.processedFillEventIds);
+    }
     try {
       this.grid = buildGrid({ lower: this.config.lower, upper: this.config.upper, gridCount: this.config.gridCount });
       this._recomputeRisk();
@@ -146,6 +202,34 @@ export class GridBot {
     this.lastPrice = snap.lastPrice ?? null;
     this.grid = buildGrid({ lower: this.config.lower, upper: this.config.upper, gridCount: this.config.gridCount });
     this._recomputeRisk();
+
+    if (this.ex.strictOrderRecovery === true) {
+      if (typeof this.config.gridRunId !== 'string' || this.config.gridRunId.length === 0) {
+        throw new Error('严格恢复快照缺少 gridRunId。');
+      }
+      this._processedFillEventIds = strictProcessedEventIds(snap.processedFillEventIds);
+      try {
+        const recovered = await this.ex.recoverOwnedOrders({
+          marketId: this.config.marketId,
+          reason: 'startup',
+        });
+        this.active = new Map(recovered.activeOrders.map((order) => [
+          String(order.orderId), strictActiveOrder(order),
+        ]));
+        this.ex.on('fill', this._onFill);
+        this.ex.on('price', this._onPrice);
+        if (typeof this.ex.start === 'function') this.ex.start();
+        this.running = true;
+        await this.reconcileOpenOrders();
+        this._alert(`已恢复运行中的 ${this.config.displayName} ${labelMode(this.config.mode)}：接管 ${this.active.size} 个挂单并完成对账。`);
+        this._changed();
+        this._startReconcileTimer();
+      } catch (cause) {
+        this._rollbackResume();
+        throw new Error(`恢复初始对账失败：${cause?.message || cause}`, { cause });
+      }
+      return this.getState();
+    }
 
     // Rebuild our active map AND the adapter's order tracking so fills on these
     // pre-existing orders are detected.
@@ -349,6 +433,23 @@ export class GridBot {
       throw new Error(`${action}前撤单失败：${cause?.message || cause}`, { cause });
     }
     if (ok !== true) throw new Error(`${action}前撤单失败：交易所未确认全部撤单成功。`);
+    if (this.ex.requiresDurableFillAck === true) {
+      const result = await this.ex.reconcileOwnedOrders({
+        marketId,
+        reason: `cancel:${action}`,
+        suppressRequote: true,
+      });
+      if (!Array.isArray(result?.activeOrders) || result.activeOrders.length !== 0) {
+        throw new Error(`${action}前撤单失败：严格对账仍存在活动订单。`);
+      }
+      this.ex.releaseRecoveredEvents();
+      await this._fillQueue;
+      const pending = this.ex.pendingFillEvents();
+      if (!Array.isArray(pending) || pending.length !== 0) {
+        throw new Error(`${action}前撤单失败：仍有未完成成交事件。`);
+      }
+      return;
+    }
     if (this.ex.requiresCancelConfirmation !== true) return;
     this._alert(`${action}：撤单请求已接受，等待交易所连续快照确认。`);
     try {
@@ -376,6 +477,14 @@ export class GridBot {
       outOfRangeAction: cfg.outOfRangeAction === 'recover' ? 'recover' : 'close',
       stepSize: market.stepSize, stepPrice: market.stepPrice,
     };
+    if (this.ex.strictOrderRecovery === true) {
+      if (this.config.mode !== 'long') {
+        throw new Error('严格订单恢复适配器当前只允许做多网格。');
+      }
+      this.config.gridRunId = randomUUID();
+      this._processedFillEventIds = new Set();
+      this._changed();
+    }
     this.grid = buildGrid({ lower: this.config.lower, upper: this.config.upper, gridCount: this.config.gridCount });
     this._recomputeRisk();
     this._refillPausedUntil = 0; this._cancelTimes = []; // fresh start clears any back-off
@@ -590,10 +699,16 @@ export class GridBot {
   }
 
   async _place(o) {
+    const strict = this.ex.strictOrderRecovery === true;
     const opening = o.opening !== false;
     const reduceOnly = o.reduceOnly ?? isReduceOnly(o.side, this.config.mode);
     const lvl = o.levelIndex;
     const sizeBase = Number(o.sizeBase) > 0 ? Number(o.sizeBase) : this.config.sizeBase; // per-order override (partial fills)
+    const parentFillEventId = o.parentFillEventId ?? null;
+    const intentId = strict
+      ? (o.intentId
+        ?? `grid:${this.config.gridRunId}:${this.config.marketId}:${lvl}:${o.side}:${opening ? 'open' : 'close'}`)
+      : o.intentId;
     // Back-off: while paused (after a burst of cancellations / collateral
     // rejections) do not place new OPENING orders. CLOSING / reduce-only /
     // recovery legs need no extra margin and are never blocked — dropping a
@@ -619,6 +734,11 @@ export class GridBot {
         && Number(active.price) === Number(o.price)
         && activeSize === sizeBase
         && active.opening === opening;
+      if (equivalent && strict && active.parentFillEventId !== parentFillEventId) {
+        const reason = `level ${lvl} 补单意图冲突：现有 parentFillEventId=${String(active.parentFillEventId)}，待补=${String(parentFillEventId)}`;
+        this._alert(`❌ 网格补单冲突：${reason}。未重复下单，请检查交易所挂单。`);
+        return { status: 'blocked', reason };
+      }
       if (equivalent) return { status: 'covered', orderId };
       const reason = `level ${lvl} 已被不等价订单 ${orderId} 占用（现有 ${active.side} @ ${active.price}，待补 ${o.side} @ ${o.price}）`;
       this._alert(`❌ 网格补单冲突：${reason}。未重复下单，请检查交易所挂单。`);
@@ -633,15 +753,52 @@ export class GridBot {
           marketId: this.config.marketId, side: o.side, price: o.price,
           sizeBase, reduceOnly,
           levelIndex: o.levelIndex, clientOrderId,
+          opening, intentId, parentFillEventId,
         });
         if (r?.orderId) {
-          this.active.set(String(r.orderId), { levelIndex: lvl, side: o.side, price: o.price, sizeBase, opening, recovery: !!o.recovery, placedAt: Date.now() });
+          if (strict) {
+            const required = [
+              'clientOrderId', 'marketId', 'side', 'price', 'sizeBase', 'reduceOnly',
+              'levelIndex', 'opening', 'parentFillEventId',
+            ];
+            if (required.some((field) => r[field] === undefined)) {
+              throw new Error('严格下单响应缺少完整订单元数据。');
+            }
+          }
+          const activeOrder = {
+            levelIndex: r.levelIndex ?? lvl,
+            side: r.side ?? o.side,
+            price: r.price ?? o.price,
+            sizeBase: r.sizeBase ?? sizeBase,
+            clientOrderId: r.clientOrderId ?? null,
+            reduceOnly: r.reduceOnly ?? reduceOnly,
+            opening: r.opening ?? opening,
+            recovery: !!o.recovery,
+            parentFillEventId: r.parentFillEventId ?? parentFillEventId,
+            placedAt: Date.now(),
+          };
+          if (strict) {
+            const validated = strictActiveOrder({
+              orderId: String(r.orderId),
+              marketId: r.marketId,
+              ...activeOrder,
+            });
+            if (Number(r.marketId) !== Number(this.config.marketId)) {
+              throw new Error('严格下单响应 marketId 与当前网格冲突。');
+            }
+            Object.assign(activeOrder, validated, { recovery: !!o.recovery });
+          }
+          this.active.set(String(r.orderId), activeOrder);
           return { status: 'placed', orderId: String(r.orderId) };
         }
         return { status: 'failed', reason: `level ${lvl} 下单响应缺少订单 ID` };
       } catch (error) {
         this._placeFails++; this._lastFailAt = Date.now();
         this._alert('下单失败: ' + error.message);
+        if (strict) {
+          this.ex.haltFromBot?.(error);
+          throw error;
+        }
         this._queueRetry({ ...o, opening, reduceOnly, sizeBase }); // closing legs get retried
         return { status: 'failed', reason: error?.message || String(error) };
       }
@@ -683,8 +840,91 @@ export class GridBot {
     }
   }
 
+  async _handleStrictFill(f, tracked) {
+    try {
+      if (typeof f.fillEventId !== 'string' || !/^px-fill-[0-9a-f]{64}$/.test(f.fillEventId)) {
+        throw new Error('严格成交事件缺少有效 fillEventId。');
+      }
+      if (this._processedFillEventIds.has(f.fillEventId)) {
+        const replacements = [...this.active.entries()]
+          .filter(([, order]) => order.parentFillEventId === f.fillEventId);
+        if (f.suppressRequote) {
+          this.ex.acknowledgeFillEvent(f.fillEventId, null);
+          return;
+        }
+        if (replacements.length !== 1) {
+          throw new Error(`严格成交事件 ${f.fillEventId} 已入账但补单身份不唯一。`);
+        }
+        this.ex.acknowledgeFillEvent(f.fillEventId, replacements[0][0]);
+        return;
+      }
+
+      const levelIndex = tracked?.levelIndex ?? f.levelIndex;
+      const fillPrice = Number.isFinite(f.price) ? f.price : (tracked?.price ?? 0);
+      const fillSize = Number.isFinite(f.sizeBase) ? f.sizeBase : this.config.sizeBase;
+      if (!Number.isSafeInteger(levelIndex) || levelIndex < 0
+          || !Number.isFinite(fillPrice) || fillPrice <= 0
+          || !Number.isFinite(fillSize) || fillSize <= 0
+          || !['buy', 'sell'].includes(f.side)) {
+        throw new Error(`严格成交事件 ${f.fillEventId} 的订单事实无效。`);
+      }
+      const isRecovery = !!tracked?.recovery;
+      const closing = isRecovery ? true
+        : (tracked ? tracked.opening === false : f.side === 'sell');
+      let replacementOrderId = null;
+
+      if (!isRecovery && !f.suppressRequote && this.grid) {
+        const replacement = replacementFor({ side: f.side, levelIndex }, this.grid.levels, this.config.mode);
+        if (!replacement || this.outOfRange || !this.running) {
+          throw new Error(`严格成交事件 ${f.fillEventId} 无法生成安全补单。`);
+        }
+        replacement.opening = closing;
+        replacement.sizeBase = fillSize;
+        replacement.intentId = `replacement:${f.fillEventId}`;
+        replacement.parentFillEventId = f.fillEventId;
+        const result = await this._place(replacement);
+        if (!['placed', 'covered'].includes(result.status)) {
+          throw new Error(`严格成交事件 ${f.fillEventId} 补单失败：${result.reason || result.status}。`);
+        }
+        replacementOrderId = result.orderId;
+      } else if (!f.suppressRequote) {
+        throw new Error(`严格成交事件 ${f.fillEventId} 未被允许跳过补单。`);
+      }
+
+      const previousStats = { ...this.stats };
+      const previousFills = [...this.fills];
+      try {
+        if (f.side === 'buy') this.stats.buys++; else this.stats.sells++;
+        this.stats.volume = round2(this.stats.volume + fillPrice * fillSize);
+        this.fills.unshift({
+          t: Date.now(), side: f.side, price: fillPrice, size: fillSize, level: levelIndex,
+        });
+        if (this.fills.length > 50) this.fills.pop();
+        if (closing) {
+          this.stats.completedRungs++;
+          const spacing = this.grid?.spacing ?? this.config.spacing ?? 0;
+          this.stats.gridProfit = round2(this.stats.gridProfit + spacing * fillSize);
+        }
+        this._processedFillEventIds.add(f.fillEventId);
+        this._changed();
+      } catch (error) {
+        this.stats = previousStats;
+        this.fills = previousFills;
+        this._processedFillEventIds.delete(f.fillEventId);
+        throw error;
+      }
+      this.ex.acknowledgeFillEvent(f.fillEventId, replacementOrderId);
+    } catch (error) {
+      this.ex.haltFromBot?.(error);
+      throw error;
+    }
+  }
+
   async _handleFill(f, tracked) {
     if (!this.running || f.marketId !== this.config.marketId) return;
+    if (this.ex.requiresDurableFillAck === true) {
+      return this._handleStrictFill(f, tracked);
+    }
     const id = String(f.orderId);
     const act = tracked;
     const levelIndex = act?.levelIndex ?? f.levelIndex;
@@ -1041,6 +1281,22 @@ export class GridBot {
    */
   async reconcileOpenOrders() {
     if (!this.running || !this.config) return;
+    if (this.ex.strictOrderRecovery === true) {
+      if (typeof this.ex.reconcileOwnedOrders !== 'function') {
+        throw new Error('严格订单恢复适配器缺少 reconcileOwnedOrders。');
+      }
+      const result = await this.ex.reconcileOwnedOrders({
+        marketId: this.config.marketId,
+        reason: 'periodic',
+      });
+      this.active = new Map(result.activeOrders.map((order) => [
+        String(order.orderId), strictActiveOrder(order),
+      ]));
+      this._exchangeOpenOrders = this.active.size;
+      this._changed();
+      this.ex.releaseRecoveredEvents?.();
+      return;
+    }
     if (typeof this.ex.fetchOpenOrders !== 'function') return;
     // Keep the adapter's price watch warm so a long-running market is never
     // pruned as "idle" (adapters drop unwatched markets after 10 min).

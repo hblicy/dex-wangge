@@ -274,6 +274,39 @@ test('RPC client collects all positions and rejects impossible pagination', asyn
   );
 });
 
+test('RPC client collects every active and completed order page exactly once', async () => {
+  const client = new PopdexRpcClient({ fetchImpl: async () => { throw new Error('unused'); } });
+  const activeOffsets = [];
+  const completedOffsets = [];
+  client.getActiveOrders = async (_account, offset) => {
+    activeOffsets.push(offset);
+    return offset === 0
+      ? { orders: [{ orderId: '11' }], hasMore: true }
+      : { orders: [{ orderId: '12' }], hasMore: false };
+  };
+  client.getCompletedOrders = async (_account, offset) => {
+    completedOffsets.push(offset);
+    return { orders: [{ orderId: '21' }], hasMore: false };
+  };
+
+  assert.deepEqual((await client.getAllActiveOrders(ACCOUNT)).map((order) => order.orderId), ['11', '12']);
+  assert.deepEqual((await client.getAllCompletedOrders(ACCOUNT)).map((order) => order.orderId), ['21']);
+  assert.deepEqual(activeOffsets, [0, 1]);
+  assert.deepEqual(completedOffsets, [0]);
+});
+
+test('RPC client rejects empty order pages with hasMore and bounded overflow', async () => {
+  const client = new PopdexRpcClient({ fetchImpl: async () => { throw new Error('unused'); } });
+  client.getActiveOrders = async () => ({ orders: [], hasMore: true });
+  await assert.rejects(client.getAllActiveOrders(ACCOUNT), /hasMore=true.*为空/);
+
+  client.getCompletedOrders = async () => ({ orders: [{ orderId: '21' }], hasMore: true });
+  await assert.rejects(
+    client.getAllCompletedOrders(ACCOUNT, { maxPages: 2 }),
+    /分页超过.*maxPages=2/,
+  );
+});
+
 test('RPC client reads official active orders without losing uint values', async () => {
   const iface = new Interface(ORDER_PAGE_ABI);
   const order = chainOrder();

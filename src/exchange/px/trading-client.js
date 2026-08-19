@@ -8,11 +8,12 @@ import {
 } from './constants.js';
 import {
   POPDEX_USER_CONFIG_INTERFACE,
+  encodeBtcLeverageOne,
   encodeReduceOnlyMarketClose,
   parseLeverageUpdatedReceipt,
   verifyStage5Simulation,
 } from './fill-close-codec.js';
-import { assertConfirmedLong, exactBtcLeverage } from './fill-close-state.js';
+import { assertConfirmedLong, classifyClose, exactBtcLeverage } from './fill-close-state.js';
 import { encodeCancelOrder, POPDEX_ORDER_INTERFACE } from './order-codec.js';
 import { strictAddress, strictIntegerString } from './normalize.js';
 import { parseOrderCancelReceipt, parseOrderCreateReceipt } from './receipt-events.js';
@@ -509,6 +510,205 @@ export class PopdexTradingClient {
       return completed;
     } catch (error) {
       safeJournalError(journal, 'CANCEL_BROADCAST', error);
+      throw error;
+    }
+  }
+
+  async placeAdapterOrder(plan, journal) {
+    if (!plan || typeof plan !== 'object' || !sameAddress(plan.mainAccount, this.mainAccount)) {
+      throw new Error('PopDEX 下单计划 mainAccount 与交易客户端不匹配。');
+    }
+    await this.preflight();
+    const receipt = await this.#submit({
+      data: plan.data,
+      functionName: 'placeOrder',
+      journal,
+      expectedStage: 'PREPARED',
+      nextStage: 'BROADCAST',
+      txHashField: 'txHash',
+    });
+    try {
+      const receiptOrder = parseOrderCreateReceipt(receipt, {
+        account: plan.mainAccount,
+        symbolId: plan.symbolId,
+        clientOrderId: plan.clientOrderId,
+        priceWad: plan.priceWad,
+        qtyWad: plan.qtyWad,
+      });
+      const order = await this.#pollOpenConfirmation(plan, receiptOrder);
+      validateIdentity(order, plan, 'CONFIRMED');
+      if (order.filledQtyWad !== '0') mismatch('CONFIRMED', 'filledQtyWad', '0', order.filledQtyWad);
+      if (order.remainingQtyWad !== plan.qtyWad) {
+        mismatch('CONFIRMED', 'remainingQtyWad', plan.qtyWad, order.remainingQtyWad);
+      }
+      if (order.cancelledQtyWad !== '0') {
+        mismatch('CONFIRMED', 'cancelledQtyWad', '0', order.cancelledQtyWad);
+      }
+      const orderId = strictIntegerString(order.orderId, 'orderId');
+      if (BigInt(orderId) <= 0n) throw new Error('PopDEX CONFIRMED orderId 必须是正整数。');
+      journal.advance('BROADCAST', 'CONFIRMED', { orderId });
+      return order;
+    } catch (error) {
+      safeJournalError(journal, 'BROADCAST', error);
+      throw error;
+    }
+  }
+
+  async cancelAdapterOrder(openOrder, journal) {
+    if (!openOrder || typeof openOrder !== 'object') {
+      throw new Error('PopDEX openOrder 必须是对象。');
+    }
+    if (typeof openOrder.walletId !== 'string' || !sameAddress(openOrder.walletId, this.mainAccount)) {
+      throw new Error('PopDEX openOrder.walletId 与主账户不匹配。');
+    }
+    if (openOrder.side !== '0' && openOrder.side !== '1') {
+      throw new Error('PopDEX openOrder.side 必须是 0 或 1。');
+    }
+    if (openOrder.isReduceOnly !== false) {
+      throw new Error('PopDEX openOrder.isReduceOnly 必须是 false。');
+    }
+    symbolForId(openOrder.symbolId);
+    await this.preflight();
+    const receipt = await this.#submit({
+      data: encodeCancelOrder({
+        mainAccount: this.mainAccount,
+        orderId: openOrder.orderId,
+        clientOrderId: openOrder.clientOrderId,
+      }),
+      functionName: 'cancelOrder',
+      journal,
+      expectedStage: 'PREPARED',
+      nextStage: 'BROADCAST',
+      txHashField: 'txHash',
+    });
+    try {
+      parseOrderCancelReceipt(receipt, {
+        account: this.mainAccount,
+        orderId: openOrder.orderId,
+        clientOrderId: openOrder.clientOrderId,
+      });
+      const completed = await this.#pollCancelled(openOrder);
+      journal.advance('BROADCAST', 'CONFIRMED');
+      return completed;
+    } catch (error) {
+      safeJournalError(journal, 'BROADCAST', error);
+      throw error;
+    }
+  }
+
+  async setAdapterBtcLeverageOne(journal) {
+    await this.preflight();
+    const current = exactBtcLeverage(await this.readRpc.getAccountConfig(this.mainAccount));
+    if (current === '1') {
+      journal.completePreparedWithoutBroadcast('safe-no-broadcast');
+      return { leverage: '1', changed: false };
+    }
+    const receipt = await this.#submit({
+      data: encodeBtcLeverageOne(this.mainAccount),
+      functionName: 'updateLeverage',
+      journal,
+      expectedStage: 'PREPARED',
+      nextStage: 'BROADCAST',
+      txHashField: 'txHash',
+      to: POPDEX_USER_CONFIG_PRECOMPILE,
+      simulationInterface: POPDEX_USER_CONFIG_INTERFACE,
+    });
+    try {
+      const event = parseLeverageUpdatedReceipt(receipt, { mainAccount: this.mainAccount });
+      const readback = exactBtcLeverage(
+        await this.readRpc.getAccountConfig(this.mainAccount),
+      );
+      if (readback !== '1') {
+        throw new Error(`PopDEX BTCUSDT 杠杆回读必须是 1，实际 ${String(readback)}。`);
+      }
+      journal.advance('BROADCAST', 'CONFIRMED');
+      return { ...event, changed: true };
+    } catch (error) {
+      safeJournalError(journal, 'BROADCAST', error);
+      throw error;
+    }
+  }
+
+  async #pollAdapterClose(plan) {
+    const attempts = Math.ceil(this.orderTimeoutMs / this.orderPollMs) + 1;
+    let latest = null;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const [fills, openOrders, positions] = await Promise.all([
+        this.accountClient.getAllFills(this.mainAccount, 'BTCUSDT'),
+        this.accountClient.getAllOpenOrders(this.mainAccount, 'BTCUSDT'),
+        this.readRpc.getAllOpenPositions(this.mainAccount),
+      ]);
+      latest = classifyClose(plan, { fills, openOrders, positions });
+      if (latest.kind === 'completed-flat') return latest;
+      if (attempt < attempts) await this.sleep(this.orderPollMs);
+    }
+    throw new Error(
+      `PopDEX close CONFIRMED 超时：closeOrderId=${plan.closeOrderId} `
+      + `kind=${String(latest?.kind)} remaining=${String(latest?.remainingPositionQtyWad)}。`,
+    );
+  }
+
+  async closeAdapterBtcLong(position, journal) {
+    if (!position || typeof position !== 'object') {
+      throw new Error('PopDEX adapter 平仓 position 必须是对象。');
+    }
+    const positionId = strictIntegerString(position.positionId, 'adapter positionId');
+    const qtyWad = strictIntegerString(position.qtyWad, 'adapter qtyWad');
+    if (BigInt(positionId) <= 0n || BigInt(qtyWad) <= 0n) {
+      throw new Error('PopDEX adapter positionId 和 qtyWad 必须是正整数字符串。');
+    }
+    await this.preflight();
+    const [openOrders, positions] = await Promise.all([
+      this.accountClient.getAllOpenOrders(this.mainAccount, 'BTCUSDT'),
+      this.readRpc.getAllOpenPositions(this.mainAccount),
+    ]);
+    const livePosition = assertConfirmedLong(
+      { mainAccount: this.mainAccount, symbol: 'BTCUSDT', symbolId: '20000' },
+      { openOrders, positions },
+      qtyWad,
+    );
+    if (String(livePosition.positionId) !== positionId) {
+      throw new Error(
+        `PopDEX adapter 平仓 positionId 不匹配：expected=${positionId} actual=${String(livePosition.positionId)}。`,
+      );
+    }
+    const receipt = await this.#submit({
+      data: encodeReduceOnlyMarketClose({
+        mainAccount: this.mainAccount,
+        closeClientOrderId: position.closeClientOrderId,
+        closeQtyWad: qtyWad,
+      }),
+      functionName: 'placeOrder',
+      journal,
+      expectedStage: 'PREPARED',
+      nextStage: 'BROADCAST',
+      txHashField: 'txHash',
+      simulationInterface: POPDEX_ORDER_INTERFACE,
+    });
+    try {
+      const order = parseOrderCreateReceipt(receipt, {
+        account: this.mainAccount,
+        symbolId: '20000',
+        clientOrderId: position.closeClientOrderId,
+        priceWad: '0',
+        priceRule: 'positive-execution',
+        qtyWad,
+      });
+      const settled = await this.#pollAdapterClose({
+        mainAccount: this.mainAccount,
+        closeOrderId: order.orderId,
+        closeQtyWad: qtyWad,
+        closeClientOrderId: position.closeClientOrderId,
+      });
+      journal.advance('BROADCAST', 'CONFIRMED', { closeOrderId: order.orderId });
+      return {
+        ...order,
+        closeOrderId: order.orderId,
+        filledQtyWad: settled.filledQtyWad,
+        positionQtyWad: settled.remainingPositionQtyWad,
+      };
+    } catch (error) {
+      safeJournalError(journal, 'BROADCAST', error);
       throw error;
     }
   }
