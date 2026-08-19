@@ -23,7 +23,7 @@
 - Modify: `src/exchange/rs/error-details.js:1-27`
 - Test: `test/risex-private-stream.test.js:1-4`
 
-- [ ] **Step 1: Import and test the wished-for classifier**
+- [x] **Step 1: Import and test the wished-for classifier**
 
 Change the test import and add one focused test near the constants:
 
@@ -43,7 +43,7 @@ test('RISEx transient network classification follows nested causes but rejects H
 });
 ```
 
-- [ ] **Step 2: Run the test and verify RED**
+- [x] **Step 2: Run the test and verify RED**
 
 Run:
 
@@ -53,7 +53,7 @@ node --test test/risex-private-stream.test.js
 
 Expected: FAIL at module loading because `error-details.js` does not export `isTransientNetworkError`.
 
-- [ ] **Step 3: Implement the bounded classifier**
+- [x] **Step 3: Implement the bounded classifier**
 
 Add to `src/exchange/rs/error-details.js` without changing `describeError()`:
 
@@ -79,7 +79,7 @@ export function isTransientNetworkError(error) {
 
 The HTTP 403 fixture must remain false because it contains no transport code/cause and no transient phrase.
 
-- [ ] **Step 4: Run the focused tests and verify GREEN**
+- [x] **Step 4: Run the focused tests and verify GREEN**
 
 Run:
 
@@ -89,7 +89,7 @@ node --test test/risex-private-stream.test.js
 
 Expected: all private-stream tests pass.
 
-- [ ] **Step 5: Commit the classifier**
+- [x] **Step 5: Commit the classifier**
 
 ```bash
 git add src/exchange/rs/error-details.js test/risex-private-stream.test.js
@@ -102,7 +102,7 @@ git commit -m "修复：识别RISEx临时网络错误"
 - Modify: `src/exchange/rs/private-stream.js:3,76-91,158-162,320-329,380-408`
 - Test: `test/risex-private-stream.test.js:225-237`
 
-- [ ] **Step 1: Write the runtime re-authentication regression test**
+- [x] **Step 1: Write the runtime re-authentication regression test**
 
 Add after the existing disconnect test:
 
@@ -151,7 +151,7 @@ test('runtime signer-check fetch failure reconnects without fatal and later auth
 });
 ```
 
-- [ ] **Step 2: Run the test and verify RED**
+- [x] **Step 2: Run the test and verify RED**
 
 Run:
 
@@ -161,7 +161,7 @@ node --test test/risex-private-stream.test.js
 
 Expected: FAIL because the signer-check exception calls `_fatal()`, increments `fatals`, sets `_stopped`, and does not schedule a second reconnect.
 
-- [ ] **Step 3: Add the authenticated-history and failure-routing state**
+- [x] **Step 3: Add the authenticated-history and failure-routing state**
 
 Update imports and constructor state:
 
@@ -199,7 +199,7 @@ stop() {
 }
 ```
 
-- [ ] **Step 4: Implement recoverable reconnect handling**
+- [x] **Step 4: Implement recoverable reconnect handling**
 
 Add immediately before `_fatal()`:
 
@@ -223,7 +223,7 @@ _handleConnectionFailure(error) {
 
 Do not set `_stopped`, emit `fatal`, clear buffers, or mark authentication successful.
 
-- [ ] **Step 5: Run private stream and adapter tests**
+- [x] **Step 5: Run private stream and adapter tests**
 
 Run:
 
@@ -233,7 +233,7 @@ node --test test/risex-private-stream.test.js test/risex-adapter.test.js
 
 Expected: PASS; the new regression test reconnects, and existing tests still prove writes remain blocked during `RECONCILING` and exact REST/WS reconciliation is required before `READY`.
 
-- [ ] **Step 6: Commit the runtime reconnect fix**
+- [x] **Step 6: Commit the runtime reconnect fix**
 
 ```bash
 git add src/exchange/rs/private-stream.js test/risex-private-stream.test.js
@@ -246,7 +246,7 @@ git commit -m "修复：恢复RISEx运行中认证网络故障"
 - Modify: `src/exchange/rs/private-stream.js:427-432`
 - Test: `test/risex-private-stream.test.js:239-253,272-297`
 
-- [ ] **Step 1: Add initial fail-fast and runtime timeout tests**
+- [x] **Step 1: Add initial fail-fast and runtime timeout tests**
 
 Extend the existing initial timeout test with a fatal assertion:
 
@@ -286,7 +286,7 @@ test('runtime authentication timeout reconnects while initial timeout remains fa
 });
 ```
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [x] **Step 2: Run the tests and verify RED**
 
 Run:
 
@@ -296,7 +296,7 @@ node --test test/risex-private-stream.test.js
 
 Expected: initial timeout assertion passes, but runtime timeout test fails because `_startConnectDeadline()` calls `_fatal()` directly.
 
-- [ ] **Step 3: Route the connection deadline through the classifier**
+- [x] **Step 3: Route the connection deadline through the classifier**
 
 Change only the deadline callback:
 
@@ -311,7 +311,7 @@ this._connectDeadline = this._setDeadline(() => {
 
 Because `_everAuthenticated` is false during initial startup, the same error remains fatal there. After a successful historical authentication it is transient and enters the reconnect path.
 
-- [ ] **Step 4: Run all RISEx tests**
+- [x] **Step 4: Run all RISEx tests**
 
 Run:
 
@@ -321,7 +321,7 @@ node --test test/risex-normalize.test.js test/risex-order-state.test.js test/ris
 
 Expected: all RISEx tests pass with zero failures.
 
-- [ ] **Step 5: Commit timeout handling**
+- [x] **Step 5: Commit timeout handling**
 
 ```bash
 git add src/exchange/rs/private-stream.js test/risex-private-stream.test.js
@@ -334,7 +334,7 @@ git commit -m "修复：重试RISEx运行中认证超时"
 - Modify: `AGENTS.md`
 - Modify: `docs/superpowers/plans/2026-08-19-risex-transient-auth-reconnect.md`
 
-- [ ] **Step 1: Update the project source of truth**
+- [x] **Step 1: Update the project source of truth**
 
 Add one RISEx rule to `AGENTS.md`:
 
@@ -342,7 +342,7 @@ Add one RISEx rule to `AGENTS.md`:
 - RISEx 已成功认证后的私有流自动重连若遇到可证明的临时网络错误，必须保持 `RECONCILING`、禁止新增风险写入并按 1–30 秒指数退避持续重试；只有完成新的 REST/WS 所有权对账才可恢复 `READY`。初次启动、私有验证、人工重建客户端及 signer/签名/domain/nonce/schema/身份冲突仍须 fail-fast 或进入 `HALTED`，不得把 HTTP 拒绝或确定性错误伪装成网络抖动。
 ```
 
-- [ ] **Step 2: Run static scope checks**
+- [x] **Step 2: Run static scope checks**
 
 Run:
 
@@ -354,7 +354,7 @@ git diff --stat main...HEAD
 
 Expected: only the design/plan, `AGENTS.md`, two RISEx source files, and one RISEx test file appear; no `.env`, state files, credentials, Decibel, PopDEX, bot, server, or frontend files appear.
 
-- [ ] **Step 3: Run the complete test suite**
+- [x] **Step 3: Run the complete test suite**
 
 Run:
 
@@ -364,7 +364,7 @@ npm test
 
 Expected: all tests pass, `fail 0`, with no unhandled exception.
 
-- [ ] **Step 4: Mark this plan complete and commit documentation**
+- [x] **Step 4: Mark this plan complete and commit documentation**
 
 Change every completed checkbox in this plan from `[ ]` to `[x]`, then run:
 
@@ -373,7 +373,7 @@ git add AGENTS.md docs/superpowers/plans/2026-08-19-risex-transient-auth-reconne
 git commit -m "文档：记录RISEx认证重连安全边界"
 ```
 
-- [ ] **Step 5: Inspect the final branch**
+- [x] **Step 5: Inspect the final branch**
 
 Run:
 
